@@ -179,6 +179,7 @@ def test_main_auto_match(monkeypatch, tmp_path: Path):
 
     fake_fubar = types.ModuleType("caesar.fubar_halo")
 
+
     def stub_fubar_halo(sim):
         if (
             'haloid' in sim._kwargs
@@ -193,6 +194,7 @@ def test_main_auto_match(monkeypatch, tmp_path: Path):
             )
 
     fake_fubar.fubar_halo = stub_fubar_halo
+
 
     fake_zoom = types.ModuleType("caesar.zoom_funcs")
     fake_zoom.all_object_contam_check = lambda *_a, **_k: None
