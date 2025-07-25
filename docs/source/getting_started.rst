@@ -56,7 +56,7 @@ python package manager `pip <https://pypi.python.org/pypi/pip>`_.
 
 .. code-block:: bash
 
-   $> conda install numpy scipy cython h5py matplotlib psutil joblib six astropy
+   $> conda install numpy scipy cython h5py matplotlib psutil joblib scikit-learn six astropy pandas tqdm
 
 Alternatively, if you do not wish to use Anaconda, these can all be installed
 under ``pip`` by replacing ``conda`` with ``pip`` in the line above.  Some
