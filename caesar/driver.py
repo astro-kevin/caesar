@@ -82,6 +82,16 @@ class Snapshot(object):
 
         obj = caesar.CAESAR(ds)
         obj.member_search(snapdirformat,**kwargs)
+        if kwargs.get('match_subhalos') and 'haloid_file' in kwargs:
+            try:
+                from caesar.halo_matching import match_subhalos_to_galaxies
+                match_subhalos_to_galaxies(
+                    obj,
+                    ahf_file=kwargs['haloid_file'],
+                    snapshot_file=self.snap,
+                )
+            except Exception as exc:
+                mylog.warning('Subhalo matching failed: %s' % exc)
         obj.save(self.outfile)
 
         obj = None

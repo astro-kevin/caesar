@@ -4,8 +4,8 @@
 # Test stand-alone photometry code
 #=======================================================================
 
-import yt
-import caesar
+import pytest
+pytest.skip("Requires yt and caesar datasets", allow_module_level=True)
 import pylab as plt
 import numpy as np
 from scipy.special import erf
