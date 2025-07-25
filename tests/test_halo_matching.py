@@ -94,7 +94,6 @@ def test_subhalo_merge(tmp_path: Path):
     assert len(sim.galaxies[0].slist) == 6
     assert sim.galaxies[0].masses["dm"] == 3.0
 
-
 def test_snapshot_auto_match(monkeypatch, tmp_path: Path):
     """Ensure subhalo matching runs automatically when haloid='AHF'."""
 
@@ -155,3 +154,4 @@ def test_snapshot_auto_match(monkeypatch, tmp_path: Path):
     snap.member_search(False, False, haloid="AHF", haloid_file=ahf_file)
 
     assert called["ahf_file"] == ahf_file
+
