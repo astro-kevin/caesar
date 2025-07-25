@@ -354,6 +354,7 @@ class CAESAR(object):
             all_object_contam_check(self)
 
 
+
     def vtk_vis(self, **kwargs):
         """Method to visualize an entire simulation with VTK.
         
