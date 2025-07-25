@@ -155,3 +155,84 @@ def test_snapshot_auto_match(monkeypatch, tmp_path: Path):
 
     assert called["ahf_file"] == ahf_file
 
+
+def test_member_search_auto_match(monkeypatch, tmp_path: Path):
+    """Ensure CAESAR.member_search auto-calls subhalo matching when haloid='AHF'."""
+
+    called = {}
+
+    def fake_match(sim, *, ahf_file, snapshot_file=None, star_particle_ids=None):
+        called['ahf_file'] = ahf_file
+        called['snapshot_file'] = snapshot_file
+
+    import types, sys, importlib.util
+
+    fake_pkg = types.ModuleType("caesar")
+
+    fake_assign = types.ModuleType("caesar.assignment")
+    fake_assign.assign_galaxies_to_halos = lambda *_a, **_k: None
+    fake_assign.assign_clouds_to_galaxies = lambda *_a, **_k: None
+    fake_assign.assign_central_galaxies = lambda *_a, **_k: None
+
+    fake_link = types.ModuleType("caesar.linking")
+    fake_link.link_galaxies_and_halos = lambda *_a, **_k: None
+    fake_link.link_clouds_and_galaxies = lambda *_a, **_k: None
+    fake_link.create_sublists = lambda *_a, **_k: None
+
+    fake_fubar_halo = types.ModuleType("caesar.fubar_halo")
+    fake_fubar_halo.fubar_halo = lambda *_a, **_k: None
+
+    fake_zoom = types.ModuleType("caesar.zoom_funcs")
+    fake_zoom.all_object_contam_check = lambda *_a, **_k: None
+
+    fake_hm = types.ModuleType("caesar.halo_matching")
+    fake_hm.match_subhalos_to_galaxies = fake_match
+
+    fake_pm = types.ModuleType("caesar.property_manager")
+    fake_pm.DatasetType = object
+
+    fake_pl = types.ModuleType("caesar.particle_list")
+    class DummyPLC:
+        def __init__(self, *_a, **_k):
+            pass
+    fake_pl.ParticleListContainer = DummyPLC
+
+    fake_sa = types.ModuleType("caesar.simulation_attributes")
+    class DummySA:
+        def __init__(self):
+            pass
+    fake_sa.SimulationAttributes = DummySA
+
+    sys.modules['caesar'] = fake_pkg
+    sys.modules['caesar.assignment'] = fake_assign
+    sys.modules['caesar.linking'] = fake_link
+    sys.modules['caesar.fubar_halo'] = fake_fubar_halo
+    sys.modules['caesar.zoom_funcs'] = fake_zoom
+    sys.modules['caesar.halo_matching'] = fake_hm
+    sys.modules['caesar.property_manager'] = fake_pm
+    sys.modules['caesar.particle_list'] = fake_pl
+    sys.modules['caesar.simulation_attributes'] = fake_sa
+
+    fake_yt_funcs = types.ModuleType("yt.funcs")
+    class DummyLog:
+        def warning(self, *args, **kwargs):
+            pass
+    fake_yt_funcs.mylog = DummyLog()
+    fake_yt_funcs.get_hash = lambda *_a, **_k: "0"
+    sys.modules['yt.funcs'] = fake_yt_funcs
+
+    main_path = Path(__file__).resolve().parents[1] / 'caesar' / 'main.py'
+    spec = importlib.util.spec_from_file_location('cmain', main_path)
+    cmain = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cmain)
+
+    obj = cmain.CAESAR()
+    obj.simulation.fullpath = str(tmp_path)
+    obj.simulation.basename = 'snap_000.hdf5'
+
+    ahf_file = str(tmp_path / 'file.AHF_particles')
+    obj.member_search(haloid='AHF', haloid_file=ahf_file)
+
+    assert called['ahf_file'] == ahf_file
+    assert called['snapshot_file'] == str(Path(tmp_path) / 'snap_000.hdf5')
+

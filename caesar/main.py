@@ -1,4 +1,5 @@
 import numpy as np
+import os
 
 from caesar.property_manager import DatasetType
 from caesar.particle_list import ParticleListContainer
@@ -352,6 +353,20 @@ class CAESAR(object):
         if (len(self.halos) !=0) and ('lowres' in self._kwargs and self._kwargs['lowres'] is not None): # no need this when there is no halos
             from caesar.zoom_funcs import all_object_contam_check
             all_object_contam_check(self)
+
+        match_subs = self._kwargs.get('match_subhalos')
+        ahf_selected = self._kwargs.get('haloid', '').upper() == 'AHF'
+        if (match_subs or ahf_selected) and 'haloid_file' in self._kwargs:
+            try:
+                from caesar.halo_matching import match_subhalos_to_galaxies
+                snapshot = os.path.join(self.simulation.fullpath, self.simulation.basename)
+                match_subhalos_to_galaxies(
+                    self,
+                    ahf_file=self._kwargs['haloid_file'],
+                    snapshot_file=snapshot,
+                )
+            except Exception as exc:
+                mylog.warning('Subhalo matching failed: %s' % exc)
 
 
     def vtk_vis(self, **kwargs):
