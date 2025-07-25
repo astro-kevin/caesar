@@ -1,9 +1,8 @@
 
 # Generate two SSP tables, plot spectra at selected age, met to compare 
 
-import numpy as np
-import pylab as plt
-from caesar.pyloser.pyloser import get_ssp_spectrum,generate_ssp_table_bpass,generate_ssp_table_bc03
+import pytest
+pytest.skip("Requires CAESAR SSP datasets", allow_module_level=True)
 
 colors = ['b','c','g','r']
 #generate_ssp_table_bpass('../BPASS_Chab100.hdf5')
