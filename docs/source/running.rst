@@ -52,8 +52,12 @@ Here is a more detailed description of the options shown above:
 
 * **haloid**:  Source for particle halo ID's.  
   ``haloid='fof'`` uses a 3D Friends-of-Friends (3DFOF) with b=0.2 to identify halos.  
-  ``haloid='snap'`` reads halo membership info for each particle from the snapshot variable ``HaloID``, if present.  
-  *Default:* 'fof'
+``haloid='snap'`` reads halo membership info for each particle from the snapshot variable ``HaloID``, if present.
+``haloid='AHF'`` will read an associated ``AHF_particles`` file and automatically
+invoke subhalo matching to merge galaxies using
+``match_subhalos_to_galaxies``. This occurs before galaxy properties are
+computed so merged galaxies are processed only once.
+ *Default:* 'fof'
 
 * **fof6d_file**:  Stores results of 6DFOF galaxy finder in a file for future retrieval.  If file does not exist, it is created; if it exists, the galaxy membership information is read from this file instead of running the 6DFOF.  *Default:* *None*
 

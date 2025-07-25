@@ -178,7 +178,23 @@ def test_main_auto_match(monkeypatch, tmp_path: Path):
     fake_link.create_sublists = lambda *_a, **_k: None
 
     fake_fubar = types.ModuleType("caesar.fubar_halo")
-    fake_fubar.fubar_halo = lambda *_a, **_k: None
+
+
+    def stub_fubar_halo(sim):
+        if (
+            'haloid' in sim._kwargs
+            and isinstance(sim._kwargs['haloid'], str)
+            and sim._kwargs['haloid'].upper() == 'AHF'
+            and 'haloid_file' in sim._kwargs
+        ):
+            fake_match(
+                sim,
+                ahf_file=sim._kwargs['haloid_file'],
+                star_particle_ids=[],
+            )
+
+    fake_fubar.fubar_halo = stub_fubar_halo
+
 
     fake_zoom = types.ModuleType("caesar.zoom_funcs")
     fake_zoom.all_object_contam_check = lambda *_a, **_k: None

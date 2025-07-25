@@ -373,6 +373,7 @@ class CAESAR(object):
                 mylog.warning('Subhalo matching failed: %s' % exc)
 
 
+
     def vtk_vis(self, **kwargs):
         """Method to visualize an entire simulation with VTK.
         

@@ -92,6 +92,26 @@ def fubar_halo(obj):
         mylog.warning('Not enough eligible galaxy particles found!')
         return  
     galaxies.load_lists(parent=halos)  # create galaxy_list, load particle index lists for galaxies
+
+    if (
+        'haloid' in obj._kwargs
+        and isinstance(obj._kwargs['haloid'], str)
+        and obj._kwargs['haloid'].upper() == 'AHF'
+        and 'haloid_file' in obj._kwargs
+    ):
+        try:
+            from caesar.halo_matching import match_subhalos_to_galaxies
+            from caesar.property_manager import get_property
+
+            star_ids = get_property(obj, 'pid', 'star').d
+            match_subhalos_to_galaxies(
+                obj,
+                ahf_file=obj._kwargs['haloid_file'],
+                star_particle_ids=star_ids,
+            )
+        except Exception as exc:  # pragma: no cover - optional heavy deps
+            mylog.warning('Subhalo matching failed: %s' % exc)
+
     get_group_properties(galaxies,galaxies.obj.galaxy_list)  # compute galaxy properties
     if ('fsps_bands' in obj._kwargs) and obj._kwargs['fsps_bands'] is not None:
         from caesar.pyloser.pyloser import photometry
