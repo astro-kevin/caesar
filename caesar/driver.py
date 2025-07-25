@@ -82,7 +82,11 @@ class Snapshot(object):
 
         obj = caesar.CAESAR(ds)
         obj.member_search(snapdirformat,**kwargs)
-        if kwargs.get('match_subhalos') and 'haloid_file' in kwargs:
+
+        match_subs = kwargs.get('match_subhalos')
+        ahf_selected = kwargs.get('haloid', '').upper() == 'AHF'
+        if (match_subs or ahf_selected) and 'haloid_file' in kwargs:
+
             try:
                 from caesar.halo_matching import match_subhalos_to_galaxies
                 match_subhalos_to_galaxies(

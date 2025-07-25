@@ -93,3 +93,65 @@ def test_subhalo_merge(tmp_path: Path):
     assert sim.ngalaxies == 1
     assert len(sim.galaxies[0].slist) == 6
     assert sim.galaxies[0].masses["dm"] == 3.0
+
+def test_snapshot_auto_match(monkeypatch, tmp_path: Path):
+    """Ensure subhalo matching runs automatically when haloid='AHF'."""
+
+    called = {}
+
+    def fake_match(sim, *, ahf_file, snapshot_file=None, star_particle_ids=None):
+        called['ahf_file'] = ahf_file
+        called['snapshot_file'] = snapshot_file
+
+    class FakeDS:
+        cosmological_simulation = 1
+        current_redshift = 0.0
+        fullpath = str(tmp_path)
+
+    class FakeCAESAR:
+        def __init__(self, ds):
+            self.ds = ds
+        def member_search(self, *_args, **_kwargs):
+            pass
+        def save(self, *_args, **_kwargs):
+            pass
+
+    import types, sys, importlib.util
+
+    # fake modules for driver import
+    fake_caesar = types.ModuleType("caesar")
+    fake_caesar.CAESAR = FakeCAESAR
+    fake_caesar.progen = types.ModuleType("caesar.progen")
+    def progen_finder(*args, **kwargs):
+        pass
+    fake_caesar.progen.progen_finder = progen_finder
+    fake_hm = types.ModuleType("caesar.halo_matching")
+    fake_hm.match_subhalos_to_galaxies = fake_match
+    sys.modules["caesar"] = fake_caesar
+    sys.modules["caesar.progen"] = fake_caesar.progen
+    sys.modules["caesar.halo_matching"] = fake_hm
+
+    fake_yt = types.ModuleType("yt")
+    fake_funcs = types.ModuleType("yt.funcs")
+    class DummyLog:
+        def warning(self, *args, **kwargs):
+            pass
+    fake_funcs.mylog = DummyLog()
+    fake_yt.load = lambda p: FakeDS()
+    fake_yt.funcs = fake_funcs
+    sys.modules["yt"] = fake_yt
+    sys.modules["yt.funcs"] = fake_funcs
+
+    driver_path = Path(__file__).resolve().parents[1] / "caesar" / "driver.py"
+    spec = importlib.util.spec_from_file_location("driver_mod", driver_path)
+    driver_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(driver_mod)
+
+    monkeypatch.setattr(driver_mod.os.path, "isfile", lambda p: True)
+
+    snap = driver_mod.Snapshot(str(tmp_path), "snap_", 0, "hdf5")
+    ahf_file = str(tmp_path / "file.AHF_particles")
+    snap.member_search(False, False, haloid="AHF", haloid_file=ahf_file)
+
+    assert called["ahf_file"] == ahf_file
+
