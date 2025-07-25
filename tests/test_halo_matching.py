@@ -127,9 +127,9 @@ def test_snapshot_auto_match(monkeypatch, tmp_path: Path):
     fake_caesar.progen.progen_finder = progen_finder
     fake_hm = types.ModuleType("caesar.halo_matching")
     fake_hm.match_subhalos_to_galaxies = fake_match
-    sys.modules["caesar"] = fake_caesar
-    sys.modules["caesar.progen"] = fake_caesar.progen
-    sys.modules["caesar.halo_matching"] = fake_hm
+    monkeypatch.setitem(sys.modules, "caesar", fake_caesar)
+    monkeypatch.setitem(sys.modules, "caesar.progen", fake_caesar.progen)
+    monkeypatch.setitem(sys.modules, "caesar.halo_matching", fake_hm)
 
     fake_yt = types.ModuleType("yt")
     fake_funcs = types.ModuleType("yt.funcs")
@@ -139,8 +139,8 @@ def test_snapshot_auto_match(monkeypatch, tmp_path: Path):
     fake_funcs.mylog = DummyLog()
     fake_yt.load = lambda p: FakeDS()
     fake_yt.funcs = fake_funcs
-    sys.modules["yt"] = fake_yt
-    sys.modules["yt.funcs"] = fake_funcs
+    monkeypatch.setitem(sys.modules, "yt", fake_yt)
+    monkeypatch.setitem(sys.modules, "yt.funcs", fake_funcs)
 
     driver_path = Path(__file__).resolve().parents[1] / "caesar" / "driver.py"
     spec = importlib.util.spec_from_file_location("driver_mod", driver_path)
@@ -152,6 +152,97 @@ def test_snapshot_auto_match(monkeypatch, tmp_path: Path):
     snap = driver_mod.Snapshot(str(tmp_path), "snap_", 0, "hdf5")
     ahf_file = str(tmp_path / "file.AHF_particles")
     snap.member_search(False, False, haloid="AHF", haloid_file=ahf_file)
+
+    assert called["ahf_file"] == ahf_file
+
+
+def test_main_auto_match(monkeypatch, tmp_path: Path):
+    """Ensure CAESAR.member_search triggers subhalo matching when haloid='AHF'."""
+
+    called = {}
+
+    def fake_match(sim, *, ahf_file, snapshot_file=None, star_particle_ids=None):
+        called["ahf_file"] = ahf_file
+        called["snapshot_file"] = snapshot_file
+
+    import types, sys, importlib.util
+
+    fake_assignment = types.ModuleType("caesar.assignment")
+    fake_assignment.assign_galaxies_to_halos = lambda *_a, **_k: None
+    fake_assignment.assign_clouds_to_galaxies = lambda *_a, **_k: None
+    fake_assignment.assign_central_galaxies = lambda *_a, **_k: None
+
+    fake_link = types.ModuleType("caesar.linking")
+    fake_link.link_galaxies_and_halos = lambda *_a, **_k: None
+    fake_link.link_clouds_and_galaxies = lambda *_a, **_k: None
+    fake_link.create_sublists = lambda *_a, **_k: None
+
+    fake_fubar = types.ModuleType("caesar.fubar_halo")
+    fake_fubar.fubar_halo = lambda *_a, **_k: None
+
+    fake_zoom = types.ModuleType("caesar.zoom_funcs")
+    fake_zoom.all_object_contam_check = lambda *_a, **_k: None
+
+    fake_hm = types.ModuleType("caesar.halo_matching")
+    fake_hm.match_subhalos_to_galaxies = fake_match
+
+    # stubs required for importing main module without heavy deps
+    fake_pm = types.ModuleType("caesar.property_manager")
+    class _DT:
+        def __init__(self, *_a, **_k):
+            pass
+    fake_pm.DatasetType = _DT
+
+    fake_pl = types.ModuleType("caesar.particle_list")
+    class _PLC:
+        def __init__(self, *_a, **_k):
+            pass
+    fake_pl.ParticleListContainer = _PLC
+
+    fake_sa = types.ModuleType("caesar.simulation_attributes")
+    class _SA:
+        def create_attributes(self, *_a, **_k):
+            pass
+    fake_sa.SimulationAttributes = _SA
+
+    fake_yt = types.ModuleType("yt")
+    fake_funcs = types.ModuleType("yt.funcs")
+    class DummyLog:
+        def warning(self, *args, **kwargs):
+            pass
+    fake_funcs.mylog = DummyLog()
+    fake_funcs.get_hash = lambda *_a, **_k: 0
+    fake_yt.funcs = fake_funcs
+
+    monkeypatch.setitem(sys.modules, "caesar.property_manager", fake_pm)
+    monkeypatch.setitem(sys.modules, "caesar.particle_list", fake_pl)
+    monkeypatch.setitem(sys.modules, "caesar.simulation_attributes", fake_sa)
+    monkeypatch.setitem(sys.modules, "yt", fake_yt)
+    monkeypatch.setitem(sys.modules, "yt.funcs", fake_funcs)
+
+    main_path = Path(__file__).resolve().parents[1] / "caesar" / "main.py"
+    spec = importlib.util.spec_from_file_location("main_mod", main_path)
+    main_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(main_mod)
+
+    fake_caesar = types.ModuleType("caesar")
+    fake_caesar.assignment = fake_assignment
+    fake_caesar.linking = fake_link
+    fake_caesar.fubar_halo = fake_fubar
+    fake_caesar.zoom_funcs = fake_zoom
+    fake_caesar.halo_matching = fake_hm
+
+    monkeypatch.setitem(sys.modules, "caesar", fake_caesar)
+    monkeypatch.setitem(sys.modules, "caesar.assignment", fake_assignment)
+    monkeypatch.setitem(sys.modules, "caesar.linking", fake_link)
+    monkeypatch.setitem(sys.modules, "caesar.fubar_halo", fake_fubar)
+    monkeypatch.setitem(sys.modules, "caesar.zoom_funcs", fake_zoom)
+    monkeypatch.setitem(sys.modules, "caesar.halo_matching", fake_hm)
+
+    sim = main_mod.CAESAR(ds=0)
+
+    ahf_file = str(tmp_path / "file.AHF_particles")
+    sim.member_search(haloid="AHF", haloid_file=ahf_file)
 
     assert called["ahf_file"] == ahf_file
 

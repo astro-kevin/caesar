@@ -353,6 +353,25 @@ class CAESAR(object):
             from caesar.zoom_funcs import all_object_contam_check
             all_object_contam_check(self)
 
+        if (
+            'haloid' in self._kwargs
+            and isinstance(self._kwargs['haloid'], str)
+            and self._kwargs['haloid'].upper() == 'AHF'
+            and 'haloid_file' in self._kwargs
+        ):
+            try:
+                from caesar.halo_matching import match_subhalos_to_galaxies
+                snapshot_file = None
+                if not isinstance(self._ds, int):
+                    snapshot_file = getattr(self._ds, 'fullpath', None)
+                match_subhalos_to_galaxies(
+                    self,
+                    ahf_file=self._kwargs['haloid_file'],
+                    snapshot_file=snapshot_file,
+                )
+            except Exception as exc:  # pragma: no cover - optional heavy deps
+                mylog.warning('Subhalo matching failed: %s' % exc)
+
 
     def vtk_vis(self, **kwargs):
         """Method to visualize an entire simulation with VTK.
