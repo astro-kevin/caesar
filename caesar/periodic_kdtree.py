@@ -311,9 +311,12 @@ class PeriodicCKDTree(cKDTree):
                 else:
                     return np.inf, self.n
             elif k>1:
-                dd = np.empty(k,dtype=np.float64)
+                dd = np.empty(k, dtype=np.float64)
                 dd.fill(np.inf)
-                ii = np.empty(k,dtype=np.int)
+                # ``np.int`` was removed in NumPy 2.0; use the built-in ``int``
+                # type instead to maintain compatibility with newer versions
+                # while keeping behaviour identical across platforms.
+                ii = np.empty(k, dtype=int)
                 ii.fill(self.n)
                 for j in range(len(hits)):
                     dd[j], ii[j] = hits[j]
@@ -377,7 +380,9 @@ class PeriodicCKDTree(cKDTree):
             return self.__query_ball_point(x, r, p, eps)
         else:
             retshape = x.shape[:-1]
-            result = np.empty(retshape, dtype=np.object)
+            # ``np.object`` was deprecated and removed in NumPy 2.0.  The
+            # built-in ``object`` dtype serves the same purpose.
+            result = np.empty(retshape, dtype=object)
             for c in np.ndindex(retshape):
                 result[c] = self.__query_ball_point(x[c], r, p, eps)
             return result
