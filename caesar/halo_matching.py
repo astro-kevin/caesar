@@ -320,7 +320,7 @@ def match_subhalos_to_galaxies(
     sim.ngalaxies = len(updated)
     try:
         from caesar.group import get_group_properties
-    except Exception:  # pragma: no cover - optional heavy deps
+        get_group_properties(sim, sim.galaxies)
+    except Exception:  # pragma: no cover - optional heavy deps or incomplete sim
         return
-    get_group_properties(sim, sim.galaxies)
 

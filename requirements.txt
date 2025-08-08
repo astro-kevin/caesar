@@ -1,7 +1,7 @@
 six
 numpy
 h5py
-cython
+cython>=3.0
 psutil
 scipy
 joblib
