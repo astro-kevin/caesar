@@ -26,6 +26,34 @@ class build_ext(_build_ext):
         import numpy
         self.include_dirs.append(numpy.get_include())
 
+    def run(self):
+        """Generate C files with Cython and patch for NumPy 2.x"""
+        from Cython.Build import cythonize
+        import re
+
+        # Generate C sources from the pyx files
+        cythonize(self.extensions, compiler_directives={'language_level': "3"})
+
+        # Older versions of Cython (<3.0) generate C code that directly
+        # accesses `PyArray_Descr.subarray`, which was removed in NumPy 2.0.
+        # Replace such occurrences with the compatible `PyDataType_SUBARRAY`
+        # helper so compilation succeeds with NumPy>=2.
+        pattern = re.compile(r'(\w+)->subarray->shape')
+        for ext in self.extensions:
+            for source in ext.sources:
+                if source.endswith('.pyx'):
+                    c_file = source.replace('.pyx', '.c')
+                    if os.path.exists(c_file):
+                        with open(c_file, 'r+', encoding='utf-8') as fh:
+                            code = fh.read()
+                            if '->subarray->shape' in code:
+                                code = pattern.sub(r'PyDataType_SUBARRAY(\1)->shape', code)
+                                fh.seek(0)
+                                fh.write(code)
+                                fh.truncate()
+
+        _build_ext.run(self)
+
 
 class sdist(_sdist):
     # subclass setuptools source distribution builder to ensure cython
