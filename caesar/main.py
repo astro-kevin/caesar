@@ -358,17 +358,29 @@ class CAESAR(object):
             and isinstance(self._kwargs['haloid'], str)
             and self._kwargs['haloid'].upper() == 'AHF'
             and 'haloid_file' in self._kwargs
+            and not getattr(self, "_ahf_matched", False)
         ):
             try:
                 from caesar.halo_matching import match_subhalos_to_galaxies
-                snapshot_file = None
-                if not isinstance(self._ds, int):
-                    snapshot_file = getattr(self._ds, 'fullpath', None)
+                # Prefer in-memory star IDs; fall back to snapshot path if unavailable
+                star_ids = None
+                try:
+                    from caesar.property_manager import get_property
+                    star_ids = get_property(self, 'pid', 'star').d
+                except Exception:
+                    star_ids = None
+
+                snapshot_file = None if star_ids is not None else (
+                    getattr(self._ds, 'fullpath', None) if not isinstance(self._ds, int) else None
+                )
+
                 match_subhalos_to_galaxies(
                     self,
                     ahf_file=self._kwargs['haloid_file'],
                     snapshot_file=snapshot_file,
+                    star_particle_ids=star_ids,
                 )
+                setattr(self, "_ahf_matched", True)
             except Exception as exc:  # pragma: no cover - optional heavy deps
                 mylog.warning('Subhalo matching failed: %s' % exc)
 

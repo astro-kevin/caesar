@@ -85,15 +85,25 @@ class Snapshot(object):
 
         match_subs = kwargs.get('match_subhalos')
         ahf_selected = kwargs.get('haloid', '').upper() == 'AHF'
-        if (match_subs or ahf_selected) and 'haloid_file' in kwargs:
+        if (match_subs or ahf_selected) and 'haloid_file' in kwargs and not getattr(obj, "_ahf_matched", False):
 
             try:
                 from caesar.halo_matching import match_subhalos_to_galaxies
+                # Prefer in-memory star IDs to avoid snapshot I/O
+                star_ids = None
+                try:
+                    from caesar.property_manager import get_property
+                    star_ids = get_property(obj, 'pid', 'star').d
+                except Exception:
+                    star_ids = None
+
                 match_subhalos_to_galaxies(
                     obj,
                     ahf_file=kwargs['haloid_file'],
-                    snapshot_file=self.snap,
+                    snapshot_file=(None if star_ids is not None else self.snap),
+                    star_particle_ids=star_ids,
                 )
+                setattr(obj, "_ahf_matched", True)
             except Exception as exc:
                 mylog.warning('Subhalo matching failed: %s' % exc)
         obj.save(self.outfile)

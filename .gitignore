@@ -98,6 +98,7 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+group_func.c
 
 # VS Code
 .vscode/

@@ -100,15 +100,10 @@ def fubar_halo(obj):
         and 'haloid_file' in obj._kwargs
     ):
         try:
-            from caesar.halo_matching import match_subhalos_to_galaxies
-            from caesar.property_manager import get_property
-
-            star_ids = get_property(obj, 'pid', 'star').d
-            match_subhalos_to_galaxies(
-                obj,
-                ahf_file=obj._kwargs['haloid_file'],
-                star_particle_ids=star_ids,
-            )
+            from caesar.halo_matching import integrate_ahf_match_prune_inplace
+            integrate_ahf_match_prune_inplace(obj, obj._kwargs['haloid_file'])
+            # Mark that we've completed AHF subhalo matching to avoid double invocation
+            setattr(obj, "_ahf_matched", True)
         except Exception as exc:  # pragma: no cover - optional heavy deps
             mylog.warning('Subhalo matching failed: %s' % exc)
 
