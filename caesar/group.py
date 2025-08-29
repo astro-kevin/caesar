@@ -874,14 +874,25 @@ def collate_group_ids(grp_list,part_type,ntot):
 
 
     ngroup = len(grp_list)
-    grpids = np.zeros(ntot,dtype=np.int64)
-    gid_bins = np.zeros(ngroup+1,dtype=np.int64)
+    # Compute the exact number of particle indices we will collate, rather than using
+    # an upper bound (ntot). This avoids allocating and duplicating large unused tails
+    # when building gathered arrays for property calculations.
+    total_used = 0
+    for igrp in range(ngroup):
+        mylist = 'grp_list[igrp].' + suffix
+        total_used += len(eval(mylist))
+
+    grpids = np.empty(total_used, dtype=np.int64)
+    gid_bins = np.zeros(ngroup+1, dtype=np.int64)
+
     i0 = 0
     for igrp in range(ngroup):
-        mylist = 'grp_list[igrp].'+suffix
-        i1 = i0 + len(eval(mylist))
+        mylist = 'grp_list[igrp].' + suffix
+        lst = eval(mylist)
+        i1 = i0 + len(lst)
         gid_bins[igrp+1] = i1
-        grpids[i0:i1] = eval(mylist)
+        if len(lst) > 0:
+            grpids[i0:i1] = lst
         i0 = i1
 
     return ngroup, grpids, gid_bins
