@@ -481,49 +481,153 @@ def _pid_to_index_map(arr: np.ndarray) -> Dict[int, int]:
 
 
 def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
-    """Integrate AHF star-only matching, hierarchical pruning, and reassignment.
+    """Integrate AHF matching per your spec, then prune and reassign.
 
-    Modifies ``sim.galaxy_list`` in-place before property recomputation.
+    Matching policy:
+    - For each CAESAR galaxy, record all AHF nodes whose star overlap > 50%.
+    - After collecting candidates, choose the lowest-level (deepest) node.
+    - Then compute exclusives and reassign particle lists from that node.
+
+    Honors ``sim.nproc`` for parallel selection across galaxies.
     """
     from caesar.property_manager import get_property, has_ptype
-    from caesar.group import get_group_properties
 
     # Must have a galaxy list already
     if not hasattr(sim, 'galaxy_list') or len(sim.galaxy_list) == 0:
         return
 
-    # Build CAESAR galaxy star PID memberships
-    star_ids = get_property(sim, 'pid', 'star').d.astype(np.int64)
-    caesar_data = _galaxies_to_namedata_from_group_list(sim.galaxy_list, star_ids)
-
-    # Load full AHF particle memberships (all ptypes) and index by ID
-    ahf_lines = _maybe_readlines(ahf_particles_file)
-    ahf_all = read_file_to_structure(ahf_particles_file, lines=ahf_lines)
-    ahf_by_id: Dict[int, ParticleMembership] = {pm.id: pm for pm in ahf_all}
-
-    # Match galaxies to AHF by star intersection
+    # Resolve n_jobs
     n_jobs = getattr(sim, 'nproc', None)
     try:
-        n_jobs = int(n_jobs) if n_jobs is not None else None
+        n_jobs = int(n_jobs) if n_jobs is not None else 1
     except Exception:
-        n_jobs = None
-    matches = find_best_matches(caesar_data, ahf_all, n_jobs=n_jobs)
+        n_jobs = 1
 
-    # Map AHF ID -> list of CAESAR galaxy indices in sim.galaxy_list
+    # Star PID array and PID->index map
+    star_ids = get_property(sim, 'pid', 'star').d.astype(np.int64)
+    pid_to_star_index: Dict[int, int] = _pid_to_index_map(star_ids)
+
+    # Build star_index -> galaxy_index map and per-galaxy star counts
+    nstar = len(star_ids)
+    staridx_to_galidx = np.full(nstar, -1, dtype=np.int32)
+    galaxy_star_counts = np.zeros(len(sim.galaxy_list), dtype=np.int64)
+    for gi, gal in enumerate(sim.galaxy_list):
+        sl = getattr(gal, 'slist', [])
+        if sl is None:
+            continue
+        if isinstance(sl, np.ndarray):
+            sl_idx = sl
+        else:
+            sl_idx = np.array(list(sl), dtype=np.int64)
+        if sl_idx.size == 0:
+            continue
+        staridx_to_galidx[sl_idx] = gi
+        galaxy_star_counts[gi] = sl_idx.size
+
+    # Read AHF particles file once and tally per-galaxy AHF star overlaps
     from collections import defaultdict
-    mapping: Dict[int, List[int]] = defaultdict(list)
-    caesar_gid_to_index = {int(g.GroupID): i for i, g in enumerate(sim.galaxy_list)}
-    for idx, (gid, ahf_id) in enumerate(matches):
-        if ahf_id != -1:
-            gi = caesar_gid_to_index.get(int(gid))
-            if gi is not None:
-                mapping[int(ahf_id)].append(gi)
+    gal_to_counts: List[Dict[int, int]] = [defaultdict(int) for _ in range(len(sim.galaxy_list))]
+
+    def _open_particles(path: str):
+        if path.endswith('.gz'):
+            import gzip
+            return gzip.open(path, 'rt')
+        return open(path, 'r')
+
+    with _open_particles(ahf_particles_file) as f:
+        current_hid = None
+        remaining = 0
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if remaining == 0 and len(parts) == 2:
+                # Header line: "npart hid"
+                try:
+                    remaining = int(parts[0])
+                    current_hid = int(parts[1])
+                except Exception:
+                    current_hid = None
+                    remaining = 0
+                continue
+            if remaining > 0:
+                remaining -= 1
+                pparts = line.split('\t')
+                if len(pparts) != 2:
+                    continue
+                try:
+                    pid = int(pparts[0])
+                    ptype = int(pparts[1])
+                except Exception:
+                    continue
+                # Only consider stars for galaxy matching
+                if ptype != 4 or current_hid is None:
+                    continue
+                si = pid_to_star_index.get(pid)
+                if si is None:
+                    continue
+                gi = int(staridx_to_galidx[si])
+                if gi < 0:
+                    continue
+                gal_to_counts[gi][current_hid] += 1
+
+    # Load AHF hierarchy to support lowest-level selection and exclusives
+    parent_of, children_of = _read_ahf_hierarchy(ahf_particles_file)
+
+    # Cache depths for speed
+    depth_cache: Dict[int, int] = {}
+    def depth(h: int) -> int:
+        if h in depth_cache:
+            return depth_cache[h]
+        d = 0
+        cur = h
+        while True:
+            p = parent_of.get(cur, 0)
+            if p is None or p == 0:
+                break
+            d += 1
+            cur = p
+        depth_cache[h] = d
+        return d
+
+    # Choose selected AHF node per galaxy
+    indices = list(range(len(sim.galaxy_list)))
+    def _select_for_gal(gi: int) -> int:
+        counts = gal_to_counts[gi]
+        total = int(galaxy_star_counts[gi])
+        if total <= 0 or not counts:
+            return -1
+        thresh = 0.5 * total
+        # Candidates > 50%
+        cands = [hid for hid, c in counts.items() if c > thresh]
+        if not cands:
+            # Fallback: best by count
+            hid = max(counts.items(), key=lambda kv: kv[1])[0]
+            return int(hid)
+        # Pick lowest-level (max depth); tie-break by count then id
+        cands.sort(key=lambda h: (depth(h), counts[h], h))
+        return int(cands[-1])
+
+    selected: List[int]
+    if n_jobs is not None and n_jobs > 1:
+        try:
+            from joblib import Parallel, delayed
+            selected = Parallel(n_jobs=n_jobs, backend='loky')(delayed(_select_for_gal)(gi) for gi in indices)
+        except Exception:
+            selected = [_select_for_gal(gi) for gi in indices]
+    else:
+        selected = [_select_for_gal(gi) for gi in indices]
+
+    # Build mapping from selected AHF ID -> list of galaxy indices
+    from collections import defaultdict as _dd
+    mapping: Dict[int, List[int]] = _dd(list)
+    for gi, hid in enumerate(selected):
+        if hid is not None and int(hid) != -1:
+            mapping[int(hid)].append(gi)
 
     if not mapping:
         return
-
-    # Build AHF hierarchy
-    parent_of, children_of = _read_ahf_hierarchy(ahf_particles_file)
 
     matched_ids = set(mapping.keys())
     # Need all ancestors of matched nodes and all their descendants for pruning
@@ -531,13 +635,67 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
     descendants = _collect_descendants(matched_ids, children_of)
     needed_ids = matched_ids | ancestors | descendants
 
-    # Compute exclusive memberships bottom-up
+    # Load memberships only for needed IDs to save time/memory
+    def _read_needed_memberships(path: str, needed: Set[int]) -> Dict[int, ParticleMembership]:
+        out: Dict[int, ParticleMembership] = {}
+        with _open_particles(path) as f:
+            current_hid = None
+            remaining = 0
+            cur_pm: Optional[ParticleMembership] = None
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if remaining == 0 and len(parts) == 2:
+                    # finalize previous if any
+                    if cur_pm is not None and cur_pm.id in needed:
+                        out[cur_pm.id] = cur_pm
+                    # new header
+                    try:
+                        remaining = int(parts[0])
+                        current_hid = int(parts[1])
+                    except Exception:
+                        current_hid = None
+                        remaining = 0
+                        cur_pm = None
+                        continue
+                    cur_pm = ParticleMembership(current_hid) if current_hid in needed else None
+                    continue
+                if remaining > 0:
+                    remaining -= 1
+                    if cur_pm is None:
+                        continue
+                    pparts = line.split('\t')
+                    if len(pparts) != 2:
+                        continue
+                    try:
+                        pid = int(pparts[0])
+                        ptype = int(pparts[1])
+                    except Exception:
+                        continue
+                    if ptype == 0:
+                        cur_pm.parttype0.add(pid)
+                    elif ptype == 1:
+                        cur_pm.parttype1.add(pid)
+                    elif ptype == 4:
+                        cur_pm.parttype4.add(pid)
+                    elif ptype == 5:
+                        cur_pm.parttype5.add(pid)
+            # finalize last
+            if cur_pm is not None and cur_pm.id in needed:
+                out[cur_pm.id] = cur_pm
+        return out
+
+    ahf_by_id = _read_needed_memberships(ahf_particles_file, needed_ids)
+
+    # Compute exclusives bottom-up for needed nodes
     exclusives = _compute_exclusive_memberships(ahf_by_id, children_of, needed_ids)
 
-    # Build PID->index maps for each ptype present
+    # Build PID->index maps for each ptype present (for reassignment)
     pid_maps: Dict[str, Dict[int, int]] = {}
     if has_ptype(sim, 'star'):
-        pid_maps['star'] = _pid_to_index_map(star_ids)
+        pid_maps['star'] = pid_to_star_index
     if has_ptype(sim, 'dm'):
         pid_maps['dm'] = _pid_to_index_map(get_property(sim, 'pid', 'dm').d.astype(np.int64))
     if has_ptype(sim, 'gas'):
