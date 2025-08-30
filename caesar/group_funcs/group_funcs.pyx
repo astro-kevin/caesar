@@ -456,7 +456,8 @@ def get_group_dust_properties(group,grp_list):
     cdef:
         ## gas quantities
         long long[:] hid_bins = did_bins   # starting indexes of particle IDs in each group
-        float[:]   dm = group.obj.data_manager.mass[grpids]
+        long long[:] dmap = group.obj.data_manager.dlist[grpids]
+        float[:]   dm = group.obj.data_manager.mass[dmap]
 
         # general variables#
         int ng = ngroup
@@ -493,14 +494,16 @@ def get_group_gas_properties(group,grp_list):
     cdef:
         ## gas quantities
         long long[:] hid_bins = gid_bins   # starting indexes of particle IDs in each group
-        float[:]   gm = np.float32(group.obj.data_manager.mass[grpids])
-        float[:]   gnh = group.obj.data_manager.gnh[grpids]
-        float[:]   gsfr = np.float32(group.obj.data_manager.gsfr[grpids])
-        float[:]   gZ = group.obj.data_manager.gZ[grpids]
-        float[:]   gtemp = group.obj.data_manager.gT[grpids]
-        float[:]   gfH2 = group.obj.data_manager.gfH2[grpids]
-        float[:]   gfHI = group.obj.data_manager.gfHI[grpids]
-        float[:]   mdust = group.obj.data_manager.dustmass[grpids]
+        # grpids are indices into the gas-only slice (glist). Map to global particle indices first.
+        long long[:] gmap = group.obj.data_manager.glist[grpids]
+        float[:]   gm = np.float32(group.obj.data_manager.mass[gmap])
+        float[:]   gnh = group.obj.data_manager.gnh[gmap]
+        float[:]   gsfr = np.float32(group.obj.data_manager.gsfr[gmap])
+        float[:]   gZ = group.obj.data_manager.gZ[gmap]
+        float[:]   gtemp = group.obj.data_manager.gT[gmap]
+        float[:]   gfH2 = group.obj.data_manager.gfH2[gmap]
+        float[:]   gfHI = group.obj.data_manager.gfHI[gmap]
+        float[:]   mdust = group.obj.data_manager.dustmass[gmap]
         # general variables
         int ng = ngroup
         int my_nproc = group.nproc
@@ -586,9 +589,10 @@ def get_group_star_properties(group,grp_list):
     cdef:
         ## star quantities
         long long[:] hid_bins = gid_bins   # starting indexes of particle IDs in each group
-        float[:]   sm = np.float32(group.obj.data_manager.mass[grpids])
-        float[:]   sZ = group.obj.data_manager.sZ[grpids]
-        float[:]   sage = group.obj.data_manager.age[grpids]
+        long long[:] smap = group.obj.data_manager.slist[grpids]
+        float[:]   sm = np.float32(group.obj.data_manager.mass[smap])
+        float[:]   sZ = group.obj.data_manager.sZ[smap]
+        float[:]   sage = group.obj.data_manager.age[smap]
         # general variables
         int ng = ngroup
         int my_nproc = group.nproc
@@ -638,8 +642,9 @@ def get_group_bh_properties(group,grp_list):
     cdef:
         ## bh quantities
         long long[:] hid_bins = gid_bins   # starting indexes of particle IDs in each group
-        float[:]   bhmass = np.float32(group.obj.data_manager.bhmass[grpids])
-        float[:]   bhmdot = group.obj.data_manager.bhmdot[grpids]
+        long long[:] bmap = group.obj.data_manager.bhlist[grpids]
+        float[:]   bhmass = np.float32(group.obj.data_manager.bhmass[bmap])
+        float[:]   bhmdot = group.obj.data_manager.bhmdot[bmap]
         # general variables
         int ng = ngroup
         int my_nproc = group.nproc

@@ -19672,8 +19672,8 @@ static CYTHON_INLINE PyObject *__pyx_f_5numpy_PyDataType_SHAPE(PyArray_Descr *__
  *         return ()
  */
     __Pyx_XDECREF(__pyx_r);
-    __Pyx_INCREF(((PyObject*)__pyx_v_d->subarray->shape));
-    __pyx_r = ((PyObject*)__pyx_v_d->subarray->shape);
+    __Pyx_INCREF(((PyObject*)PyDataType_SUBARRAY(__pyx_v_d)->shape));
+    __pyx_r = ((PyObject*)PyDataType_SUBARRAY(__pyx_v_d)->shape);
     goto __pyx_L0;
 
     /* "../anaconda3/envs/p3.12/lib/python3.12/site-packages/numpy/__init__.cython-30.pxd":789
