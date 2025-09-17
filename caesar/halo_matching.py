@@ -441,6 +441,13 @@ def build_galaxies_from_ahf_fast(
     ctx = _Ctx(sim)
     _get_group_properties(ctx, sim.galaxy_list)
 
+    # Ensure group_types includes 'galaxy' so downstream reverse maps are built
+    try:
+        if 'galaxy' not in sim.group_types:
+            sim.group_types.append('galaxy')
+    except Exception:
+        pass
+
     # Exclusive DM reverse map in full-snapshot space, using final GroupIDs
     if ndm_full > 0:
         exclusive_gal_dm = np.full(ndm_full, -1, dtype=np.int32)
