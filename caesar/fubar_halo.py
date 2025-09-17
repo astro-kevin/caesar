@@ -104,6 +104,8 @@ def fubar_halo(obj):
             integrate_ahf_match_prune_inplace(obj, obj._kwargs['haloid_file'])
             # Mark that we've completed AHF subhalo matching to avoid double invocation
             setattr(obj, "_ahf_matched", True)
+            # Enable DM properties for galaxies for this AHF-integrated run
+            setattr(obj, "_include_dm_in_galaxies", True)
         except Exception as exc:  # pragma: no cover - optional heavy deps
             mylog.warning('Subhalo matching failed: %s' % exc)
 
@@ -222,7 +224,11 @@ def load_global_lists(obj):
         setattr(obj.global_particle_lists, '%s_slist'  % group_type, slist)
         setattr(obj.global_particle_lists, '%s_bhlist' % group_type, bhlist)
         setattr(obj.global_particle_lists, '%s_dlist'  % group_type, dlist)
-        setattr(obj.global_particle_lists, '%s_dmlist' % group_type, dmlist)
+        # If we have an exclusive DM override for galaxies, use it for the global reverse map
+        if group_type == 'galaxy' and hasattr(obj, '_exclusive_galaxy_dmlist'):
+            setattr(obj.global_particle_lists, '%s_dmlist' % group_type, obj._exclusive_galaxy_dmlist)
+        else:
+            setattr(obj.global_particle_lists, '%s_dmlist' % group_type, dmlist)
         if 'dm2' in obj.data_manager.ptypes: setattr(obj.global_particle_lists, '%s_dm2list'% group_type, dm2list)
         if 'dm3' in obj.data_manager.ptypes: setattr(obj.global_particle_lists, '%s_dm3list'% group_type, dm3list)
 

@@ -162,6 +162,41 @@ def find_best_matches(
         return [best_for(pm1) for pm1 in tqdm(list1, desc="Matching Progress")]
 
 
+def _build_selected_pid_maps(sim) -> Dict[str, Dict[int, int]]:
+    """Build PID -> selected-index maps for each ptype present in the CAESAR-selected subset.
+
+    The selected index is the index within the CAESAR DataManager per-type lists
+    (e.g., ``data_manager.slist``, ``glist``, etc.), not the full-snapshot index.
+
+    Returns a dict like { 'star': {pid: sel_idx}, ... } for the ptypes available.
+    """
+    from caesar.property_manager import get_property, has_ptype
+
+    maps: Dict[str, Dict[int, int]] = {}
+
+    def add_map(ptype: str, list_name: str) -> None:
+        if not has_ptype(sim, ptype):
+            return
+        sel = getattr(sim.data_manager, list_name, None)
+        if sel is None or len(sel) == 0:
+            return
+        # Map CAESAR-selected per-type indices back to full-snapshot per-type indices
+        # via DataManager.indexes, then obtain PIDs and build pid->selected-index map.
+        try:
+            full_indices = sim.data_manager.indexes[sel]
+            full_pids = get_property(sim, 'pid', ptype).d.astype(np.int64)
+            sel_pids = full_pids[full_indices]
+            maps[ptype] = {int(pid): int(i) for i, pid in enumerate(sel_pids.tolist())}
+        except Exception:
+            return
+
+    add_map('star', 'slist')
+    add_map('gas', 'glist')
+    add_map('bh', 'bhlist')
+    add_map('dm', 'dmlist')
+    return maps
+
+
 def get_caesar_file(directory: str, number: int) -> str:
     filename = os.path.join(directory, f"Simba_M200_snap_{number:03d}.h5")
     if not os.path.isfile(filename):
@@ -507,22 +542,31 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
     star_ids = get_property(sim, 'pid', 'star').d.astype(np.int64)
     pid_to_star_index: Dict[int, int] = _pid_to_index_map(star_ids)
 
-    # Build star_index -> galaxy_index map and per-galaxy star counts
+    # Build star_index (full per-type) -> galaxy_index map and per-galaxy star counts.
+    # Convert CAESAR-selected star indices (gal.slist) to full per-type star indices via
+    # the concatenated-index mapping in DataManager (slist -> concatenated -> indexes -> full).
     nstar = len(star_ids)
     staridx_to_galidx = np.full(nstar, -1, dtype=np.int32)
     galaxy_star_counts = np.zeros(len(sim.galaxy_list), dtype=np.int64)
+    dm_slist = getattr(sim.data_manager, 'slist', None)
+    if dm_slist is None:
+        dm_slist = np.array([], dtype=np.int64)
     for gi, gal in enumerate(sim.galaxy_list):
         sl = getattr(gal, 'slist', [])
         if sl is None:
             continue
-        if isinstance(sl, np.ndarray):
-            sl_idx = sl
-        else:
-            sl_idx = np.array(list(sl), dtype=np.int64)
-        if sl_idx.size == 0:
+        if not isinstance(sl, np.ndarray):
+            sl = np.array(list(sl), dtype=np.int64)
+        if sl.size == 0:
             continue
-        staridx_to_galidx[sl_idx] = gi
-        galaxy_star_counts[gi] = sl_idx.size
+        try:
+            concat_idx = dm_slist[sl]
+            full_idx = sim.data_manager.indexes[concat_idx]
+            staridx_to_galidx[full_idx] = gi
+            galaxy_star_counts[gi] = sl.size
+        except Exception:
+            # If mapping fails for any reason, skip this galaxy for matching
+            continue
 
     # Read AHF particles file once and tally per-galaxy AHF star overlaps
     from collections import defaultdict
@@ -689,26 +733,36 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
 
     ahf_by_id = _read_needed_memberships(ahf_particles_file, needed_ids)
 
-    # Compute exclusives bottom-up for needed nodes
+    # Compute exclusives bottom-up for needed nodes (for baryons)
     exclusives = _compute_exclusive_memberships(ahf_by_id, children_of, needed_ids)
 
-    # Build PID->index maps for each ptype present (for reassignment)
-    pid_maps: Dict[str, Dict[int, int]] = {}
-    if has_ptype(sim, 'star'):
-        pid_maps['star'] = pid_to_star_index
-    if has_ptype(sim, 'dm'):
-        pid_maps['dm'] = _pid_to_index_map(get_property(sim, 'pid', 'dm').d.astype(np.int64))
-    if has_ptype(sim, 'gas'):
-        pid_maps['gas'] = _pid_to_index_map(get_property(sim, 'pid', 'gas').d.astype(np.int64))
-    if has_ptype(sim, 'bh'):
-        pid_maps['bh'] = _pid_to_index_map(get_property(sim, 'pid', 'bh').d.astype(np.int64))
+    # Build PID->selected-index maps for each ptype present (for reassignment)
+    pid_maps_sel: Dict[str, Dict[int, int]] = _build_selected_pid_maps(sim)
 
-    # Helper to map PID sets to index arrays
+    # Also build full-snapshot PID->index maps for DM to construct the exclusive reverse map
+    ndm_full = 0
+    pid_to_dm_fullidx: Dict[int, int] = {}
+    if has_ptype(sim, 'dm'):
+        dm_pids_full = get_property(sim, 'pid', 'dm').d.astype(np.int64)
+        ndm_full = len(dm_pids_full)
+        if ndm_full > 0:
+            pid_to_dm_fullidx = {int(pid): int(i) for i, pid in enumerate(dm_pids_full.tolist())}
+
+    # Helper to map PID sets to selected index arrays
     def map_set(pidset: Set[int], key: str) -> List[int]:
-        mp = pid_maps.get(key, {})
+        mp = pid_maps_sel.get(key, {})
+        if not mp or not pidset:
+            return []
         return [mp[pid] for pid in pidset if pid in mp]
 
-    # Merge galaxies per AHF ID and overwrite particle lists with exclusive sets
+    # Exclusive DM reverse map for global list reconstruction
+    exclusive_gal_dm = None
+    if ndm_full > 0:
+        exclusive_gal_dm = np.full(ndm_full, -1, dtype=np.int32)
+
+    # Merge galaxies per AHF ID and overwrite particle lists
+    # - Stars/gas/BH: use exclusives
+    # - DM: use inclusive membership (selected node + all its subhalos already included in AHF block)
     to_remove: Set[int] = set()
     for ahf_id, gal_indices in mapping.items():
         if ahf_id not in exclusives:
@@ -718,12 +772,59 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
         base_i = gal_indices[0]
         base = sim.galaxy_list[base_i]
 
-        # Overwrite lists from exclusives
+        # Overwrite lists from exclusives (baryons)
         base.slist = np.array(map_set(e.parttype4, 'star'), dtype=np.int32)
-        base.dmlist = np.array(map_set(e.parttype1, 'dm'), dtype=np.int32) if hasattr(base, 'dmlist') else np.array(map_set(e.parttype1, 'dm'), dtype=np.int32)
         base.glist = np.array(map_set(e.parttype0, 'gas'), dtype=np.int32) if hasattr(base, 'glist') else np.array(map_set(e.parttype0, 'gas'), dtype=np.int32)
         if 'bh' in pid_maps:
             base.bhlist = np.array(map_set(e.parttype5, 'bh'), dtype=np.int32)
+
+        # DM: use inclusive membership from the selected AHF node (AHF block includes subhalos)
+        dm_pm = ahf_by_id.get(ahf_id)
+        dm_set: Set[int] = set()
+        if dm_pm is not None:
+            dm_set = dm_pm.parttype1
+        base.dmlist = np.array(map_set(dm_set, 'dm'), dtype=np.int32)
+        # Populate exclusive reverse map for this galaxy (in full-snapshot DM index space)
+        if exclusive_gal_dm is not None and e.parttype1:
+            if pid_to_dm_fullidx:
+                ex_full = [pid_to_dm_fullidx[pid] for pid in e.parttype1 if pid in pid_to_dm_fullidx]
+                if ex_full:
+                    exclusive_gal_dm[np.array(ex_full, dtype=np.int64)] = int(base.GroupID)
+
+        # Rebuild global_indexes to include current per-type lists (so overall properties see DM when enabled)
+        gi = []
+        try:
+            # gas
+            if hasattr(base, 'glist') and base.glist is not None and len(base.glist) > 0:
+                gi.append(sim.data_manager.glist[base.glist])
+        except Exception:
+            pass
+        try:
+            # stars
+            if hasattr(base, 'slist') and base.slist is not None and len(base.slist) > 0:
+                gi.append(sim.data_manager.slist[base.slist])
+        except Exception:
+            pass
+        try:
+            # dm
+            if hasattr(base, 'dmlist') and base.dmlist is not None and len(base.dmlist) > 0 and has_ptype(sim, 'dm'):
+                gi.append(sim.data_manager.dmlist[base.dmlist])
+        except Exception:
+            pass
+        try:
+            # bh
+            if hasattr(base, 'bhlist') and base.bhlist is not None and len(base.bhlist) > 0 and 'bh' in pid_maps:
+                gi.append(sim.data_manager.bhlist[base.bhlist])
+        except Exception:
+            pass
+        try:
+            # dust
+            if hasattr(base, 'dlist') and base.dlist is not None and len(base.dlist) > 0:
+                gi.append(sim.data_manager.dlist[base.dlist])
+        except Exception:
+            pass
+        if gi:
+            base.global_indexes = np.concatenate(gi).astype(np.int64)
 
         # Mark other matched galaxies for removal
         for gi in gal_indices[1:]:
@@ -743,3 +844,6 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
         sim.ngalaxies = len(new_list)
 
     # Do not recompute properties here; caller (member_search flow) will handle it
+    # Stash exclusive DM reverse map for global list construction
+    if exclusive_gal_dm is not None:
+        setattr(sim, '_exclusive_galaxy_dmlist', exclusive_gal_dm)

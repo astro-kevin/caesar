@@ -515,9 +515,11 @@ def setup_indexes(self,halo_indexes):
         return np.zeros(1,dtype=np.int32)
     # collect particles for fof6d: first apply dense gas cut
     gas_indexes = halo_indexes[my_ptype == ptype_ints['gas']]
-    gtemp = self.obj.data_manager.gT[gas_indexes]
-    gsfr = self.obj.data_manager.gsfr[gas_indexes]
-    gnh = self.obj.data_manager.gnh[gas_indexes]
+    # Map global indices to per-type gas indices before indexing per-type arrays
+    gidx = self.obj.data_manager.indexes[gas_indexes]
+    gtemp = self.obj.data_manager.gT[gidx]
+    gsfr = self.obj.data_manager.gsfr[gidx]
+    gnh = self.obj.data_manager.gnh[gidx]
     select_dense_gas = self.dense_crit(gnh, gtemp, gsfr)
     dense_indexes = gas_indexes[select_dense_gas]
     # add in other particle types

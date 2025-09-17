@@ -120,6 +120,9 @@ class Group(object):
         """Galaxies/clouds do not have DM, so remove references."""
         if self.obj_type != 'galaxy' or not self._valid:
             return
+        # If AHF integration enabled DM for galaxies, retain DM references
+        if getattr(self.obj, '_include_dm_in_galaxies', False):
+            return
         self._delete_attribute('ndm')
         if 'dm2' in self.obj.data_manager.ptypes: self._delete_attribute('ndm2')
         if 'dm3' in self.obj.data_manager.ptypes: self._delete_attribute('ndm3')
@@ -594,7 +597,8 @@ class Group(object):
             half_masses[k] = 0.5 * v
 
         for k,v in six.iteritems(radial_categories):
-            if k == 'dm' and self.obj_type == 'galaxy': continue
+            if k == 'dm' and self.obj_type == 'galaxy' and not getattr(self.obj, '_include_dm_in_galaxies', False):
+                continue
             binary = 0
             for p in v:
                 binary += 2**p

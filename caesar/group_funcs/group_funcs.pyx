@@ -494,16 +494,17 @@ def get_group_gas_properties(group,grp_list):
     cdef:
         ## gas quantities
         long long[:] hid_bins = gid_bins   # starting indexes of particle IDs in each group
-        # grpids are indices into the gas-only slice (glist). Map to global particle indices first.
+        # Map per-type gas indices to global indices only for global arrays like mass.
         long long[:] gmap = group.obj.data_manager.glist[grpids]
         float[:]   gm = np.float32(group.obj.data_manager.mass[gmap])
-        float[:]   gnh = group.obj.data_manager.gnh[gmap]
-        float[:]   gsfr = np.float32(group.obj.data_manager.gsfr[gmap])
-        float[:]   gZ = group.obj.data_manager.gZ[gmap]
-        float[:]   gtemp = group.obj.data_manager.gT[gmap]
-        float[:]   gfH2 = group.obj.data_manager.gfH2[gmap]
-        float[:]   gfHI = group.obj.data_manager.gfHI[gmap]
-        float[:]   mdust = group.obj.data_manager.dustmass[gmap]
+        # Per-type gas arrays must be indexed by per-type indices (grpids).
+        float[:]   gnh = group.obj.data_manager.gnh[grpids]
+        float[:]   gsfr = np.float32(group.obj.data_manager.gsfr[grpids])
+        float[:]   gZ = group.obj.data_manager.gZ[grpids]
+        float[:]   gtemp = group.obj.data_manager.gT[grpids]
+        float[:]   gfH2 = group.obj.data_manager.gfH2[grpids]
+        float[:]   gfHI = group.obj.data_manager.gfHI[grpids]
+        float[:]   mdust = group.obj.data_manager.dustmass[grpids]
         # general variables
         int ng = ngroup
         int my_nproc = group.nproc
@@ -521,6 +522,7 @@ def get_group_gas_properties(group,grp_list):
         double[:]   grp_Zm = np.zeros(ngroup,dtype=np.float64)  # mass-weighted metallicity
         double[:]   grp_Zsfr = np.zeros(ngroup,dtype=np.float64)  # SFR-weighted metallicity
         double[:]   grp_Tm = np.zeros(ngroup,dtype=np.float64)  # mass-weighted temperature
+        double[:]   grp_Tm_num = np.zeros(ngroup,dtype=np.float64)  # accumulator for mass-weighted temperature numerator
         double[:]   grp_Tcgm = np.zeros(ngroup,dtype=np.float64)  # mass-weighted CGM temperature (excluding SF gas)
         double[:]   grp_Zcgm = np.zeros(ngroup,dtype=np.float64)  # mass-weighted CGM metallicity (excluding SF gas)
         double[:]   grp_TZcgm = np.zeros(ngroup,dtype=np.float64)  # metal-weighted CGM temperature (excluding SF gas)
@@ -539,13 +541,15 @@ def get_group_gas_properties(group,grp_list):
             grp_sfr[ig] += gsfr[i]
             grp_Zm[ig] += gZ[i]*gm[i]
             grp_Zsfr[ig] += gZ[i]*gsfr[i]
-            grp_Tm[ig] /= gm[i]*gtemp[i]
+            grp_Tm_num[ig] += gm[i]*gtemp[i]
             if gnh[i] < ism_thresh:
                 grp_Zcgm[ig] += gm[i]*gZ[i]
                 grp_Tcgm[ig] += gm[i]*gtemp[i]
                 grp_ZTcgm[ig] += gm[i]*gtemp[i]*gZ[i]
                 grp_TZcgm[ig] += gm[i]*gtemp[i]*gZ[i]
         grp_Zm[ig] /= grp_mass[ig]
+        if grp_mass[ig] > 0:
+            grp_Tm[ig] = grp_Tm_num[ig] / grp_mass[ig]
         if grp_sfr[ig]>0:
             grp_Zsfr[ig] /= grp_sfr[ig]
         if grp_mass[ig] - grp_mism[ig] > 0:
@@ -584,15 +588,14 @@ def get_group_star_properties(group,grp_list):
     from caesar.group import collate_group_ids
     ngroup, grpids, gid_bins = collate_group_ids(grp_list,'star',group.nparttype['star'])
 
-    mass_float32 = np.float32(group.obj.data_manager.mass[grpids])
-
     cdef:
         ## star quantities
         long long[:] hid_bins = gid_bins   # starting indexes of particle IDs in each group
         long long[:] smap = group.obj.data_manager.slist[grpids]
         float[:]   sm = np.float32(group.obj.data_manager.mass[smap])
-        float[:]   sZ = group.obj.data_manager.sZ[smap]
-        float[:]   sage = group.obj.data_manager.age[smap]
+        # Per-type star arrays (sZ, age) are indexed by per-type indices.
+        float[:]   sZ = group.obj.data_manager.sZ[grpids]
+        float[:]   sage = group.obj.data_manager.age[grpids]
         # general variables
         int ng = ngroup
         int my_nproc = group.nproc
@@ -643,8 +646,9 @@ def get_group_bh_properties(group,grp_list):
         ## bh quantities
         long long[:] hid_bins = gid_bins   # starting indexes of particle IDs in each group
         long long[:] bmap = group.obj.data_manager.bhlist[grpids]
-        float[:]   bhmass = np.float32(group.obj.data_manager.bhmass[bmap])
-        float[:]   bhmdot = group.obj.data_manager.bhmdot[bmap]
+        # Per-type BH arrays (bhmass, bhmdot) are indexed by per-type indices.
+        float[:]   bhmass = np.float32(group.obj.data_manager.bhmass[grpids])
+        float[:]   bhmdot = group.obj.data_manager.bhmdot[grpids]
         # general variables
         int ng = ngroup
         int my_nproc = group.nproc
@@ -713,12 +717,25 @@ def get_group_overall_properties(group,grp_list):
         int[6] pt_rints = np.zeros(6, dtype=np.int32)- 1 # for reversed part type saving information
     cn = 0
     for p in group.obj.data_manager.ptypes:
-        if (group.obj_type in ['galaxy', 'cloud']):
-            if p not in ['dm','dm2','dm3']:  # not DM informaiton for galaxies, see aperture calculation later
-                pt_ints.append(ptype_ints[p])
-                pt_names.append(p)
-                pt_rints[ptype_ints[p]] = cn
-                cn+=1
+        if group.obj_type == 'galaxy':
+            cdef bint include_dm = 0
+            try:
+                include_dm = 1 if getattr(group.obj, '_include_dm_in_galaxies') else 0
+            except Exception:
+                include_dm = 0
+            if (not include_dm) and (p in ['dm','dm2','dm3']):
+                continue  # default: exclude DM in galaxies unless flag enabled
+            pt_ints.append(ptype_ints[p])
+            pt_names.append(p)
+            pt_rints[ptype_ints[p]] = cn
+            cn += 1
+        elif group.obj_type == 'cloud':
+            if p in ['dm','dm2','dm3']:
+                continue
+            pt_ints.append(ptype_ints[p])
+            pt_names.append(p)
+            pt_rints[ptype_ints[p]] = cn
+            cn += 1
         else:
             pt_ints.append(ptype_ints[p])
             pt_rints[ptype_ints[p]] = cn
