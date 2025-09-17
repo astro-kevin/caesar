@@ -1,4 +1,5 @@
 import numpy as np
+import os
 from yt.funcs import mylog
 
 from caesar.property_manager import ptype_ints, ptype_aliases, get_particles_for_FOF, get_property, has_property
@@ -104,6 +105,56 @@ class DataManager(object):
         self._check_for_lowres_dm()
         
         if select is None: self._pdata_loaded = True
+
+    # ------------------------------
+    # Index-space mapping utilities
+    # ------------------------------
+    def _ptype_list(self, ptype: str):
+        """Return the concatenated index list array for a per-type (e.g., glist, slist)."""
+        key = f"{ptype}list"
+        if not hasattr(self, key):
+            return None
+        return getattr(self, key)
+
+    def selected_to_concat(self, ptype: str, sel_idx: np.ndarray) -> np.ndarray:
+        """Map selected per-type indices -> concatenated indices via the per-type list array.
+
+        Parameters
+        ----------
+        ptype : {'gas','star','bh','dm','dm2','dm3'}
+        sel_idx : np.ndarray (int)
+
+        Returns
+        -------
+        np.ndarray of concatenated indices
+        """
+        lst = self._ptype_list(ptype)
+        if lst is None or len(sel_idx) == 0:
+            return np.array([], dtype=np.int64)
+        return lst[sel_idx]
+
+    def concat_to_selected(self, ptype: str, concat_idx: np.ndarray) -> np.ndarray:
+        """Map concatenated indices -> selected per-type indices using searchsorted on the per-type list.
+
+        Assumes the per-type list (e.g., glist) is sorted ascending, which holds for
+        concatenated arrays constructed in DataManager.
+        """
+        lst = self._ptype_list(ptype)
+        if lst is None or concat_idx.size == 0:
+            return np.array([], dtype=np.int64)
+        pos = np.searchsorted(lst, concat_idx)
+        # Optional runtime validation to catch mismatches early
+        if os.environ.get('CAESAR_VALIDATE_INDEX') == '1':
+            try:
+                sample = pos if pos.size <= 5 else pos[np.linspace(0, pos.size - 1, 5, dtype=int)]
+                sel = concat_idx if concat_idx.size <= 5 else concat_idx[np.linspace(0, concat_idx.size - 1, 5, dtype=int)]
+                ok = np.all(lst[pos] == concat_idx)
+                if not ok:
+                    from yt.funcs import mylog
+                    mylog.warning(f'concat_to_selected mismatch for {ptype}: example lst[pos]={lst[sample][:3]} vs concat={sel[:3]}')
+            except Exception:
+                pass
+        return pos
 
     def _assign_local_lists(self):
         """Assigns local lists."""
