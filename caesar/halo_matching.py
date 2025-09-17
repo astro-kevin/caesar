@@ -197,6 +197,263 @@ def _build_selected_pid_maps(sim) -> Dict[str, Dict[int, int]]:
     return maps
 
 
+def _collect_all_node_ids(parent_of: Dict[int, Optional[int]], children_of: Dict[int, List[int]]) -> Set[int]:
+    ids: Set[int] = set(parent_of.keys())
+    for kids in children_of.values():
+        ids.update(kids)
+    return ids
+
+
+def _read_memberships_for_ids(path: str, needed: Set[int]) -> Dict[int, ParticleMembership]:
+    """Read AHF particle memberships only for the given IDs (supports .gz)."""
+    out: Dict[int, ParticleMembership] = {}
+
+    def _open_particles(p: str):
+        if p.endswith('.gz'):
+            import gzip
+            return gzip.open(p, 'rt')
+        return open(p, 'r')
+
+    with _open_particles(path) as f:
+        current_hid = None
+        remaining = 0
+        cur_pm: Optional[ParticleMembership] = None
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if remaining == 0 and len(parts) == 2:
+                # finalize previous if any
+                if cur_pm is not None and cur_pm.id in needed:
+                    out[cur_pm.id] = cur_pm
+                # new header
+                try:
+                    remaining = int(parts[0])
+                    current_hid = int(parts[1])
+                except Exception:
+                    current_hid = None
+                    remaining = 0
+                    cur_pm = None
+                    continue
+                cur_pm = ParticleMembership(current_hid) if current_hid in needed else None
+                continue
+            if remaining > 0:
+                remaining -= 1
+                if cur_pm is None:
+                    continue
+                pparts = line.split('\t')
+                if len(pparts) != 2:
+                    continue
+                try:
+                    pid = int(pparts[0])
+                    ptype = int(pparts[1])
+                except Exception:
+                    continue
+                if ptype == 0:
+                    cur_pm.parttype0.add(pid)
+                elif ptype == 1:
+                    cur_pm.parttype1.add(pid)
+                elif ptype == 4:
+                    cur_pm.parttype4.add(pid)
+                elif ptype == 5:
+                    cur_pm.parttype5.add(pid)
+        # finalize last
+        if cur_pm is not None and cur_pm.id in needed:
+            out[cur_pm.id] = cur_pm
+    return out
+
+
+def _root_of(node: int, parent_of: Dict[int, Optional[int]]) -> int:
+    cur = node
+    seen = set()
+    while True:
+        if cur in seen:
+            return cur
+        seen.add(cur)
+        p = parent_of.get(cur, 0)
+        if p is None or p == 0:
+            return cur
+        cur = int(p)
+
+
+def build_galaxies_from_ahf_fast(
+    sim,
+    ahf_particles_file: str,
+    *,
+    min_stars: int = 16,
+    n_jobs: Optional[int] = None,
+) -> None:
+    """Build galaxies directly from AHF nodes using a star-count gate.
+
+    - Uses exclusive baryon memberships computed from the AHF hierarchy.
+    - Keeps nodes with >= min_stars as galaxies.
+    - Deposits sub-threshold satellites into the host central; discards
+      top-level sub-threshold hosts with no eligible central.
+    - DM is inclusive for each selected node; an exclusive reverse map
+      is constructed for galaxies after properties are computed.
+    """
+    from caesar.group import create_new_group
+    from caesar.group import get_group_properties as _get_group_properties
+    from caesar.property_manager import get_property, has_ptype
+
+    # Build PID -> selected-index maps for per-type lists
+    pid_maps_sel = _build_selected_pid_maps(sim)
+
+    # Full-snapshot DM index map for reverse assignment
+    pid_to_dm_fullidx: Dict[int, int] = {}
+    ndm_full = 0
+    if has_ptype(sim, 'dm'):
+        dm_pids_full = get_property(sim, 'pid', 'dm').d.astype(np.int64)
+        ndm_full = len(dm_pids_full)
+        if ndm_full > 0:
+            pid_to_dm_fullidx = {int(pid): int(i) for i, pid in enumerate(dm_pids_full.tolist())}
+
+    # Load hierarchy and memberships
+    parent_of, children_of = _read_ahf_hierarchy(ahf_particles_file)
+    needed_ids = _collect_all_node_ids(parent_of, children_of)
+    if not needed_ids:
+        sim.galaxy_list = []
+        sim.ngalaxies = 0
+        return
+    ahf_by_id = _read_memberships_for_ids(ahf_particles_file, needed_ids)
+    exclusives = _compute_exclusive_memberships(ahf_by_id, children_of, needed_ids)
+
+    # Partition by host root
+    by_host: Dict[int, List[int]] = {}
+    for hid in needed_ids:
+        root = _root_of(hid, parent_of)
+        by_host.setdefault(root, []).append(hid)
+
+    galaxies = []
+    galnode_to_dm_exclusive: Dict[int, Set[int]] = {}
+
+    # Helper to map PID sets to selected indices
+    def map_sel(pidset: Set[int], key: str) -> List[int]:
+        mp = pid_maps_sel.get(key, {})
+        if not mp or not pidset:
+            return []
+        return [mp[pid] for pid in pidset if pid in mp]
+
+    # Build galaxy groups
+    for host, nodes in by_host.items():
+        # Eligible by star threshold
+        eligible = [n for n in nodes if len(exclusives.get(n, ParticleMembership(n)).parttype4) >= min_stars]
+        if not eligible:
+            # No central -> discard all nodes under this host
+            continue
+        # Choose central as eligible with max stars (tie-break by id)
+        central = max(eligible, key=lambda n: (len(exclusives[n].parttype4), n))
+
+        # Precompute deposit sets for central
+        deposit_star: Set[int] = set()
+        deposit_gas: Set[int] = set()
+        deposit_bh: Set[int] = set()
+        deposit_dm_inclusive: Set[int] = set()
+
+        for n in nodes:
+            if n == central:
+                continue
+            stars_n = exclusives.get(n, ParticleMembership(n)).parttype4
+            if len(stars_n) >= min_stars:
+                continue  # satellite galaxy remains separate
+            # Sub-threshold: deposit only if satellite (has parent)
+            if parent_of.get(n, 0) not in (None, 0):
+                ex = exclusives.get(n, ParticleMembership(n))
+                deposit_star |= ex.parttype4
+                deposit_gas |= ex.parttype0
+                deposit_bh |= ex.parttype5
+                dm_pm = ahf_by_id.get(n)
+                if dm_pm is not None:
+                    deposit_dm_inclusive |= dm_pm.parttype1
+            # else top-level and sub-threshold: discard
+
+        # Build central galaxy
+        cen_ex = exclusives[central]
+        cen_stars = set(cen_ex.parttype4) | deposit_star
+        cen_gas = set(cen_ex.parttype0) | deposit_gas
+        cen_bh = set(cen_ex.parttype5) | deposit_bh
+        cen_dm_inclusive = set(ahf_by_id.get(central, ParticleMembership(central)).parttype1) | deposit_dm_inclusive
+
+        g = create_new_group(sim, 'galaxy')
+        g.slist = np.array(map_sel(cen_stars, 'star'), dtype=np.int32)
+        g.glist = np.array(map_sel(cen_gas, 'gas'), dtype=np.int32)
+        if 'bh' in pid_maps_sel:
+            g.bhlist = np.array(map_sel(cen_bh, 'bh'), dtype=np.int32)
+        if 'dm' in pid_maps_sel:
+            g.dmlist = np.array(map_sel(cen_dm_inclusive, 'dm'), dtype=np.int32)
+        # Build global indexes for property kernels
+        gi = []
+        if len(g.glist) > 0:
+            gi.append(sim.data_manager.glist[g.glist])
+        if len(g.slist) > 0:
+            gi.append(sim.data_manager.slist[g.slist])
+        if hasattr(g, 'dmlist') and g.dmlist is not None and len(getattr(g, 'dmlist')) > 0 and has_ptype(sim, 'dm'):
+            gi.append(sim.data_manager.dmlist[g.dmlist])
+        if hasattr(g, 'bhlist') and g.bhlist is not None and len(getattr(g, 'bhlist')) > 0:
+            gi.append(sim.data_manager.bhlist[g.bhlist])
+        if gi:
+            g.global_indexes = np.concatenate(gi).astype(np.int64)
+        galaxies.append(g)
+        galnode_to_dm_exclusive[id(g)] = set(exclusives[central].parttype1)
+
+        # Satellite galaxies (eligible)
+        for n in eligible:
+            if n == central:
+                continue
+            ex = exclusives[n]
+            dm_incl = ahf_by_id.get(n, ParticleMembership(n)).parttype1
+            sg = create_new_group(sim, 'galaxy')
+            sg.slist = np.array(map_sel(ex.parttype4, 'star'), dtype=np.int32)
+            sg.glist = np.array(map_sel(ex.parttype0, 'gas'), dtype=np.int32)
+            if 'bh' in pid_maps_sel:
+                sg.bhlist = np.array(map_sel(ex.parttype5, 'bh'), dtype=np.int32)
+            if 'dm' in pid_maps_sel:
+                sg.dmlist = np.array(map_sel(dm_incl, 'dm'), dtype=np.int32)
+            gi = []
+            if len(sg.glist) > 0:
+                gi.append(sim.data_manager.glist[sg.glist])
+            if len(sg.slist) > 0:
+                gi.append(sim.data_manager.slist[sg.slist])
+            if hasattr(sg, 'dmlist') and sg.dmlist is not None and len(getattr(sg, 'dmlist')) > 0 and has_ptype(sim, 'dm'):
+                gi.append(sim.data_manager.dmlist[sg.dmlist])
+            if hasattr(sg, 'bhlist') and sg.bhlist is not None and len(getattr(sg, 'bhlist')) > 0:
+                gi.append(sim.data_manager.bhlist[sg.bhlist])
+            if gi:
+                sg.global_indexes = np.concatenate(gi).astype(np.int64)
+            galaxies.append(sg)
+            galnode_to_dm_exclusive[id(sg)] = set(exclusives[n].parttype1)
+
+    # Assign to sim and compute properties
+    sim.galaxy_list = galaxies
+    sim.ngalaxies = len(galaxies)
+
+    class _Ctx:
+        def __init__(self, sim):
+            self.obj = sim
+            self.obj_type = 'galaxy'
+            self.nproc = getattr(sim, 'nproc', 1)
+            self.load_pot = getattr(sim, 'load_pot', True)
+            self.nparttot = sum(len(getattr(g, 'global_indexes', [])) for g in sim.galaxy_list)
+            # not used by our collate, but keep a dict present
+            self.nparttype = {p: len(getattr(sim.data_manager, f"{p}list", [])) for p in ['gas','star','bh','dm','dm2','dm3'] if hasattr(sim.data_manager, f"{p}list")}
+
+    ctx = _Ctx(sim)
+    _get_group_properties(ctx, sim.galaxy_list)
+
+    # Exclusive DM reverse map in full-snapshot space, using final GroupIDs
+    if ndm_full > 0:
+        exclusive_gal_dm = np.full(ndm_full, -1, dtype=np.int32)
+        for g in sim.galaxy_list:
+            ex_dm = galnode_to_dm_exclusive.get(id(g))
+            if not ex_dm:
+                continue
+            idxs = [pid_to_dm_fullidx[pid] for pid in ex_dm if pid in pid_to_dm_fullidx]
+            if idxs:
+                exclusive_gal_dm[np.array(idxs, dtype=np.int64)] = int(g.GroupID)
+        setattr(sim, '_exclusive_galaxy_dmlist', exclusive_gal_dm)
+
+
 def get_caesar_file(directory: str, number: int) -> str:
     filename = os.path.join(directory, f"Simba_M200_snap_{number:03d}.h5")
     if not os.path.isfile(filename):

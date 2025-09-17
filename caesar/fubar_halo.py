@@ -73,6 +73,19 @@ def fubar_halo(obj):
     if not obj.simulation.baryons_present:  # if no baryons, we're done
         return
 
+    # AHF-fast: build galaxies directly from AHF without 6D-FOF
+    if 'haloid' in obj._kwargs and isinstance(obj._kwargs['haloid'], str) and obj._kwargs['haloid'].upper() == 'AHF-FAST' and 'haloid_file' in obj._kwargs:
+        try:
+            from caesar.halo_matching import build_galaxies_from_ahf_fast
+            build_galaxies_from_ahf_fast(obj, obj._kwargs['haloid_file'], min_stars=16)
+            setattr(obj, "_ahf_matched", True)
+            setattr(obj, "_include_dm_in_galaxies", True)
+            # proceed to finalize at end of function
+            get_group_properties = __import__('caesar.group', fromlist=['get_group_properties']).get_group_properties
+        except Exception as exc:
+            mylog.warning('AHF-fast galaxy build failed: %s' % exc)
+            # fall back to standard path below
+
     # Find galaxies, or load galaxy membership info
     if 'galid' in obj._kwargs and 'rockstar' in obj._kwargs['galid']:
         halos.load_rockstar_ids('bottomid')
@@ -81,35 +94,37 @@ def fubar_halo(obj):
         fof6d_flag = True
         if 'fof6d_file' in obj._kwargs and obj._kwargs['fof6d_file'] is not None:
             fof6d_flag = halos.load_fof6dfile()  # load galaxy ID's from fof6d_file
-        if fof6d_flag:
+        # Skip running 6D-FOF if AHF-FAST succeeded
+        if fof6d_flag and not getattr(obj, '_ahf_matched', False):
             halos.run_fof6d('galaxy')  # run fof6d on halos to find galaxies
             halos.save_fof6dfile()  # save fof6d info
 
     # Process galaxies
-    galaxies = fof6d(obj,'galaxy')  #instantiate a fof6d object
-    galaxies.plist_init(parent=halos)  # get particle list for computing galaxy properties
-    if galaxies.nparttot == 0: # plist_init didn't find any particles in a galaxy
-        mylog.warning('Not enough eligible galaxy particles found!')
-        return  
-    galaxies.load_lists(parent=halos)  # create galaxy_list, load particle index lists for galaxies
+    if not getattr(obj, '_ahf_matched', False):
+        galaxies = fof6d(obj,'galaxy')  #instantiate a fof6d object
+        galaxies.plist_init(parent=halos)  # get particle list for computing galaxy properties
+        if galaxies.nparttot == 0: # plist_init didn't find any particles in a galaxy
+            mylog.warning('Not enough eligible galaxy particles found!')
+            return  
+        galaxies.load_lists(parent=halos)  # create galaxy_list, load particle index lists for galaxies
 
-    if (
-        'haloid' in obj._kwargs
-        and isinstance(obj._kwargs['haloid'], str)
-        and obj._kwargs['haloid'].upper() == 'AHF'
-        and 'haloid_file' in obj._kwargs
-    ):
-        try:
-            from caesar.halo_matching import integrate_ahf_match_prune_inplace
-            integrate_ahf_match_prune_inplace(obj, obj._kwargs['haloid_file'])
-            # Mark that we've completed AHF subhalo matching to avoid double invocation
-            setattr(obj, "_ahf_matched", True)
-            # Enable DM properties for galaxies for this AHF-integrated run
-            setattr(obj, "_include_dm_in_galaxies", True)
-        except Exception as exc:  # pragma: no cover - optional heavy deps
-            mylog.warning('Subhalo matching failed: %s' % exc)
+        if (
+            'haloid' in obj._kwargs
+            and isinstance(obj._kwargs['haloid'], str)
+            and obj._kwargs['haloid'].upper() in ('AHF','AHF-FAST')
+            and 'haloid_file' in obj._kwargs
+            and obj._kwargs['haloid'].upper() != 'AHF-FAST'
+        ):
+            try:
+                from caesar.halo_matching import integrate_ahf_match_prune_inplace
+                integrate_ahf_match_prune_inplace(obj, obj._kwargs['haloid_file'])
+                setattr(obj, "_ahf_matched", True)
+                setattr(obj, "_include_dm_in_galaxies", True)
+            except Exception as exc:  # pragma: no cover - optional heavy deps
+                mylog.warning('Subhalo matching failed: %s' % exc)
 
-    get_group_properties(galaxies,galaxies.obj.galaxy_list)  # compute galaxy properties
+        from caesar.group import get_group_properties
+        get_group_properties(galaxies,galaxies.obj.galaxy_list)  # compute galaxy properties
     if ('fsps_bands' in obj._kwargs) and obj._kwargs['fsps_bands'] is not None:
         from caesar.pyloser.pyloser import photometry
         galphot = photometry(obj,galaxies.obj.galaxy_list)
