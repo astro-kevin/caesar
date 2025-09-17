@@ -394,6 +394,8 @@ def build_galaxies_from_ahf_fast(
             gi.append(sim.data_manager.bhlist[g.bhlist])
         if gi:
             g.global_indexes = np.concatenate(gi).astype(np.int64)
+        else:
+            g.global_indexes = np.array([], dtype=np.int64)
         galaxies.append(g)
         galnode_to_dm_exclusive[id(g)] = set(exclusives[central].parttype1)
 
@@ -421,6 +423,8 @@ def build_galaxies_from_ahf_fast(
                 gi.append(sim.data_manager.bhlist[sg.bhlist])
             if gi:
                 sg.global_indexes = np.concatenate(gi).astype(np.int64)
+            else:
+                sg.global_indexes = np.array([], dtype=np.int64)
             galaxies.append(sg)
             galnode_to_dm_exclusive[id(sg)] = set(exclusives[n].parttype1)
 
