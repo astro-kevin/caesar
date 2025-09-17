@@ -715,10 +715,11 @@ def get_group_overall_properties(group,grp_list):
     pt_names = []
     cdef:
         int[6] pt_rints = np.zeros(6, dtype=np.int32)- 1 # for reversed part type saving information
+        bint include_dm
     cn = 0
     for p in group.obj.data_manager.ptypes:
         if group.obj_type == 'galaxy':
-            cdef bint include_dm = 0
+            include_dm = 0
             try:
                 include_dm = 1 if getattr(group.obj, '_include_dm_in_galaxies') else 0
             except Exception:
