@@ -25,11 +25,12 @@ class DataManager(object):
 
     def _member_search_init(self, select='all'):
         """Collect particle information for member_search()"""
-        memlog('Initializing member search, loading particles')
+        mode = str(self.obj._kwargs.get('haloid', 'standard')).upper()
+        memlog(f'Initializing member search particle load (mode={mode})')
         self.obj.simulation.ds_type  = self.obj._ds_type.ds_type
 #         self._determine_ptypes()
         self.load_particle_data(select=select)
-        memlog('Loaded particle data')
+        memlog(f'Loaded particle data for mode={mode}')
         self._assign_particle_counts()
         if ('Gas' in self.obj._ds_type.ds.particle_fields_by_type) or ('PartType0' in self.obj._ds_type.ds.particle_fields_by_type):
             if isinstance(select,str) and select == 'all': self._load_gas_data()
@@ -40,7 +41,7 @@ class DataManager(object):
         if self.blackholes:
             if isinstance(select,str) and select == 'all': self._load_bh_data()
             else: self._load_bh_data(select=select['bh'])
-        memlog('Loaded baryon data')
+        memlog(f'Loaded baryon data for mode={mode}')
         
     def _determine_ptypes(self):
         """Determines what particle/field types to collect."""
