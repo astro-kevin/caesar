@@ -13,7 +13,7 @@ import numpy as np
 import gzip
 
 try:  # pragma: no cover - optional acceleration
-    from numba import njit, prange, types
+    from numba import njit, prange, types, set_num_threads
     from numba.typed import List as NumbaList, Set as NumbaSet
     _NUMBA_AVAILABLE = True
 except Exception:  # pragma: no cover
@@ -21,6 +21,7 @@ except Exception:  # pragma: no cover
     njit = None
     prange = range
     types = None
+    set_num_threads = None
     NumbaList = None
     NumbaSet = None
 
@@ -217,6 +218,12 @@ def find_best_matches(
         raise RuntimeError(
             "AHF matching requires the 'numba' package; please install numba to continue."
         )
+
+    if n_jobs is not None and set_num_threads is not None:
+        try:
+            set_num_threads(max(1, int(n_jobs)))
+        except Exception:
+            pass
 
     n_list1 = len(list1)
     if n_list1 == 0:
@@ -885,7 +892,11 @@ def match_subhalos_to_galaxies(
 
     ahf_data = read_file_to_structure(ahf_file, ptype_filter={1, 4})
     ahf_by_id = {pm.id: pm for pm in ahf_data}
-    matches = find_best_matches(caesar_data, ahf_data)
+    matches = find_best_matches(
+        caesar_data,
+        ahf_data,
+        n_jobs=getattr(sim, 'nproc', None),
+    )
 
     # Build mapping from AHF halo -> list of galaxy indices
     from collections import defaultdict
