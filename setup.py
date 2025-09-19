@@ -87,6 +87,10 @@ cython_extensions = [
     Extension('caesar.cyloser',
               sources=['caesar/pyloser/cyloser.pyx'],
               extra_compile_args=[compile_arg],
+              extra_link_args=[link_arg]),
+    Extension('caesar._fast_ahf',
+              sources=['caesar/_fast_ahf.pyx'],
+              extra_compile_args=[compile_arg],
               extra_link_args=[link_arg])
 ]
 
@@ -119,4 +123,3 @@ setup(
     },
     ext_modules=cython_extensions,
 )
-

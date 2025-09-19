@@ -83,8 +83,8 @@ def fubar_halo(obj):
             # proceed to finalize at end of function
             get_group_properties = __import__('caesar.group', fromlist=['get_group_properties']).get_group_properties
         except Exception as exc:
-            mylog.warning('AHF-fast galaxy build failed: %s' % exc)
-            # fall back to standard path below
+            mylog.exception('AHF-fast galaxy build failed')
+            raise
 
     # Find galaxies, or load galaxy membership info
     if 'galid' in obj._kwargs and 'rockstar' in obj._kwargs['galid']:

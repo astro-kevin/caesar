@@ -30,6 +30,14 @@ class ParticleMembership:
     parttype5: Set[int] = field(default_factory=set)
 
 
+try:  # Optional Cython accelerators
+    from caesar._fast_ahf import iter_memberships as _fast_iter_memberships
+    from caesar._fast_ahf import read_memberships_for_ids as _fast_read_memberships
+    _HAS_FAST_AHF = True
+except ImportError:  # pragma: no cover - optional extension
+    _HAS_FAST_AHF = False
+
+
 def read_file_to_structure(
     file_path: str,
     *,
@@ -289,8 +297,17 @@ def _group_nodes_by_root(parent_of: Dict[int, Optional[int]]) -> Tuple[Dict[int,
     return host_to_nodes, node_to_root
 
 
-def _iter_memberships_stream(path: str, needed: Set[int]) -> Iterator[ParticleMembership]:
+def _iter_memberships_stream(
+    path: str,
+    needed: Set[int],
+    *,
+    load_dm: bool = False,
+) -> Iterator[ParticleMembership]:
     """Yield memberships for nodes in ``needed`` while streaming the file."""
+
+    if _HAS_FAST_AHF:
+        yield from _fast_iter_memberships(path, needed, load_dm)
+        return
 
     with _open_ahf_particles(path) as fh:
         current_hid = None
@@ -335,6 +352,8 @@ def _iter_memberships_stream(path: str, needed: Set[int]) -> Iterator[ParticleMe
                     cur_pm.parttype4.add(pid)
                 elif ptype == 5:
                     cur_pm.parttype5.add(pid)
+                elif load_dm and ptype == 1:
+                    cur_pm.parttype1.add(pid)
 
         if cur_pm is not None and cur_pm.id in needed:
             yield cur_pm
@@ -347,6 +366,9 @@ def _read_memberships_for_ids(
     load_dm: bool = True,
 ) -> Dict[int, ParticleMembership]:
     """Read AHF particle memberships only for the given IDs (supports .gz)."""
+    if _HAS_FAST_AHF:
+        return _fast_read_memberships(path, needed, load_dm)
+
     out: Dict[int, ParticleMembership] = {}
 
     with _open_ahf_particles(path) as f:
@@ -431,15 +453,6 @@ def build_galaxies_from_ahf_fast(
 
     pid_maps_sel = _build_selected_pid_maps(sim)
     dm_pid_map: Dict[int, int] = pid_maps_sel.get('dm', {})
-    selected_index_to_pid: Optional[List[Optional[int]]] = None
-    if dm_pid_map:
-        max_idx = max(dm_pid_map.values(), default=-1)
-        selected_index_to_pid = [None] * (max_idx + 1)
-        for pid, idx in dm_pid_map.items():
-            if idx >= len(selected_index_to_pid):
-                selected_index_to_pid.extend([None] * (idx + 1 - len(selected_index_to_pid)))
-            selected_index_to_pid[idx] = int(pid)
-
     pid_to_dm_fullidx: Dict[int, int] = {}
     ndm_full = 0
     if dm_pid_map and has_ptype(sim, 'dm'):
@@ -463,8 +476,6 @@ def build_galaxies_from_ahf_fast(
     all_needed_nodes: Set[int] = set(node_to_root.keys())
 
     galaxies: List = []
-    dm_nodes_inclusive: Dict[int, Set[int]] = {}
-    dm_nodes_exclusive: Dict[int, Set[int]] = {}
 
     nodes_remaining: Dict[int, int] = {root: len(nodes) for root, nodes in host_to_nodes.items()}
     pending_members: Dict[int, Dict[int, ParticleMembership]] = {}
@@ -478,6 +489,15 @@ def build_galaxies_from_ahf_fast(
         jobs = 1
     jobs = max(1, jobs)
 
+    show_progress = bool(getattr(sim, '_show_progress', True))
+    total_hosts = len(host_to_nodes)
+    host_progress = tqdm(
+        total=total_hosts,
+        desc="Building galaxies (AHF-FAST)",
+        disable=(not show_progress or total_hosts == 0),
+        leave=False,
+    )
+
     def map_sel(pidset: Set[int], key: str) -> np.ndarray:
         mp = pid_maps_sel.get(key, {})
         if not mp or not pidset:
@@ -490,6 +510,8 @@ def build_galaxies_from_ahf_fast(
     def process_host(root_id: int, bucket: Dict[int, ParticleMembership]) -> None:
         nodes_for_host = host_to_nodes.get(root_id, set())
         if not nodes_for_host:
+            if host_progress is not None:
+                host_progress.update(1)
             return
 
         # Ensure every node has a membership object (possibly empty)
@@ -507,7 +529,7 @@ def build_galaxies_from_ahf_fast(
         deposit_star: Set[int] = set()
         deposit_gas: Set[int] = set()
         deposit_bh: Set[int] = set()
-        deposit_dm_nodes: Set[int] = set()
+        deposit_dm: Set[int] = set()
 
         for node in nodes_for_host:
             if node == central:
@@ -520,23 +542,26 @@ def build_galaxies_from_ahf_fast(
                 deposit_star |= ex.parttype4
                 deposit_gas |= ex.parttype0
                 deposit_bh |= ex.parttype5
-                deposit_dm_nodes.add(node)
+                deposit_dm |= ex.parttype1
 
         cen_ex = exclusives[central]
-        payloads: List[Tuple[ParticleMembership, Set[int], Set[int]]] = []
+        payloads: List[Tuple[ParticleMembership, Set[int]]] = []
 
         cen_star = set(cen_ex.parttype4) | deposit_star
         cen_gas = set(cen_ex.parttype0) | deposit_gas
         cen_bh = set(cen_ex.parttype5) | deposit_bh
+        cen_dm = set(cen_ex.parttype1)
+        if deposit_dm:
+            cen_dm |= deposit_dm
         central_payload = (
             ParticleMembership(
                 central,
                 parttype0=cen_gas,
+                parttype1=cen_dm,
                 parttype4=cen_star,
                 parttype5=cen_bh,
             ),
-            {central} | deposit_dm_nodes,
-            {central},
+            set(cen_dm),
         )
         payloads.append(central_payload)
 
@@ -546,21 +571,31 @@ def build_galaxies_from_ahf_fast(
             ex = exclusives[node]
             payloads.append(
                 (
-                    ex,
-                    {node},
-                    {node},
+                    ParticleMembership(
+                        node,
+                        parttype0=set(ex.parttype0),
+                        parttype1=set(ex.parttype1),
+                        parttype4=set(ex.parttype4),
+                        parttype5=set(ex.parttype5),
+                    ),
+                    set(ex.parttype1),
                 )
             )
 
-        def build_group(payload: Tuple[ParticleMembership, Set[int], Set[int]]):
-            pm, dm_inc, dm_exc = payload
+        def build_group(payload: Tuple[ParticleMembership, Set[int]]):
+            pm, dm_exc = payload
             grp = create_new_group(sim, 'galaxy')
             grp.slist = map_sel(pm.parttype4, 'star')
             grp.glist = map_sel(pm.parttype0, 'gas')
             if 'bh' in pid_maps_sel:
                 grp.bhlist = map_sel(pm.parttype5, 'bh')
+            if 'dm' in pid_maps_sel:
+                dm_selected = map_sel(pm.parttype1, 'dm')
+            else:
+                dm_selected = np.array([], dtype=np.int32)
+            grp.dmlist = dm_selected
             grp.global_indexes = np.array([], dtype=np.int64)
-            return grp, dm_inc, dm_exc
+            return grp, dm_exc
 
         results: List[Tuple] = []
         try:
@@ -573,13 +608,19 @@ def build_galaxies_from_ahf_fast(
             results = [build_group(payload) for payload in payloads]
 
         base_index = len(galaxies)
-        for offset, (grp, dm_inc, dm_exc) in enumerate(results):
+        for offset, (grp, dm_exc) in enumerate(results):
             galaxies.append(grp)
-            idx = base_index + offset
-            dm_nodes_inclusive[idx] = set(dm_inc)
-            dm_nodes_exclusive[idx] = set(dm_exc)
+            # Group IDs will be reassigned later; keep exclusive DM on object
+            if dm_exc:
+                grp.__dict__['_dm_exclusive_pids'] = set(dm_exc)
+            else:
+                grp.__dict__['_dm_exclusive_pids'] = set()
 
-    for pm in _iter_memberships_stream(ahf_particles_file, all_needed_nodes):
+        if host_progress is not None:
+            host_progress.update(1)
+
+    load_dm = bool(dm_pid_map)
+    for pm in _iter_memberships_stream(ahf_particles_file, all_needed_nodes, load_dm=load_dm):
         root = node_to_root.get(pm.id)
         if root is None:
             continue
@@ -598,82 +639,15 @@ def build_galaxies_from_ahf_fast(
         pending_members.pop(root, None)
         nodes_remaining.pop(root, None)
 
+    if host_progress is not None:
+        host_progress.close()
+
     sim.galaxy_list = galaxies
     sim.ngalaxies = len(galaxies)
     setattr(sim, "_ahf_matched", True)
     setattr(sim, "_include_dm_in_galaxies", True)
     if sim.ngalaxies == 0:
         return
-
-    def _collect_dm_index_lists(
-        inclusive_nodes: Dict[int, Set[int]],
-        exclusive_nodes: Dict[int, Set[int]],
-        dm_pid_to_sel: Dict[int, int],
-    ) -> Tuple[Dict[int, List[int]], Dict[int, List[int]]]:
-        if not dm_pid_to_sel or not inclusive_nodes:
-            return {}, {}
-        node_to_gal_inclusive: Dict[int, List[int]] = {}
-        for gi, ids in inclusive_nodes.items():
-            for hid in ids:
-                node_to_gal_inclusive.setdefault(hid, []).append(gi)
-        node_to_gal_exclusive: Dict[int, List[int]] = {}
-        for gi, ids in exclusive_nodes.items():
-            for hid in ids:
-                node_to_gal_exclusive.setdefault(hid, []).append(gi)
-
-        inclusive_lists: Dict[int, List[int]] = {gi: [] for gi in inclusive_nodes}
-        exclusive_lists: Dict[int, List[int]] = {gi: [] for gi in exclusive_nodes}
-
-        with _open_ahf_particles(ahf_particles_file) as fh:
-            current_hid = None
-            remaining = 0
-            for raw in fh:
-                line = raw.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                if remaining == 0 and len(parts) == 2:
-                    try:
-                        remaining = int(parts[0])
-                        current_hid = int(parts[1])
-                    except Exception:
-                        current_hid = None
-                        remaining = 0
-                    continue
-                if remaining > 0:
-                    remaining -= 1
-                    if current_hid is None:
-                        continue
-                    pparts = line.split('\t')
-                    if len(pparts) != 2:
-                        continue
-                    try:
-                        pid = int(pparts[0])
-                        ptype = int(pparts[1])
-                    except Exception:
-                        continue
-                    if ptype != 1:
-                        continue
-                    sel_idx = dm_pid_to_sel.get(pid)
-                    if sel_idx is None:
-                        continue
-                    for gi in node_to_gal_inclusive.get(current_hid, []):
-                        inclusive_lists.setdefault(gi, []).append(sel_idx)
-                    for gi in node_to_gal_exclusive.get(current_hid, []):
-                        exclusive_lists.setdefault(gi, []).append(sel_idx)
-        return inclusive_lists, exclusive_lists
-
-    dm_inclusive_indices, dm_exclusive_indices = _collect_dm_index_lists(
-        dm_nodes_inclusive, dm_nodes_exclusive, dm_pid_map
-    )
-
-    for gi, gal in enumerate(sim.galaxy_list):
-        sel = dm_inclusive_indices.get(gi, [])
-        if sel:
-            sel_arr = np.unique(np.asarray(sel, dtype=np.int64))
-            gal.dmlist = sel_arr.astype(np.int32)
-        else:
-            gal.dmlist = np.array([], dtype=np.int32)
 
     def _refresh_global_indexes(gal) -> None:
         blocks = []
@@ -720,7 +694,15 @@ def build_galaxies_from_ahf_fast(
             self.counts = {'galaxy': len(sim.galaxy_list)}
 
     ctx = _Ctx(sim)
-    _get_group_properties(ctx, sim.galaxy_list)
+    prop_bar = None
+    if show_progress and sim.ngalaxies > 0:
+        prop_bar = tqdm(total=1, desc="Computing galaxy properties", leave=False)
+    try:
+        _get_group_properties(ctx, sim.galaxy_list)
+    finally:
+        if prop_bar is not None:
+            prop_bar.update(1)
+            prop_bar.close()
 
     try:
         if 'galaxy' not in sim.group_types:
@@ -728,26 +710,28 @@ def build_galaxies_from_ahf_fast(
     except Exception:
         pass
 
-    if ndm_full > 0 and dm_pid_map and selected_index_to_pid is not None:
+    if ndm_full > 0 and dm_pid_map:
         exclusive_gal_dm = np.full(ndm_full, -1, dtype=np.int32)
-        for gi, gal in enumerate(sim.galaxy_list):
-            sel = dm_exclusive_indices.get(gi)
-            if not sel:
+        for gal in sim.galaxy_list:
+            dm_exc = getattr(gal, '_dm_exclusive_pids', None)
+            if not dm_exc:
                 continue
-            sel_arr = np.unique(np.asarray(sel, dtype=np.int64))
-            full_indices: List[int] = []
-            for idx in sel_arr:
-                if idx < 0 or idx >= len(selected_index_to_pid):
-                    continue
-                pid = selected_index_to_pid[idx]
-                if pid is None:
-                    continue
-                mapped = pid_to_dm_fullidx.get(pid)
+            for pid in dm_exc:
+                mapped = pid_to_dm_fullidx.get(int(pid))
                 if mapped is not None:
-                    full_indices.append(mapped)
-            if full_indices:
-                exclusive_gal_dm[np.asarray(full_indices, dtype=np.int64)] = int(gal.GroupID)
+                    exclusive_gal_dm[mapped] = int(getattr(gal, 'GroupID', -1))
+            # drop the cached set to free memory
+            try:
+                del gal.__dict__['_dm_exclusive_pids']
+            except KeyError:
+                pass
         setattr(sim, '_exclusive_galaxy_dmlist', exclusive_gal_dm)
+    else:
+        for gal in sim.galaxy_list:
+            if '_dm_exclusive_pids' in gal.__dict__:
+                del gal.__dict__['_dm_exclusive_pids']
+        if hasattr(sim, '_exclusive_galaxy_dmlist'):
+            delattr(sim, '_exclusive_galaxy_dmlist')
 
 
 def get_caesar_file(directory: str, number: int) -> str:
