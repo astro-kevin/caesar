@@ -338,8 +338,9 @@ class CAESAR(object):
         else:
             from caesar.fubar_halo import fubar_halo
             fubar_halo(self)
-            assign.assign_galaxies_to_halos(self)
-            assign.assign_clouds_to_galaxies(self)
+            if not getattr(self, "_ahf_matched", False):
+                assign.assign_galaxies_to_halos(self)
+                assign.assign_clouds_to_galaxies(self)
 
         link.link_galaxies_and_halos(self)
         link.link_clouds_and_galaxies(self)
