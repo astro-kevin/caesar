@@ -113,7 +113,7 @@ setup(
     setup_requires=['six', 'numpy', 'cython>=3.0'],
     install_requires=[
         'six', 'numpy', 'h5py', 'cython>=3.0', 'psutil', 'scipy', 'joblib', 'scikit-learn',
-        'yt', 'astropy'#, 
+        'yt', 'astropy', 'numba'#, 
         #'pygadgetreader @ git+https://github.com/dnarayanan/pygadgetreader'
     ],
     cmdclass={

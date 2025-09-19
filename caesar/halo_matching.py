@@ -12,6 +12,18 @@ from tqdm import tqdm
 import numpy as np
 import gzip
 
+try:  # pragma: no cover - optional acceleration
+    from numba import njit, prange, types
+    from numba.typed import List as NumbaList, Set as NumbaSet
+    _NUMBA_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _NUMBA_AVAILABLE = False
+    njit = None
+    prange = range
+    types = None
+    NumbaList = None
+    NumbaSet = None
+
 
 def _open_ahf_particles(path: str):
     """Open an AHF particles/halos text file, transparently handling gzip."""
@@ -28,6 +40,58 @@ class ParticleMembership:
     parttype1: Set[int] = field(default_factory=set)
     parttype4: Set[int] = field(default_factory=set)
     parttype5: Set[int] = field(default_factory=set)
+
+
+def _build_numba_star_sets(memberships: List["ParticleMembership"]):
+    """Convert parttype4 memberships into Numba typed sets."""
+    if not _NUMBA_AVAILABLE:
+        raise RuntimeError("Numba is not available")
+    nb_list = NumbaList()
+    sizes = np.empty(len(memberships), dtype=np.int64)
+    key_type = types.int64
+    for idx, pm in enumerate(memberships):
+        nb_set = NumbaSet.empty(key_type)
+        for pid in pm.parttype4:
+            nb_set.add(int(pid))
+        nb_list.append(nb_set)
+        sizes[idx] = len(pm.parttype4)
+    return nb_list, sizes
+
+
+if _NUMBA_AVAILABLE:
+
+    @njit(parallel=True)
+    def _numba_match_galaxies_to_halos(gal_sets, gal_sizes, halo_sets):
+        ng = len(gal_sets)
+        nh = len(halo_sets)
+        result = np.empty(ng, dtype=np.int64)
+        for i in prange(ng):
+            gsize = gal_sizes[i]
+            if gsize == 0 or nh == 0:
+                result[i] = -1
+                continue
+            gset = gal_sets[i]
+            best_idx = -1
+            best_overlap = 0
+            for j in range(nh):
+                hset = halo_sets[j]
+                inter = 0
+                for val in gset:
+                    if val in hset:
+                        inter += 1
+                if inter * 2 > gsize:
+                    best_idx = j
+                    break
+                if inter > best_overlap:
+                    best_overlap = inter
+                    best_idx = j
+            result[i] = best_idx
+        return result
+
+else:  # pragma: no cover - executed only when Numba missing
+
+    def _numba_match_galaxies_to_halos(*args, **kwargs):  # type: ignore
+        raise RuntimeError("Numba is not available")
 
 
 try:  # Optional Cython accelerators
@@ -78,7 +142,7 @@ def read_file_to_structure(
             if not pline:
                 i += 1
                 continue
-            pparts = pline.split("\t")
+            pparts = pline.split()
             if len(pparts) != 2:
                 raise ValueError(f"Invalid particle line at line {i+1}: {pline}")
             pid = int(pparts[0])
@@ -147,13 +211,12 @@ def find_best_matches(
     list2: List[ParticleMembership],
     n_jobs: Optional[int] = None,
 ) -> List[Tuple[int, int]]:
-    """Match halos by overlapping ``parttype4`` particle IDs.
+    """Match halos by overlapping ``parttype4`` particle IDs using Numba."""
 
-    Builds a star->AHF lookup once, then counts overlaps per-galaxy using
-    NumPy (optionally threaded with joblib). Falls back to a serial
-    iterator with ``tqdm`` progress if joblib is unavailable or ``n_jobs``
-    is ``None``/``1``.
-    """
+    if not _NUMBA_AVAILABLE:
+        raise RuntimeError(
+            "AHF matching requires the 'numba' package; please install numba to continue."
+        )
 
     n_list1 = len(list1)
     if n_list1 == 0:
@@ -162,66 +225,23 @@ def find_best_matches(
         return [(pm.id, -1) for pm in list1]
 
     list1_ids = np.fromiter((pm.id for pm in list1), dtype=np.int64, count=n_list1)
-    galaxy_stars: List[np.ndarray] = []
-    galaxy_sizes = np.empty(n_list1, dtype=np.int64)
-    for i, pm in enumerate(list1):
-        count = len(pm.parttype4)
-        if count:
-            arr = np.fromiter(pm.parttype4, dtype=np.int64, count=count)
-            arr.sort()
-        else:
-            arr = np.empty(0, dtype=np.int64)
-        galaxy_stars.append(arr)
-        galaxy_sizes[i] = arr.size
 
-    from collections import defaultdict
+    gal_sets, gal_sizes = _build_numba_star_sets(list1)
+    halo_sets, _ = _build_numba_star_sets(list2)
+    if len(halo_sets) == 0:
+        return [(pm.id, -1) for pm in list1]
 
-    star_to_halos: Dict[int, np.ndarray] = {}
-    _accumulator: Dict[int, List[int]] = defaultdict(list)
-    for pm in list2:
-        if not pm.parttype4:
-            continue
-        hid = pm.id
-        for pid in pm.parttype4:
-            _accumulator[pid].append(hid)
-    for pid, entries in _accumulator.items():
-        star_to_halos[pid] = np.fromiter(entries, dtype=np.int64, count=len(entries))
-    _accumulator.clear()
+    match_indices = _numba_match_galaxies_to_halos(gal_sets, gal_sizes, halo_sets)
+    halo_ids = np.fromiter((pm.id for pm in list2), dtype=np.int64, count=len(list2))
+    hcount = halo_ids.size
 
-    def match_one(idx: int) -> Tuple[int, int]:
-        stars = galaxy_stars[idx]
-        if stars.size == 0:
-            return (int(list1_ids[idx]), -1)
-        candidate_lists: List[np.ndarray] = []
-        for pid in stars:
-            arr = star_to_halos.get(int(pid))
-            if arr is not None:
-                candidate_lists.append(arr)
-        if not candidate_lists:
-            return (int(list1_ids[idx]), -1)
-        candidates = candidate_lists[0] if len(candidate_lists) == 1 else np.concatenate(candidate_lists)
-        if candidates.size == 0:
-            return (int(list1_ids[idx]), -1)
-        uniq, counts = np.unique(candidates, return_counts=True)
-        if uniq.size == 0:
-            return (int(list1_ids[idx]), -1)
-        best_pos = int(np.argmax(counts))
-        best_count = counts[best_pos]
-        if best_count == 0:
-            return (int(list1_ids[idx]), -1)
-        return (int(list1_ids[idx]), int(uniq[best_pos]))
-
-    if n_jobs is None or n_jobs <= 1:
-        return [match_one(i) for i in tqdm(range(n_list1), desc="Matching Progress")]
-
-    try:
-        from joblib import Parallel, delayed
-
-        return Parallel(n_jobs=n_jobs, backend='threading')(
-            delayed(match_one)(i) for i in range(n_list1)
-        )
-    except Exception:
-        return [match_one(i) for i in tqdm(range(n_list1), desc="Matching Progress")]
+    results: List[Tuple[int, int]] = []
+    for i, idx in enumerate(match_indices):
+        hid = -1
+        if 0 <= idx < hcount:
+            hid = int(halo_ids[idx])
+        results.append((int(list1_ids[i]), hid))
+    return results
 
 def _build_selected_pid_maps(sim) -> Dict[str, Dict[int, int]]:
     """Build PID -> selected-index maps for each ptype present in the CAESAR-selected subset.
@@ -337,7 +357,7 @@ def _iter_memberships_stream(
                 remaining -= 1
                 if cur_pm is None:
                     continue
-                pparts = line.split('\t')
+                pparts = line.split()
                 if len(pparts) != 2:
                     continue
                 try:
@@ -399,7 +419,7 @@ def _read_memberships_for_ids(
                 remaining -= 1
                 if cur_pm is None:
                     continue
-                pparts = line.split('\t')
+                pparts = line.split()
                 if len(pparts) != 2:
                     continue
                 try:
@@ -1137,7 +1157,7 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
                 continue
             if remaining > 0:
                 remaining -= 1
-                pparts = line.split('\t')
+                pparts = line.split()
                 if len(pparts) != 2:
                     continue
                 try:
@@ -1289,85 +1309,120 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
             pid_to_dm_fullidx = {int(pid): int(i) for i, pid in enumerate(dm_pids_full.tolist())}
 
     # Helper to map PID sets to selected index arrays
-    def map_set(pidset: Set[int], key: str) -> List[int]:
+    def map_set(pidset: Set[int], key: str) -> np.ndarray:
         mp = pid_maps_sel.get(key, {})
         if not mp or not pidset:
-            return []
-        return [mp[pid] for pid in pidset if pid in mp]
+            return np.array([], dtype=np.int32)
+        arr = np.fromiter((mp[pid] for pid in pidset if pid in mp), dtype=np.int32)
+        if arr.size == 0:
+            return arr
+        return np.unique(arr)
 
     # Exclusive DM reverse map for global list reconstruction
     exclusive_gal_dm = None
     if ndm_full > 0:
         exclusive_gal_dm = np.full(ndm_full, -1, dtype=np.int32)
 
-    # Merge galaxies per AHF ID and overwrite particle lists
-    # - Stars/gas/BH: use exclusives
-    # - DM: use inclusive membership (selected node + all its subhalos already included in AHF block)
+    # Merge galaxies per AHF ID and overwrite particle lists.
+    # Stars/gas/BH use exclusives; DM uses the inclusive membership of the
+    # selected AHF node.  This step can be expensive, so parallelise across
+    # matched galaxies when possible.
     to_remove: Set[int] = set()
+
+    tasks = []
     for ahf_id, gal_indices in mapping.items():
         if ahf_id not in exclusives:
             continue
-        e = exclusives[ahf_id]
-        gal_indices = sorted(set(gal_indices))
-        base_i = gal_indices[0]
-        base = sim.galaxy_list[base_i]
+        indices = sorted(set(gal_indices))
+        if not indices:
+            continue
+        base_idx = indices[0]
+        base_gid = int(getattr(sim.galaxy_list[base_idx], 'GroupID', -1))
+        tasks.append((ahf_id, indices, base_idx, base_gid))
 
-        # Overwrite lists from exclusives (baryons)
-        base.slist = np.array(map_set(e.parttype4, 'star'), dtype=np.int32)
-        base.glist = np.array(map_set(e.parttype0, 'gas'), dtype=np.int32) if hasattr(base, 'glist') else np.array(map_set(e.parttype0, 'gas'), dtype=np.int32)
-        if 'bh' in pid_maps_sel:
-            base.bhlist = np.array(map_set(e.parttype5, 'bh'), dtype=np.int32)
+    def process_matching(task):
+        ahf_id, indices, base_idx, base_gid = task
+        e = exclusives.get(ahf_id)
+        if e is None:
+            return None
 
-        # DM: use inclusive membership from the selected AHF node (AHF block includes subhalos)
         dm_pm = ahf_by_id.get(ahf_id)
-        dm_set: Set[int] = set()
-        if dm_pm is not None:
-            dm_set = dm_pm.parttype1
-        base.dmlist = np.array(map_set(dm_set, 'dm'), dtype=np.int32)
-        # Populate exclusive reverse map for this galaxy (in full-snapshot DM index space)
-        if exclusive_gal_dm is not None and e.parttype1:
-            if pid_to_dm_fullidx:
-                ex_full = [pid_to_dm_fullidx[pid] for pid in e.parttype1 if pid in pid_to_dm_fullidx]
-                if ex_full:
-                    exclusive_gal_dm[np.array(ex_full, dtype=np.int64)] = int(base.GroupID)
+        dm_set: Set[int] = dm_pm.parttype1 if dm_pm is not None else set()
 
-        # Rebuild global_indexes to include current per-type lists (so overall properties see DM when enabled)
+        slist_arr = map_set(e.parttype4, 'star')
+        glist_arr = map_set(e.parttype0, 'gas')
+        bh_arr = map_set(e.parttype5, 'bh') if 'bh' in pid_maps_sel else np.array([], dtype=np.int32)
+        dm_arr = map_set(dm_set, 'dm')
+
+        dm_exclusive_idx: Optional[np.ndarray] = None
+        if exclusive_gal_dm is not None and e.parttype1 and pid_to_dm_fullidx:
+            idx_list = [pid_to_dm_fullidx[pid] for pid in e.parttype1 if pid in pid_to_dm_fullidx]
+            if idx_list:
+                dm_exclusive_idx = np.asarray(idx_list, dtype=np.int64)
+
+        return (base_idx, indices, base_gid, slist_arr, glist_arr, bh_arr, dm_arr, dm_exclusive_idx)
+
+    results: List[Optional[Tuple[int, List[int], int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]]] = []
+    if tasks:
+        n_jobs = getattr(sim, 'nproc', 1)
+        try:
+            from joblib import Parallel, delayed
+
+            results = Parallel(n_jobs=max(1, int(n_jobs)), backend='threading')(
+                delayed(process_matching)(task) for task in tasks
+            )
+        except Exception:
+            results = [process_matching(task) for task in tasks]
+    else:
+        results = []
+
+    for item in results:
+        if item is None:
+            continue
+        base_idx, indices, base_gid, slist_arr, glist_arr, bh_arr, dm_arr, dm_exclusive_idx = item
+        base = sim.galaxy_list[base_idx]
+
+        base.slist = slist_arr
+        base.glist = glist_arr
+        if 'bh' in pid_maps_sel:
+            if hasattr(base, 'bhlist'):
+                base.bhlist = bh_arr
+            else:
+                setattr(base, 'bhlist', bh_arr)
+        base.dmlist = dm_arr
+
         gi = []
         try:
-            # gas
-            if hasattr(base, 'glist') and base.glist is not None and len(base.glist) > 0:
-                gi.append(sim.data_manager.glist[base.glist])
+            if glist_arr.size > 0:
+                gi.append(sim.data_manager.glist[glist_arr])
         except Exception:
             pass
         try:
-            # stars
-            if hasattr(base, 'slist') and base.slist is not None and len(base.slist) > 0:
-                gi.append(sim.data_manager.slist[base.slist])
+            if slist_arr.size > 0:
+                gi.append(sim.data_manager.slist[slist_arr])
         except Exception:
             pass
         try:
-            # dm
-            if hasattr(base, 'dmlist') and base.dmlist is not None and len(base.dmlist) > 0 and has_ptype(sim, 'dm'):
-                gi.append(sim.data_manager.dmlist[base.dmlist])
+            if dm_arr.size > 0 and has_ptype(sim, 'dm'):
+                gi.append(sim.data_manager.dmlist[dm_arr])
         except Exception:
             pass
         try:
-            # bh
-            if hasattr(base, 'bhlist') and base.bhlist is not None and len(base.bhlist) > 0 and 'bh' in pid_maps_sel:
-                gi.append(sim.data_manager.bhlist[base.bhlist])
+            if 'bh' in pid_maps_sel and bh_arr.size > 0 and hasattr(sim.data_manager, 'bhlist'):
+                gi.append(sim.data_manager.bhlist[bh_arr])
         except Exception:
             pass
         try:
-            # dust
             if hasattr(base, 'dlist') and base.dlist is not None and len(base.dlist) > 0:
                 gi.append(sim.data_manager.dlist[base.dlist])
         except Exception:
             pass
-        if gi:
-            base.global_indexes = np.concatenate(gi).astype(np.int64)
+        base.global_indexes = np.concatenate(gi).astype(np.int64) if gi else np.array([], dtype=np.int64)
 
-        # Mark other matched galaxies for removal
-        for gi in gal_indices[1:]:
+        if exclusive_gal_dm is not None and dm_exclusive_idx is not None and dm_exclusive_idx.size > 0:
+            exclusive_gal_dm[dm_exclusive_idx] = base_gid
+
+        for gi in indices[1:]:
             to_remove.add(gi)
 
     if to_remove:
