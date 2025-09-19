@@ -540,67 +540,96 @@ def build_galaxies_from_ahf_fast(
 
         exclusives = _compute_exclusive_memberships(bucket, children_of, nodes_for_host)
 
-        eligible = [n for n in nodes_for_host if len(exclusives.get(n, ParticleMembership(n)).parttype4) >= min_stars]
-        if not eligible:
-            return
-
-        central = max(eligible, key=lambda n: (len(exclusives[n].parttype4), n))
-
-        deposit_star: Set[int] = set()
-        deposit_gas: Set[int] = set()
-        deposit_bh: Set[int] = set()
-        deposit_dm: Set[int] = set()
-
-        for node in nodes_for_host:
-            if node == central:
-                continue
-            stars = exclusives.get(node, ParticleMembership(node)).parttype4
-            if len(stars) >= min_stars:
-                continue
-            if parent_of.get(node, 0) not in (None, 0):
-                ex = exclusives.get(node, ParticleMembership(node))
-                deposit_star |= ex.parttype4
-                deposit_gas |= ex.parttype0
-                deposit_bh |= ex.parttype5
-                deposit_dm |= ex.parttype1
-
-        cen_ex = exclusives[central]
         payloads: List[Tuple[ParticleMembership, Set[int]]] = []
 
-        cen_star = set(cen_ex.parttype4) | deposit_star
-        cen_gas = set(cen_ex.parttype0) | deposit_gas
-        cen_bh = set(cen_ex.parttype5) | deposit_bh
-        cen_dm = set(cen_ex.parttype1)
-        if deposit_dm:
-            cen_dm |= deposit_dm
-        central_payload = (
-            ParticleMembership(
-                central,
-                parttype0=cen_gas,
-                parttype1=cen_dm,
-                parttype4=cen_star,
-                parttype5=cen_bh,
-            ),
-            set(cen_dm),
-        )
-        payloads.append(central_payload)
+        eligible = [n for n in nodes_for_host if len(exclusives.get(n, ParticleMembership(n)).parttype4) >= min_stars]
 
-        for node in eligible:
-            if node == central:
-                continue
-            ex = exclusives[node]
+        if eligible:
+            central = max(eligible, key=lambda n: (len(exclusives[n].parttype4), n))
+
+            deposit_star: Set[int] = set()
+            deposit_gas: Set[int] = set()
+            deposit_bh: Set[int] = set()
+            deposit_dm: Set[int] = set()
+
+            for node in nodes_for_host:
+                if node == central:
+                    continue
+                stars = exclusives.get(node, ParticleMembership(node)).parttype4
+                if len(stars) >= min_stars:
+                    continue
+                if parent_of.get(node, 0) not in (None, 0):
+                    ex = exclusives.get(node, ParticleMembership(node))
+                    deposit_star |= ex.parttype4
+                    deposit_gas |= ex.parttype0
+                    deposit_bh |= ex.parttype5
+                    deposit_dm |= ex.parttype1
+
+            cen_ex = exclusives[central]
+            cen_star = set(cen_ex.parttype4) | deposit_star
+            cen_gas = set(cen_ex.parttype0) | deposit_gas
+            cen_bh = set(cen_ex.parttype5) | deposit_bh
+            cen_dm = set(cen_ex.parttype1)
+            if deposit_dm:
+                cen_dm |= deposit_dm
             payloads.append(
                 (
                     ParticleMembership(
-                        node,
-                        parttype0=set(ex.parttype0),
-                        parttype1=set(ex.parttype1),
-                        parttype4=set(ex.parttype4),
-                        parttype5=set(ex.parttype5),
+                        central,
+                        parttype0=cen_gas,
+                        parttype1=cen_dm,
+                        parttype4=cen_star,
+                        parttype5=cen_bh,
                     ),
-                    set(ex.parttype1),
+                    set(cen_dm),
                 )
             )
+
+            for node in eligible:
+                if node == central:
+                    continue
+                ex = exclusives[node]
+                payloads.append(
+                    (
+                        ParticleMembership(
+                            node,
+                            parttype0=set(ex.parttype0),
+                            parttype1=set(ex.parttype1),
+                            parttype4=set(ex.parttype4),
+                            parttype5=set(ex.parttype5),
+                        ),
+                        set(ex.parttype1),
+                    )
+                )
+
+        else:
+            total_star: Set[int] = set()
+            total_gas: Set[int] = set()
+            total_bh: Set[int] = set()
+            total_dm: Set[int] = set()
+            for node in nodes_for_host:
+                pm_inc = bucket.get(node, ParticleMembership(node))
+                total_star |= pm_inc.parttype4
+                total_gas |= pm_inc.parttype0
+                total_bh |= pm_inc.parttype5
+                total_dm |= pm_inc.parttype1
+            if len(total_star) < min_stars:
+                return
+            payloads.append(
+                (
+                    ParticleMembership(
+                        root_id,
+                        parttype0=total_gas,
+                        parttype1=total_dm,
+                        parttype4=total_star,
+                        parttype5=total_bh,
+                    ),
+                    set(total_dm),
+                )
+            )
+
+        if not payloads:
+            return
 
         def build_group(payload: Tuple[ParticleMembership, Set[int]]):
             pm, dm_exc = payload
@@ -839,7 +868,7 @@ def read_single_halo_from_file(file_path: str, halo_id: int) -> Optional[Particl
                     pline = pline.strip()
                     if not pline:
                         continue
-                    pparts = pline.split("\t")
+                    pparts = pline.split()
                     if len(pparts) != 2:
                         continue
                     pid = int(pparts[0])
