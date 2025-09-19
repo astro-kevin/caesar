@@ -25,6 +25,13 @@ except Exception:  # pragma: no cover
     NumbaList = None
     NumbaSet = None
 
+try:  # optional progress bar for numba kernels
+    from numba_progress import ProgressBar
+    _HAS_NUMBA_PROGRESS = True
+except Exception:  # pragma: no cover
+    _HAS_NUMBA_PROGRESS = False
+    ProgressBar = None
+
 
 def _open_ahf_particles(path: str):
     """Open an AHF particles/halos text file, transparently handling gzip."""
@@ -62,11 +69,11 @@ def _build_numba_star_sets(memberships: List["ParticleMembership"]):
 if _NUMBA_AVAILABLE:
 
     @njit(parallel=True)
-    def _numba_match_galaxies_to_halos(gal_sets, gal_sizes, halo_sets):
+    def _numba_match_galaxies_to_halos(gal_sets, gal_sizes, halo_sets, progress_proxy=None):
         ng = len(gal_sets)
         nh = len(halo_sets)
         result = np.empty(ng, dtype=np.int64)
-        for i in prange(ng):
+        for i in prange(ng, schedule='dynamic'):
             gsize = gal_sizes[i]
             if gsize == 0 or nh == 0:
                 result[i] = -1
@@ -87,6 +94,8 @@ if _NUMBA_AVAILABLE:
                     best_overlap = inter
                     best_idx = j
             result[i] = best_idx
+            if progress_proxy is not None:
+                progress_proxy.update(1)
         return result
 
 else:  # pragma: no cover - executed only when Numba missing
@@ -211,6 +220,7 @@ def find_best_matches(
     list1: List[ParticleMembership],
     list2: List[ParticleMembership],
     n_jobs: Optional[int] = None,
+    show_progress: bool = False,
 ) -> List[Tuple[int, int]]:
     """Match halos by overlapping ``parttype4`` particle IDs using Numba."""
 
@@ -238,7 +248,11 @@ def find_best_matches(
     if len(halo_sets) == 0:
         return [(pm.id, -1) for pm in list1]
 
-    match_indices = _numba_match_galaxies_to_halos(gal_sets, gal_sizes, halo_sets)
+    if show_progress and _HAS_NUMBA_PROGRESS:
+        with ProgressBar(total=n_list1) as progress_proxy:
+            match_indices = _numba_match_galaxies_to_halos(gal_sets, gal_sizes, halo_sets, progress_proxy)
+    else:
+        match_indices = _numba_match_galaxies_to_halos(gal_sets, gal_sizes, halo_sets, None)
     halo_ids = np.fromiter((pm.id for pm in list2), dtype=np.int64, count=len(list2))
     hcount = halo_ids.size
 
@@ -896,6 +910,7 @@ def match_subhalos_to_galaxies(
         caesar_data,
         ahf_data,
         n_jobs=getattr(sim, 'nproc', None),
+        show_progress=bool(getattr(sim, '_show_progress', True)),
     )
 
     # Build mapping from AHF halo -> list of galaxy indices
