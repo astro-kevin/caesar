@@ -717,6 +717,7 @@ def build_galaxies_from_ahf_fast(
                 for p in ['gas', 'star', 'bh', 'dm', 'dm2', 'dm3']
                 if hasattr(sim.data_manager, f"{p}list")
             }
+            self.counts = {'galaxy': len(sim.galaxy_list)}
 
     ctx = _Ctx(sim)
     _get_group_properties(ctx, sim.galaxy_list)
