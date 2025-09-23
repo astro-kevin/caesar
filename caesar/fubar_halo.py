@@ -92,13 +92,7 @@ def fubar_halo(obj):
         mylog.warning('Not enough eligible galaxy particles found!')
         return  
     galaxies.load_lists(parent=halos)  # create galaxy_list, load particle index lists for galaxies
-    try:
-        get_group_properties(galaxies,galaxies.obj.galaxy_list)  # compute galaxy properties
-    except Exception as exc:
-        import traceback
-        mylog.error('Galaxy property build failed for %d objects: %s', len(galaxies.obj.galaxy_list), exc)
-        traceback.print_exc()
-        raise
+    get_group_properties(galaxies,galaxies.obj.galaxy_list)  # compute galaxy properties
     if ('fsps_bands' in obj._kwargs) and obj._kwargs['fsps_bands'] is not None:
         from caesar.pyloser.pyloser import photometry
         galphot = photometry(obj,galaxies.obj.galaxy_list)
