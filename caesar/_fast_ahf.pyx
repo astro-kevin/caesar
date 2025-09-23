@@ -1,5 +1,22 @@
 # cython: language_level=3
 
+from caesar.halo_matching import (
+    ParticleMembership,
+    _open_ahf_particles,
+    _array_from_iter,
+)
+
+
+cdef inline object _finalize_membership(object pm):
+    if pm is None:
+        return None
+    pm.parttype0 = _array_from_iter(pm.parttype0)
+    pm.parttype4 = _array_from_iter(pm.parttype4)
+    pm.parttype5 = _array_from_iter(pm.parttype5)
+    pm.parttype1 = _array_from_iter(pm.parttype1)
+    return pm
+
+
 def iter_memberships(str path, object needed, bint load_dm=True):
     """Yield ParticleMembership objects for IDs in ``needed``.
 
@@ -23,7 +40,7 @@ def iter_memberships(str path, object needed, bint load_dm=True):
             parts = line.split()
             if remaining == 0 and len(parts) == 2:
                 if pm is not None and pm.id in needed:
-                    yield pm
+                    yield _finalize_membership(pm)
 
                 try:
                     remaining = int(parts[0])
@@ -35,6 +52,10 @@ def iter_memberships(str path, object needed, bint load_dm=True):
 
                 if current_hid in needed:
                     pm = ParticleMembership(current_hid)
+                    pm.parttype0 = []
+                    pm.parttype4 = []
+                    pm.parttype5 = []
+                    pm.parttype1 = []  # always initialise; finaliser will drop if empty
                 else:
                     pm = None
                 continue
@@ -55,16 +76,16 @@ def iter_memberships(str path, object needed, bint load_dm=True):
                     continue
 
                 if ptype == 0:
-                    pm.parttype0.add(pid)
+                    pm.parttype0.append(pid)
                 elif ptype == 4:
-                    pm.parttype4.add(pid)
+                    pm.parttype4.append(pid)
                 elif ptype == 5:
-                    pm.parttype5.add(pid)
+                    pm.parttype5.append(pid)
                 elif load_dm and ptype == 1:
-                    pm.parttype1.add(pid)
+                    pm.parttype1.append(pid)
 
         if pm is not None and pm.id in needed:
-            yield pm
+            yield _finalize_membership(pm)
     finally:
         fh.close()
 
