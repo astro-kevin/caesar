@@ -100,6 +100,7 @@ def fubar_halo(obj):
             halos.save_fof6dfile()  # save fof6d info
 
     # Process galaxies
+<<<<<<< HEAD
     if not getattr(obj, '_ahf_matched', False):
         galaxies = fof6d(obj,'galaxy')  #instantiate a fof6d object
         galaxies.plist_init(parent=halos)  # get particle list for computing galaxy properties
@@ -124,7 +125,28 @@ def fubar_halo(obj):
                 mylog.warning('Subhalo matching failed: %s' % exc)
 
         from caesar.group import get_group_properties
+        try:
+            get_group_properties(galaxies,galaxies.obj.galaxy_list)  # compute galaxy properties
+        except Exception as exc:
+            import traceback
+            mylog.error('Galaxy property build failed for %d objects: %s', len(galaxies.obj.galaxy_list), exc)
+            traceback.print_exc()
+            raise
+=======
+    galaxies = fof6d(obj,'galaxy')  #instantiate a fof6d object
+    galaxies.plist_init(parent=halos)  # get particle list for computing galaxy properties
+    if galaxies.nparttot == 0: # plist_init didn't find any particles in a galaxy
+        mylog.warning('Not enough eligible galaxy particles found!')
+        return  
+    galaxies.load_lists(parent=halos)  # create galaxy_list, load particle index lists for galaxies
+    try:
         get_group_properties(galaxies,galaxies.obj.galaxy_list)  # compute galaxy properties
+    except Exception as exc:
+        import traceback
+        mylog.error('Galaxy property build failed for %d objects: %s', len(galaxies.obj.galaxy_list), exc)
+        traceback.print_exc()
+        raise
+>>>>>>> 81be22e (Fix hydrogen parallel writes and improve AHF integration)
     if ('fsps_bands' in obj._kwargs) and obj._kwargs['fsps_bands'] is not None:
         from caesar.pyloser.pyloser import photometry
         galphot = photometry(obj,galaxies.obj.galaxy_list)

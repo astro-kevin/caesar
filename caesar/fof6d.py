@@ -50,6 +50,10 @@ class fof6d:
         elif 'haloid' in self.obj._kwargs and 'rockstar' in self.obj._kwargs['haloid']:
             sys.exit('Sorry, reading from rockstar files not implemented yet')
         elif 'haloid' in self.obj._kwargs and 'AHF' in self.obj._kwargs['haloid']:
+            haloid_flag = str(self.obj._kwargs['haloid']).lower()
+            if haloid_flag == 'ahf-fast' and not self.obj._kwargs.get('AHF_use_subhalos', False):
+                mylog.info('AHF-FAST detected; enabling AHF_use_subhalos')
+                self.obj._kwargs['AHF_use_subhalos'] = True
             self.load_ahf_id()
         else:
             memlog('No Halo ID source specified -- running FOF.  This is the yt 3D FOF for halos and our homegrown 6D FOF for galaxies ...')
