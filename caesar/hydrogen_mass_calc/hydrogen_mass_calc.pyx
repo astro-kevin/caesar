@@ -363,6 +363,8 @@ def get_HIH2_masses(galaxies,aperture=30,rho_thresh=0.13):
     # set up mass computation
     galpos = np.asarray([i.pos for i in galaxies.obj.galaxy_list], dtype=np.float64)
     galmass = np.asarray([i.masses['total'] for i in galaxies.obj.galaxy_list], dtype=np.float64)
+    HImass_arr = np.array(galaxies.obj.data_manager.gfHI[grpids], dtype=MY_DTYPE, copy=True)
+    H2mass_arr = np.array(galaxies.obj.data_manager.gfH2[grpids], dtype=MY_DTYPE, copy=True)
 
     cdef:
         ## global quantities
@@ -377,8 +379,8 @@ def get_HIH2_masses(galaxies,aperture=30,rho_thresh=0.13):
         float[:,:]  gas_pos = galaxies.obj.data_manager.pos[grpids]
         float[:]    gas_mass = np.float32(galaxies.obj.data_manager.mass[grpids])
         float[:]    gas_nh = galaxies.obj.data_manager.gnh[grpids]
-        float[:]    HImass = galaxies.obj.data_manager.gfHI[grpids]
-        float[:]    H2mass = galaxies.obj.data_manager.gfH2[grpids]
+        float[:]    HImass = HImass_arr
+        float[:]    H2mass = H2mass_arr
         int[:]      galaxy_indexes = np.zeros(ngal,dtype=np.int32)
         int[:]      galind_bins = np.zeros(nhalo+1,dtype=np.int32)
         ## general variables
@@ -417,7 +419,6 @@ def get_HIH2_masses(galaxies,aperture=30,rho_thresh=0.13):
         H2mass[ih] *= XH * gas_mass[ih]
 
     for ih in prange(nhalo,nogil=True,schedule='dynamic',num_threads=my_nproc):
-    #for ih in range(nhalo):
         istart = hid_bins[ih]
         iend = hid_bins[ih+1]
         for ig in range(istart,iend):
@@ -438,6 +439,9 @@ def get_HIH2_masses(galaxies,aperture=30,rho_thresh=0.13):
         galaxies.obj.galaxy_list[ig].masses['H2_%s'%(apert_str)] = galaxies.obj.yt_dataset.quan(apert_H2mass[ig], galaxies.obj.units['mass'])
         #if ig < 10: print(ig,np.log10(galaxies.obj.galaxy_list[ig].masses['HI']),np.log10(galaxies.obj.galaxy_list[ig].masses['H2']), np.log10(galaxies.obj.galaxy_list[ig].masses['HI_30kpc']), np.log10(galaxies.obj.galaxy_list[ig].masses['H2_30kpc']))
         #if ig < 10: print(ig,np.log10(galaxies.obj.galaxy_list[ig].masses['H2']), np.log10(galaxies.obj.galaxy_list[ig].masses['H2_30kpc']), np.log10(galaxies.obj.galaxy_list[ig].masses['H2'])- np.log10(galaxies.obj.galaxy_list[ig].masses['H2_30kpc']))
+
+    galaxies.obj.data_manager.gfHI[grpids] = galaxies.obj.yt_dataset.arr(np.asarray(HImass_arr, dtype=MY_DTYPE), '')
+    galaxies.obj.data_manager.gfH2[grpids] = galaxies.obj.yt_dataset.arr(np.asarray(H2mass_arr, dtype=MY_DTYPE), '')
 
     return 
 

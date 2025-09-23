@@ -52,6 +52,8 @@ def serialize_list(obj_list, key, hd):
 
     """
     if key in blacklist: return
+    if not obj_list:
+        return
     if not hasattr(obj_list[0], key): return
     data = _get_serialized_list(obj_list, key)
     _write_dataset(key, data, hd)
@@ -84,6 +86,9 @@ def serialize_attributes(obj_list, hd, hd_dicts):
         Open HDF5 group for dictionaries.
 
     """
+    if not obj_list:
+        return
+
     for k,v in six.iteritems(obj_list[0].__dict__):
         if k in blacklist: continue
 
