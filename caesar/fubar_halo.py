@@ -100,24 +100,24 @@ def fubar_halo(obj):
             halos.save_fof6dfile()  # save fof6d info
 
     # Process galaxies
-<<<<<<< HEAD
     if not getattr(obj, '_ahf_matched', False):
-        galaxies = fof6d(obj,'galaxy')  #instantiate a fof6d object
+        galaxies = fof6d(obj, 'galaxy')  # instantiate a fof6d object
         galaxies.plist_init(parent=halos)  # get particle list for computing galaxy properties
-        if galaxies.nparttot == 0: # plist_init didn't find any particles in a galaxy
+        if galaxies.nparttot == 0:  # plist_init didn't find any particles in a galaxy
             mylog.warning('Not enough eligible galaxy particles found!')
-            return  
+            return
         galaxies.load_lists(parent=halos)  # create galaxy_list, load particle index lists for galaxies
 
         if (
             'haloid' in obj._kwargs
             and isinstance(obj._kwargs['haloid'], str)
-            and obj._kwargs['haloid'].upper() in ('AHF','AHF-FAST')
+            and obj._kwargs['haloid'].upper() in ('AHF', 'AHF-FAST')
             and 'haloid_file' in obj._kwargs
             and obj._kwargs['haloid'].upper() != 'AHF-FAST'
         ):
             try:
                 from caesar.halo_matching import integrate_ahf_match_prune_inplace
+
                 integrate_ahf_match_prune_inplace(obj, obj._kwargs['haloid_file'])
                 setattr(obj, "_ahf_matched", True)
                 setattr(obj, "_include_dm_in_galaxies", True)
@@ -125,28 +125,32 @@ def fubar_halo(obj):
                 mylog.warning('Subhalo matching failed: %s' % exc)
 
         from caesar.group import get_group_properties
+
         try:
-            get_group_properties(galaxies,galaxies.obj.galaxy_list)  # compute galaxy properties
+            get_group_properties(galaxies, galaxies.obj.galaxy_list)  # compute galaxy properties
         except Exception as exc:
             import traceback
+
             mylog.error('Galaxy property build failed for %d objects: %s', len(galaxies.obj.galaxy_list), exc)
             traceback.print_exc()
             raise
     if ('fsps_bands' in obj._kwargs) and obj._kwargs['fsps_bands'] is not None:
         from caesar.pyloser.pyloser import photometry
-        galphot = photometry(obj,galaxies.obj.galaxy_list)
+
+        galphot = photometry(obj, galaxies.obj.galaxy_list)
         galphot.run_pyloser()
 
     # Find and process clouds
     if ('fofclouds' in obj._kwargs) and obj._kwargs['fofclouds']:
         galaxies.run_fof6d('cloud')  # run fof6d to find cloudid's
         galaxies.load_lists('cloud')  # load particle index lists for galaxies
-        clouds = fof6d(obj,'cloud')  #instantiate a fof6d object
+        clouds = fof6d(obj, 'cloud')  # instantiate a fof6d object
         clouds.plist_init(parent=galaxies)  # initialize comptutation of cloud properties
-        if clouds.nparttot == 0: return  # plist_init didn't find enough particles to group
+        if clouds.nparttot == 0:
+            return  # plist_init didn't find enough particles to group
         galaxies.load_lists('cloud')
-        get_group_properties(clouds,clouds.obj.cloud_list)  # compute cloud properties
-   
+        get_group_properties(clouds, clouds.obj.cloud_list)  # compute cloud properties
+
     # reset particle lists to have original snapshot ID's; must do this after all group processing is finished
     reset_global_particle_IDs(obj)
     # load global lists
@@ -155,7 +159,8 @@ def fubar_halo(obj):
     return
 
 
-plist_dict = dict( gas='glist', star='slist', bh='bhlist', dust='dlist', dm='dmlist', dm2='dm2list', dm3='dm3list')
+plist_dict = dict(gas='glist', star='slist', bh='bhlist', dust='dlist', dm='dmlist', dm2='dm2list', dm3='dm3list')
+
 
 def reset_global_particle_IDs(obj):
     ''' Maps particle lists from currently loaded ID's to the ID's corresponding to the full snapshot '''
