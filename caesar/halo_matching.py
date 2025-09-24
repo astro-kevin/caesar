@@ -1308,13 +1308,22 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
 
     selected: List[int]
     if n_jobs is not None and n_jobs > 1:
+        from joblib import Parallel, delayed
+
         try:
-            from joblib import Parallel, delayed
-            selected = Parallel(n_jobs=n_jobs, backend='loky')(delayed(_select_for_gal)(gi) for gi in indices)
+            selected = Parallel(
+                n_jobs=n_jobs,
+                backend='threading',
+                prefer='threads',
+            )(delayed(_select_for_gal)(gi) for gi in indices)
         except Exception:
             selected = [_select_for_gal(gi) for gi in indices]
     else:
         selected = [_select_for_gal(gi) for gi in indices]
+
+    # Free large selection helpers once the mapping is built
+    del indices
+    del gal_to_counts
 
     # Build mapping from selected AHF ID -> list of galaxy indices
     from collections import defaultdict as _dd
