@@ -548,12 +548,12 @@ def build_galaxies_from_ahf_fast(
             return arr
         return np.unique(arr)
 
-    def process_host(root_id: int, bucket: Dict[int, ParticleMembership]) -> None:
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, ALL_COMPLETED
+
+    def process_host(order_idx: int, root_id: int, bucket: Dict[int, ParticleMembership]):
         nodes_for_host = host_to_nodes.get(root_id, set())
         if not nodes_for_host:
-            if host_progress is not None:
-                host_progress.update(1)
-            return
+            return order_idx, []
 
         # Ensure every node has a membership object (possibly empty)
         for node in nodes_for_host:
@@ -607,12 +607,12 @@ def build_galaxies_from_ahf_fast(
                     carry_dm[parent].update(dm_exc_set)
 
         if not payloads:
-            return
+            return order_idx, []
 
-        def build_group(payload: Tuple[int, Set[int], Set[int], Set[int], Set[int]]):
+        host_galaxies: List = []
+
+        for payload in payloads:
             node_id, star_set, gas_set, bh_set, dm_exc = payload
-            # Use the streamed membership data for inclusive DM lookups so
-            # joblib workers do not rely on a non-existent outer scope
             dm_pm = bucket.get(node_id)
             dm_inclusive = dm_pm.parttype1 if dm_pm is not None else set()
             grp = create_new_group(sim, 'galaxy')
@@ -626,52 +626,69 @@ def build_galaxies_from_ahf_fast(
                 dm_selected = np.array([], dtype=np.int32)
             grp.dmlist = dm_selected
             grp.global_indexes = np.array([], dtype=np.int64)
-            return grp, dm_exc
-
-        results: List[Tuple] = []
-        try:
-            from joblib import Parallel, delayed
-
-            results = Parallel(
-                n_jobs=jobs,
-                backend='threading',
-                prefer='threads',
-                require='sharedmem',
-            )(delayed(build_group)(payload) for payload in payloads)
-        except Exception:
-            results = [build_group(payload) for payload in payloads]
-
-        base_index = len(galaxies)
-        for offset, (grp, dm_exc) in enumerate(results):
-            galaxies.append(grp)
-            # Group IDs will be reassigned later; keep exclusive DM on object
             if dm_exc:
                 grp.__dict__['_dm_exclusive_pids'] = set(dm_exc)
             else:
                 grp.__dict__['_dm_exclusive_pids'] = set()
+            host_galaxies.append(grp)
 
-        if host_progress is not None:
-            host_progress.update(1)
+        return order_idx, host_galaxies
+
+    pending_results: Dict[int, List] = {}
+    next_to_emit = 0
+
+    def flush_completed(futures, block: bool = False):
+        nonlocal next_to_emit
+        if not futures:
+            return
+        timeout = None if block else 0
+        return_when = ALL_COMPLETED if block else FIRST_COMPLETED
+        done, _ = wait(list(futures.keys()), timeout=timeout, return_when=return_when)
+        if not done:
+            return
+        for fut in done:
+            order_idx, host_gals = fut.result()
+            futures.pop(fut, None)
+            pending_results[order_idx] = host_gals
+        while next_to_emit in pending_results:
+            host_gals = pending_results.pop(next_to_emit)
+            if host_gals:
+                galaxies.extend(host_gals)
+            if host_progress is not None:
+                host_progress.update(1)
+            next_to_emit += 1
 
     load_dm = bool(dm_pid_map)
-    for pm in _iter_memberships_stream(ahf_particles_file, all_needed_nodes, load_dm=load_dm):
-        root = node_to_root.get(pm.id)
-        if root is None:
-            continue
-        bucket = pending_members.setdefault(root, {})
-        bucket[pm.id] = pm
-        nodes_remaining[root] = nodes_remaining.get(root, 0) - 1
-        if nodes_remaining[root] <= 0:
-            process_host(root, bucket)
-            bucket.clear()
-            del pending_members[root]
-            nodes_remaining.pop(root, None)
 
-    for root, bucket in list(pending_members.items()):
-        if bucket:
-            process_host(root, bucket)
-        pending_members.pop(root, None)
-        nodes_remaining.pop(root, None)
+    with ThreadPoolExecutor(max_workers=jobs) as executor:
+        pending_futures: Dict = {}
+        host_order = 0
+
+        for pm in _iter_memberships_stream(ahf_particles_file, all_needed_nodes, load_dm=load_dm):
+            root = node_to_root.get(pm.id)
+            if root is None:
+                continue
+            bucket = pending_members.setdefault(root, {})
+            bucket[pm.id] = pm
+            nodes_remaining[root] = nodes_remaining.get(root, 0) - 1
+            if nodes_remaining[root] <= 0:
+                bucket_copy = dict(bucket)
+                future = executor.submit(process_host, host_order, root, bucket_copy)
+                pending_futures[future] = host_order
+                host_order += 1
+                pending_members.pop(root, None)
+                nodes_remaining.pop(root, None)
+                flush_completed(pending_futures, block=False)
+
+        # Drain any remaining buckets that were never submitted
+        for root, bucket in list(pending_members.items()):
+            bucket_copy = dict(bucket)
+            future = executor.submit(process_host, host_order, root, bucket_copy)
+            pending_futures[future] = host_order
+            host_order += 1
+            pending_members.pop(root, None)
+            nodes_remaining.pop(root, None)
+        flush_completed(pending_futures, block=True)
 
     if host_progress is not None:
         host_progress.close()
