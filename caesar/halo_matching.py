@@ -40,6 +40,47 @@ def _open_ahf_particles(path: str):
     return open(path, 'r')
 
 
+def build_halos_from_ahf(sim, ahf_particles_file: str):
+    """Populate ``sim.halo_list`` directly from an AHF catalogue.
+
+    For AHF-driven runs we bypass the 6D-FOF halo finder and seed the
+    CAESAR halo structures from the external membership file instead.  All
+    non-AHF modes continue to use the existing fof6d path.
+    """
+
+    if not ahf_particles_file:
+        raise ValueError("AHF particles file must be provided when haloid='AHF'.")
+
+    from yt.funcs import mylog
+
+    from caesar.fof6d import fof6d
+    from caesar.fubar import get_mean_interparticle_separation
+    from caesar.group import get_group_properties
+
+    halos = fof6d(sim, 'halo')
+
+    halos.MIS = get_mean_interparticle_separation(sim).d
+    halos.load_haloid()
+
+    sim.data_manager._member_search_init(select=halos.haloid)
+    if not halos.plist_init():
+        return None
+
+    halos.load_lists()
+    if len(sim.halo_list) == 0:
+        mylog.warning('No valid halos found! Aborting member search')
+        return None
+
+    get_group_properties(halos, sim.halo_list)
+
+    if 'halo' not in sim.group_types:
+        sim.group_types.append('halo')
+    sim.halos = sim.halo_list
+    sim.nhalos = len(sim.halo_list)
+
+    return halos
+
+
 @dataclass
 class ParticleMembership:
     """Store particle IDs for a single halo or galaxy."""
@@ -737,11 +778,27 @@ def build_galaxies_from_ahf_fast(
             self.nproc = getattr(sim, 'nproc', 1)
             self.load_pot = getattr(sim, 'load_pot', True)
             self.nparttot = sum(len(getattr(g, 'global_indexes', [])) for g in sim.galaxy_list)
-            self.nparttype = {
-                p: len(getattr(sim.data_manager, f"{p}list", []))
-                for p in ['gas', 'star', 'bh', 'dm', 'dm2', 'dm3']
-                if hasattr(sim.data_manager, f"{p}list")
+            mapping = {
+                'gas': 'glist',
+                'star': 'slist',
+                'bh': 'bhlist',
+                'dm': 'dmlist',
+                'dm2': 'dm2list',
+                'dm3': 'dm3list',
             }
+            present = set(getattr(sim.data_manager, 'ptypes', []))
+            counts: Dict[str, int] = {}
+            for p, attr in mapping.items():
+                if present and p not in present:
+                    continue
+                data = getattr(sim.data_manager, attr, None)
+                if data is None:
+                    continue
+                try:
+                    counts[p] = len(data)
+                except TypeError:
+                    continue
+            self.nparttype = counts
             self.counts = {'galaxy': len(sim.galaxy_list)}
 
     ctx = _Ctx(sim)

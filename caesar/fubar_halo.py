@@ -58,18 +58,31 @@ def fubar_halo(obj):
     if 'haloid' in obj._kwargs and 'snap' in obj._kwargs['haloid']:
         obj.load_haloid = True
 
-    # Process halos
-    halos = fof6d(obj,'halo')  #instantiate a fof6d object
-    halos.MIS = get_mean_interparticle_separation(obj).d # also computes omega_baryon and related quantities
-    halos.load_haloid()
-    halos.obj.data_manager._member_search_init(select=halos.haloid)  # load particle info, but only those selected to be in a halo
-    if not halos.plist_init():  # not enough halo particles found, nothing to do!
-        return  
-    halos.load_lists()  # create halos, load particle indexes for halos
-    if len(halos.obj.halo_list) == 0:  # no valid halos found
-        mylog.warning('No valid halos found! Aborting member search')
-        return  
-    get_group_properties(halos,halos.obj.halo_list)  # compute halo properties
+    use_ahf_halos = (
+        'haloid' in obj._kwargs
+        and isinstance(obj._kwargs['haloid'], str)
+        and obj._kwargs['haloid'].upper() in ('AHF', 'AHF-FAST')
+        and obj._kwargs.get('haloid_file')
+    )
+
+    if use_ahf_halos:
+        from caesar.halo_matching import build_halos_from_ahf
+
+        halos = build_halos_from_ahf(obj, obj._kwargs['haloid_file'])
+        if halos is None:
+            return
+    else:
+        halos = fof6d(obj,'halo')  #instantiate a fof6d object
+        halos.MIS = get_mean_interparticle_separation(obj).d # also computes omega_baryon and related quantities
+        halos.load_haloid()
+        halos.obj.data_manager._member_search_init(select=halos.haloid)  # load particle info, but only those selected to be in a halo
+        if not halos.plist_init():  # not enough halo particles found, nothing to do!
+            return
+        halos.load_lists()  # create halos, load particle indexes for halos
+        if len(halos.obj.halo_list) == 0:  # no valid halos found
+            mylog.warning('No valid halos found! Aborting member search')
+            return
+        get_group_properties(halos,halos.obj.halo_list)  # compute halo properties
     if not obj.simulation.baryons_present:  # if no baryons, we're done
         return
 
