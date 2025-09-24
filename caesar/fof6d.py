@@ -67,68 +67,202 @@ class fof6d:
             haloid_file = self.obj._kwargs['haloid_file']
             if os.path.isfile(haloid_file):
                 memlog('Reading AHF halo IDs from %s'%(haloid_file))
-                if '.gz' == haloid_file[-3:]: #compressed txt file
-                    import gzip
-                    with gzip.open(haloid_file) as f:
-                        lines = f.readlines()
+                particles_file = haloid_file
+                if particles_file.endswith('.gz'):
+                    halos_file = particles_file.replace('particles.gz','halos')
                 else:
-                    with open(haloid_file) as f:
-                        lines = f.readlines()
+                    halos_file = particles_file.replace('particles','halos')
+                halo_info = np.loadtxt(halos_file, usecols=(0, 1), dtype=np.int64)
 
-                if '.gz' == haloid_file[-3:]: #compressed txt file
-                    haloid_file=haloid_file.replace('particles.gz','halos') #load halo file
-                else:
-                    haloid_file=haloid_file.replace('particles','halos')
-                halo_info=np.loadtxt(haloid_file,usecols=(0,1),dtype=np.int64) #hid, host hid
+                if halo_info.size == 0:
+                    sys.exit("No Halos in AHF halo file -- no need to run Caesar! Halos: %d" % halo_info.size)
+                if halo_info.ndim == 1:
+                    halo_info = halo_info.reshape(1, 2)
 
-                if len(halo_info) == 0:
-                    sys.exit("No Halos in AHF halo file -- no need to run Caesar! Halos: %d" % len(halo_info))
-                elif len(halo_info.shape)==1: # avoid error for single halo
-                    halo_info=np.reshape(halo_info,(1,2))
+                total_halos = len(halo_info)
 
                 if 'AHF_use_subhalos' not in self.obj._kwargs:  #only use particles in distinct halo. this is default.
-                    nhalos=int(lines[0])
-                    if nhalos == len(halo_info): # no MPI case 
-                        hpp=1 # halo particle numbers and halo ID position
-                        hid_info=[] #particle ID, particle type, halo_ID as keys fillup with the information from AHF particle file
-                        for i in range(nhalos):
-                            npt,hid=[int(x) for x in lines[hpp].split()]
-                            hpp+=1
-                            tmp=np.loadtxt(lines[hpp:hpp+npt],dtype=np.int64)
-                            hpp+=npt
-                            if halo_info[i,1] == 0: # we only use idstinctive halos, as subhalos (sub subhalos) repeatively saved the particles, really a pain to deal with! Match galaxies back to subhhalos later by yourself.
-                                tmpd = np.zeros((tmp.shape[0],3),dtype=np.int64)
-                                tmpd[:, :2] = tmp
-                                tmpd[:, 2] = hid
-                                hid_info.extend(tmpd.tolist())
-                        hid_info = np.asarray(hid_info)
-                        uniq_hid, uq_counts = np.unique(hid_info[:,0], return_counts=True)
-                        if uniq_hid.size != hid_info.shape[0]:
-                            memlog('!!Warning!! duplicated particle IDs in different halos!! removing them %d, %d' % (uniq_hid.size , hid_info.shape[0]))
-                    else: # MPI case, in which the _particles file contains information merged from different files
-                        memlog('!!Warning!! reading AHF halo IDs from merged files!!')
-                        hpp=0 # halo particle numbers and halo ID position
-                        hid_info=[] #particle ID, particle type, halo_ID as keys fillup with the information from AHF particle file
-                        nhalos=0
-                        while nhalos < len(halo_info):
-                            tempn = int(lines[hpp])
-                            nhalos+=tempn
-                            hpp+=1
-                            for i in range(tempn):
-                                npt,hid=[int(x) for x in lines[hpp].split()]
-                                hpp+=1
-                                tmp=np.loadtxt(lines[hpp:hpp+npt],dtype=np.int64)
-                                hpp+=npt
-                                if halo_info[nhalos-tempn+i,1] == 0: # we only use idstinctive halos, as subhalos (sub subhalos) repeatively saved the particles, really a pain to deal with! Match galaxies back to subhhalos later by yourself.
-                                    tmpd = np.zeros((tmp.shape[0],3),dtype=np.int64)
-                                    tmpd[:, :2] = tmp
-                                    tmpd[:, 2] = hid
-                                    hid_info.extend(tmpd.tolist())
-                        hid_info = np.asarray(hid_info)
-                        uniq_hid, uq_counts = np.unique(hid_info[:,0], return_counts=True)
-                        if uniq_hid.size != hid_info.shape[0]:
-                            memlog('!!Warning!! duplicated particle IDs in different halos!! removing them %d, %d' % (uniq_hid.size , hid_info.shape[0]))            
+                    host_mask = halo_info[:, 1] == 0
+
+                    mpi_warning_logged = False
+
+                    def _open_particles(path):
+                        if path.endswith('.gz'):
+                            import gzip
+                            return gzip.open(path, 'rt')
+                        return open(path, 'r')
+
+                    def _stream_particle_blocks(host_only=True):
+                        fh = _open_particles(particles_file)
+
+                        def _read_nonempty_line():
+                            while True:
+                                raw = fh.readline()
+                                if not raw:
+                                    return None
+                                stripped = raw.strip()
+                                if stripped:
+                                    return stripped
+
+                        def _skip_rows(count):
+                            for _ in range(count):
+                                fh.readline()
+
+                        def _read_block(count):
+                            if count <= 0:
+                                return np.empty((0, 2), dtype=np.int64)
+                            block = np.loadtxt(fh, max_rows=count, dtype=np.int64)
+                            if block.size == 0:
+                                return np.empty((0, 2), dtype=np.int64)
+                            block = np.atleast_2d(block)
+                            return block.reshape(-1, 2)
+
+                        first_line = _read_nonempty_line()
+                        if first_line is None:
+                            fh.close()
+                            return
+                        expected = int(first_line)
+                        mpi_mode = expected != total_halos
+                        if mpi_mode:
+                            nonlocal mpi_warning_logged
+                            if not mpi_warning_logged:
+                                memlog('!!Warning!! reading AHF halo IDs from merged files!!')
+                                mpi_warning_logged = True
+
+                        try:
+                            if not mpi_mode:
+                                for idx in range(total_halos):
+                                    header = _read_nonempty_line()
+                                    if header is None:
+                                        break
+                                    parts = header.split()
+                                    if len(parts) != 2:
+                                        continue
+                                    npt = int(parts[0])
+                                    hid = int(parts[1])
+                                    if host_only and not host_mask[idx]:
+                                        _skip_rows(npt)
+                                        continue
+                                    block = _read_block(npt)
+                                    yield idx, hid, block
+                            else:
+                                remaining_in_block = expected
+                                idx = 0
+                                while idx < total_halos:
+                                    if remaining_in_block == 0:
+                                        block_line = _read_nonempty_line()
+                                        if block_line is None:
+                                            break
+                                        remaining_in_block = int(block_line)
+                                        continue
+                                    header = _read_nonempty_line()
+                                    if header is None:
+                                        break
+                                    parts = header.split()
+                                    if len(parts) != 2:
+                                        continue
+                                    npt = int(parts[0])
+                                    hid = int(parts[1])
+                                    if host_only and not host_mask[idx]:
+                                        _skip_rows(npt)
+                                    else:
+                                        block = _read_block(npt)
+                                        yield idx, hid, block
+                                    remaining_in_block -= 1
+                                    idx += 1
+                        finally:
+                            fh.close()
+
+                    counts_by_code = {}
+                    for p in self.obj.data_manager.ptypes:
+                        if has_ptype(self.obj, p):
+                            code = ptype_ints[p]
+                            counts_by_code[code] = 0
+
+                    for _, _, block in _stream_particle_blocks(host_only=True):
+                        if block.size == 0:
+                            continue
+                        part_types = block[:, 1]
+                        for code in counts_by_code:
+                            counts_by_code[code] += int(np.count_nonzero(part_types == code))
+
+                    self.haloid = {}
+                    type_buffers = {}
+                    for p in self.obj.data_manager.ptypes:
+                        if has_ptype(self.obj, p):
+                            code = ptype_ints[p]
+                            data = get_property(self.obj, 'pid', p).d.astype(np.int64)
+                            tmpp = np.full(len(data), -1, dtype=np.int64)
+                            self.haloid[p] = tmpp
+                            size = counts_by_code.get(code, 0)
+                            pid_buffer = np.empty(size, dtype=np.int64)
+                            hid_buffer = np.empty(size, dtype=np.int64)
+                            type_buffers[code] = {
+                                'particle_type': p,
+                                'data': data,
+                                'tmpp': tmpp,
+                                'pid_buffer': pid_buffer,
+                                'hid_buffer': hid_buffer,
+                                'offset': 0,
+                            }
+                        else:
+                            self.haloid[p] = np.empty(0, dtype=np.int64)
+
+                    for _, hid, block in _stream_particle_blocks(host_only=True):
+                        if block.size == 0:
+                            continue
+                        for code, info in type_buffers.items():
+                            pid_buffer = info['pid_buffer']
+                            if pid_buffer.size == 0:
+                                continue
+                            mask = block[:, 1] == code
+                            if not np.any(mask):
+                                continue
+                            chunk = block[mask, 0].astype(np.int64, copy=False)
+                            n = chunk.size
+                            start = info['offset']
+                            info['pid_buffer'][start:start + n] = chunk
+                            info['hid_buffer'][start:start + n] = hid
+                            info['offset'] += n
+
+                    pids = []
+                    nhid = 0
+                    memlog('Reading simulation data IDs and mapping halo particle to them')
+                    for code, info in type_buffers.items():
+                        pid_buffer = info['pid_buffer']
+                        if pid_buffer.size == 0:
+                            continue
+                        hid_buffer = info['hid_buffer']
+                        if info['offset'] != pid_buffer.size:
+                            pid_buffer = pid_buffer[:info['offset']]
+                            hid_buffer = hid_buffer[:info['offset']]
+                        uniq_pid, first_indices = np.unique(pid_buffer, return_index=True)
+                        if uniq_pid.size != pid_buffer.size:
+                            memlog('!!Warning!! duplicated particle IDs in different halos!! removing them %d, %d' % (uniq_pid.size , pid_buffer.size))
+                            pid_buffer = uniq_pid
+                            hid_buffer = hid_buffer[first_indices]
+                        data = info['data']
+                        tmpp = info['tmpp']
+                        com, x_ind, y_ind = np.intersect1d(data, pid_buffer, return_indices=True)
+                        tmpp[x_ind] = hid_buffer[y_ind]
+                        nhid += len(com)
+                        if tmpp.size:
+                            pids.append(tmpp[tmpp >= 0])
+
+                    if pids:
+                        self.obj.data_manager.haloid = np.concatenate(pids).astype(np.int64, copy=False)
+                    else:
+                        self.obj.data_manager.haloid = np.empty(0, dtype=np.int64)
+                    memlog('Total halo particle IDs = %d'%(nhid))
+                    return
                 else: # use subhalo inforamtion as well, but very pain to remove these duplicated particles!!!!
+                    if particles_file.endswith('.gz'):
+                        import gzip
+                        with gzip.open(particles_file) as f:
+                            lines = f.readlines()
+                    else:
+                        with open(particles_file) as f:
+                            lines = f.readlines()
                     hpp=1 # halo particle numbers and halo ID position
                     hid_info={} #particle ID, particle type, halo_ID as keys fillup with the information from AHF particle file
                     for i in range(int(lines[0])):

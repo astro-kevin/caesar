@@ -611,7 +611,9 @@ def build_galaxies_from_ahf_fast(
 
         def build_group(payload: Tuple[int, Set[int], Set[int], Set[int], Set[int]]):
             node_id, star_set, gas_set, bh_set, dm_exc = payload
-            dm_pm = ahf_by_id.get(node_id)
+            # Use the streamed membership data for inclusive DM lookups so
+            # joblib workers do not rely on a non-existent outer scope
+            dm_pm = bucket.get(node_id)
             dm_inclusive = dm_pm.parttype1 if dm_pm is not None else set()
             grp = create_new_group(sim, 'galaxy')
             grp.slist = map_set(star_set, 'star')
@@ -630,9 +632,12 @@ def build_galaxies_from_ahf_fast(
         try:
             from joblib import Parallel, delayed
 
-            results = Parallel(n_jobs=jobs, backend='threading')(
-                delayed(build_group)(payload) for payload in payloads
-            )
+            results = Parallel(
+                n_jobs=jobs,
+                backend='threading',
+                prefer='threads',
+                require='sharedmem',
+            )(delayed(build_group)(payload) for payload in payloads)
         except Exception:
             results = [build_group(payload) for payload in payloads]
 
