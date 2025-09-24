@@ -616,12 +616,12 @@ def build_galaxies_from_ahf_fast(
             dm_pm = bucket.get(node_id)
             dm_inclusive = dm_pm.parttype1 if dm_pm is not None else set()
             grp = create_new_group(sim, 'galaxy')
-            grp.slist = map_set(star_set, 'star')
-            grp.glist = map_set(gas_set, 'gas')
+            grp.slist = map_sel(star_set, 'star')
+            grp.glist = map_sel(gas_set, 'gas')
             if 'bh' in pid_maps_sel:
-                grp.bhlist = map_set(bh_set, 'bh')
+                grp.bhlist = map_sel(bh_set, 'bh')
             if 'dm' in pid_maps_sel:
-                dm_selected = map_set(dm_inclusive, 'dm')
+                dm_selected = map_sel(dm_inclusive, 'dm')
             else:
                 dm_selected = np.array([], dtype=np.int32)
             grp.dmlist = dm_selected
