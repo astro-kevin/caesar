@@ -304,7 +304,7 @@ class fof6d:
                         child_bary = child_arr[child_arr[:, 1] != 1]
                         if child_bary.size == 0:
                             continue
-                        _, parent_idx = np.intersect1d(parent_arr[:, 0], child_bary[:, 0], return_indices=True)
+                        _, parent_idx, _ = np.intersect1d(parent_arr[:, 0], child_bary[:, 0], return_indices=True)
                         if parent_idx.size == 0:
                             continue
                         parent_arr = np.delete(parent_arr, parent_idx, axis=0)
