@@ -12,6 +12,8 @@ from tqdm import tqdm
 import numpy as np
 import gzip
 
+from yt.funcs import mylog
+
 try:  # pragma: no cover - optional acceleration
     from numba import njit, prange, types, set_num_threads
     from numba.typed import List as NumbaList, Set as NumbaSet
@@ -591,7 +593,10 @@ def build_galaxies_from_ahf_fast(
 
     from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, ALL_COMPLETED
 
+    skipped_empty_payloads = 0
+
     def process_host(order_idx: int, root_id: int, bucket: Dict[int, ParticleMembership]):
+        nonlocal skipped_empty_payloads
         nodes_for_host = host_to_nodes.get(root_id, set())
         if not nodes_for_host:
             return order_idx, []
@@ -671,6 +676,25 @@ def build_galaxies_from_ahf_fast(
                 grp.__dict__['_dm_exclusive_pids'] = set(dm_exc)
             else:
                 grp.__dict__['_dm_exclusive_pids'] = set()
+
+            mapped_star = len(grp.slist) if hasattr(grp, 'slist') else 0
+            mapped_gas = len(grp.glist) if hasattr(grp, 'glist') else 0
+            mapped_bh = len(grp.bhlist) if hasattr(grp, 'bhlist') else 0
+            mapped_dm = len(dm_selected)
+            particle_total = mapped_star + mapped_gas + mapped_bh + mapped_dm
+            if particle_total == 0:
+                skipped_empty_payloads += 1
+                if skipped_empty_payloads <= 10:
+                    mylog.warning(
+                        'AHF-FAST: node %d had %d star / %d gas / %d bh / %d dm particles '
+                        'from AHF but none mapped into CAESAR selection',
+                        node_id,
+                        len(star_set),
+                        len(gas_set),
+                        len(bh_set),
+                        len(dm_inclusive),
+                    )
+                continue
             host_galaxies.append(grp)
 
         return order_idx, host_galaxies
@@ -733,6 +757,14 @@ def build_galaxies_from_ahf_fast(
 
     if host_progress is not None:
         host_progress.close()
+
+    if skipped_empty_payloads > 0:
+        from yt.funcs import mylog
+
+        mylog.warning(
+            'AHF-FAST: skipped %d galaxy payload(s) with no mapped particles'
+            % skipped_empty_payloads
+        )
 
     sim.galaxy_list = galaxies
     sim.ngalaxies = len(galaxies)
@@ -1290,40 +1322,60 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
 
     # Choose selected AHF node per galaxy
     indices = list(range(len(sim.galaxy_list)))
-    def _select_for_gal(gi: int) -> int:
+    def _select_for_gal(gi: int) -> Tuple[int, int]:
         counts = gal_to_counts[gi]
+        if not counts:
+            return -1, -1
         total = int(galaxy_star_counts[gi])
-        if total <= 0 or not counts:
-            return -1
-        thresh = 0.5 * total
-        # Candidates > 50%
-        cands = [hid for hid, c in counts.items() if c > thresh]
-        if not cands:
-            # Fallback: best by count
-            hid = max(counts.items(), key=lambda kv: kv[1])[0]
-            return int(hid)
-        # Pick lowest-level (max depth); tie-break by count then id
-        cands.sort(key=lambda h: (depth(h), counts[h], h))
-        return int(cands[-1])
+        thresh = 0.5 * total if total > 0 else 0
 
-    selected: List[int]
+        # Determine the best candidate above the threshold (if any)
+        cands = []
+        if total > 0:
+            cands = [hid for hid, c in counts.items() if c > thresh]
+        if cands:
+            cands.sort(key=lambda h: (depth(int(h)), counts[h], h))
+            primary = int(cands[-1])
+        else:
+            primary = -1
+
+        # Always keep track of the best-overlap node for fallback purposes
+        best_hid, _ = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
+        best_hid = int(best_hid)
+
+        if primary == -1 and total <= 0 and counts[best_hid] > 0:
+            primary = best_hid
+
+        return primary, best_hid
+
+    selection_info: List[Tuple[int, int]]
     if n_jobs is not None and n_jobs > 1:
         from joblib import Parallel, delayed
 
         try:
-            selected = Parallel(
+            selection_info = Parallel(
                 n_jobs=n_jobs,
                 backend='threading',
                 prefer='threads',
             )(delayed(_select_for_gal)(gi) for gi in indices)
         except Exception:
-            selected = [_select_for_gal(gi) for gi in indices]
+            selection_info = [_select_for_gal(gi) for gi in indices]
     else:
-        selected = [_select_for_gal(gi) for gi in indices]
+        selection_info = [_select_for_gal(gi) for gi in indices]
+
+    selected: List[int] = []
+    for primary, best in selection_info:
+        if primary is not None and primary != -1:
+            selected.append(int(primary))
+        else:
+            chosen = best if best is not None else -1
+            selected.append(int(chosen) if chosen != -1 else -1)
 
     # Free large selection helpers once the mapping is built
     del indices
     del gal_to_counts
+
+    galaxy_to_ahf_nodes = [int(h) if h is not None else -1 for h in selected]
 
     # Build mapping from selected AHF ID -> list of galaxy indices
     from collections import defaultdict as _dd
@@ -1333,6 +1385,8 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
             mapping[int(hid)].append(gi)
 
     if not mapping:
+        sim._ahf_galaxy_hosts = [-1] * len(sim.galaxy_list)
+        sim._ahf_galaxy_ahf_ids = galaxy_to_ahf_nodes
         return
 
     matched_ids = set(mapping.keys())
@@ -1527,18 +1581,67 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
         for gi in indices[1:]:
             to_remove.add(gi)
 
+    final_galaxy_ahf_ids: List[int]
     if to_remove:
         # Build new galaxy list and renumber GroupIDs
         new_list = []
+        new_host_ids: List[int] = []
         for i, g in enumerate(sim.galaxy_list):
             if i in to_remove:
                 continue
             new_list.append(g)
+            new_host_ids.append(galaxy_to_ahf_nodes[i])
         # Renumber GroupIDs to be sequential
         for new_id, g in enumerate(new_list):
             g.GroupID = new_id
         sim.galaxy_list = new_list
         sim.ngalaxies = len(new_list)
+        final_galaxy_ahf_ids = new_host_ids
+    else:
+        final_galaxy_ahf_ids = list(galaxy_to_ahf_nodes)
+
+    # Determine halo ownership using the AHF hierarchy
+    ahf_to_halo_index: Dict[int, int] = {}
+    for halo_index, halo in enumerate(sim.halo_list):
+        ahf_hid = getattr(halo, 'AHF_haloID', None)
+        if ahf_hid is None:
+            continue
+        try:
+            ahf_to_halo_index[int(ahf_hid)] = halo_index
+        except Exception:
+            continue
+
+    def _resolve_halo_index(node_id: int) -> int:
+        cur = int(node_id)
+        candidate = ahf_to_halo_index.get(cur)
+        visited: Set[int] = set()
+        while True:
+            parent = parent_of.get(cur, 0)
+            if parent in (0, None):
+                return candidate if candidate is not None else -1
+            cur = int(parent)
+            if cur in visited:
+                break
+            visited.add(cur)
+            idx = ahf_to_halo_index.get(cur)
+            if idx is not None:
+                candidate = idx
+        return candidate if candidate is not None else -1
+
+    host_indices: List[int] = []
+    normalized_ahf_ids: List[int] = []
+    for node_id in final_galaxy_ahf_ids:
+        if node_id is None or node_id == -1:
+            normalized_ahf_ids.append(-1)
+            host_indices.append(-1)
+            continue
+        top_id = int(node_id)
+        normalized_ahf_ids.append(top_id)
+        host_idx = _resolve_halo_index(top_id)
+        host_indices.append(int(host_idx) if host_idx is not None else -1)
+
+    sim._ahf_galaxy_hosts = host_indices
+    sim._ahf_galaxy_ahf_ids = normalized_ahf_ids
 
     # Do not recompute properties here; caller (member_search flow) will handle it
     # Stash exclusive DM reverse map for global list construction

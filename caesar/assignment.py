@@ -1,5 +1,7 @@
 import numpy as np
 
+from typing import List
+
 from yt.funcs import mylog
 
 def assign_galaxies_to_halos(obj):
@@ -21,6 +23,43 @@ def assign_galaxies_to_halos(obj):
 
     mylog.info('Assigning galaxies to halos')
     
+    override_hosts = getattr(obj, '_ahf_galaxy_hosts', None)
+
+    if override_hosts is not None and len(override_hosts) == obj.ngalaxies:
+        for halo in obj.halos:
+            halo.galaxy_index_list = []
+
+        pending: List[int] = []
+        for gi, galaxy in enumerate(obj.galaxies):
+            host_index = override_hosts[gi]
+            if host_index is not None and 0 <= host_index < len(obj.halos):
+                galaxy.parent_halo_index = int(host_index)
+                obj.halos[int(host_index)].galaxy_index_list.append(gi)
+            else:
+                galaxy.parent_halo_index = -1
+                pending.append(gi)
+
+        if not pending:
+            return
+
+        # Fallback to particle-based assignment only for the unresolved galaxies.
+        h_glist = obj.global_particle_lists.halo_glist
+        h_slist = obj.global_particle_lists.halo_slist
+        for gi in pending:
+            galaxy = obj.galaxies[gi]
+            glist = h_glist[galaxy.glist]
+            slist = h_slist[galaxy.slist]
+
+            combined = np.hstack((glist, slist))
+            valid = np.where(combined > -1)[0]
+            combined = combined[valid]
+
+            if len(combined) > 0:
+                parent_index = np.bincount(combined).argmax()
+                galaxy.parent_halo_index = parent_index
+                obj.halos[parent_index].galaxy_index_list.append(gi)
+        return
+
     h_glist = obj.global_particle_lists.halo_glist
     h_slist = obj.global_particle_lists.halo_slist
     for galaxy in obj.galaxies:
@@ -118,5 +157,3 @@ def assign_central_galaxies(obj,central_mass_definition='total'):
         galaxy_masses = np.array([s.masses[central_mass_definition] for s in halo.galaxies])
         central_index = np.argmax(galaxy_masses)
         obj.galaxies[halo.galaxy_index_list[central_index]].central = True
-
-
