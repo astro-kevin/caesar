@@ -759,8 +759,6 @@ def build_galaxies_from_ahf_fast(
         host_progress.close()
 
     if skipped_empty_payloads > 0:
-        from yt.funcs import mylog
-
         mylog.warning(
             'AHF-FAST: skipped %d galaxy payload(s) with no mapped particles'
             % skipped_empty_payloads
