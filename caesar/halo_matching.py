@@ -42,7 +42,7 @@ def _open_ahf_particles(path: str):
     return open(path, 'r')
 
 
-def build_halos_from_ahf(sim, ahf_particles_file: str):
+def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bool = False):
     """Populate ``sim.halo_list`` directly from an AHF catalogue.
 
     For AHF-driven runs we bypass the 6D-FOF halo finder and seed the
@@ -64,7 +64,19 @@ def build_halos_from_ahf(sim, ahf_particles_file: str):
     halos.MIS = get_mean_interparticle_separation(sim).d
     halos.load_haloid()
 
-    sim.data_manager._member_search_init(select=halos.haloid)
+    if full_particle_load:
+        select_all: Dict[str, np.ndarray] = {}
+        for ptype, arr in halos.haloid.items():
+            if isinstance(arr, np.ndarray):
+                if ptype in ('gas', 'star', 'bh', 'dust'):
+                    select_all[ptype] = np.zeros_like(arr, dtype=np.int64)
+                else:
+                    select_all[ptype] = arr
+            else:
+                select_all[ptype] = arr
+        sim.data_manager._member_search_init(select=select_all)
+    else:
+        sim.data_manager._member_search_init(select=halos.haloid)
     if not halos.plist_init():
         return None
 
@@ -560,6 +572,7 @@ def build_galaxies_from_ahf_fast(
     all_needed_nodes: Set[int] = set(node_to_root.keys())
 
     galaxies: List = []
+    galaxy_node_ids: List[int] = []
 
     nodes_remaining: Dict[int, int] = {root: len(nodes) for root, nodes in host_to_nodes.items()}
     pending_members: Dict[int, Dict[int, ParticleMembership]] = {}
@@ -655,7 +668,7 @@ def build_galaxies_from_ahf_fast(
         if not payloads:
             return order_idx, []
 
-        host_galaxies: List = []
+        host_galaxies: List[Tuple[int, object]] = []
 
         for payload in payloads:
             node_id, star_set, gas_set, bh_set, dm_exc = payload
@@ -695,7 +708,7 @@ def build_galaxies_from_ahf_fast(
                         len(dm_inclusive),
                     )
                 continue
-            host_galaxies.append(grp)
+            host_galaxies.append((int(node_id), grp))
 
         return order_idx, host_galaxies
 
@@ -718,7 +731,9 @@ def build_galaxies_from_ahf_fast(
         while next_to_emit in pending_results:
             host_gals = pending_results.pop(next_to_emit)
             if host_gals:
-                galaxies.extend(host_gals)
+                for node_id, grp in host_gals:
+                    galaxies.append(grp)
+                    galaxy_node_ids.append(int(node_id))
             if host_progress is not None:
                 host_progress.update(1)
             next_to_emit += 1
@@ -766,10 +781,89 @@ def build_galaxies_from_ahf_fast(
 
     sim.galaxy_list = galaxies
     sim.ngalaxies = len(galaxies)
+    sim.galaxies = galaxies
     setattr(sim, "_ahf_matched", True)
     setattr(sim, "_include_dm_in_galaxies", True)
     if sim.ngalaxies == 0:
+        sim._ahf_galaxy_ahf_ids = []
+        sim._ahf_galaxy_hosts = []
         return
+
+    host_indices: List[int] = []
+    if galaxy_node_ids and len(galaxy_node_ids) == sim.ngalaxies:
+        galaxy_node_ids = [int(nid) if nid is not None else -1 for nid in galaxy_node_ids]
+        sim._ahf_galaxy_ahf_ids = list(galaxy_node_ids)
+
+        ahf_to_halo_index: Dict[int, int] = {}
+        for halo_index, halo in enumerate(sim.halo_list):
+            ahf_hid = getattr(halo, 'AHF_haloID', None)
+            if ahf_hid is None:
+                continue
+            try:
+                ahf_to_halo_index[int(ahf_hid)] = halo_index
+            except Exception:
+                continue
+
+        def _resolve_halo_index(node_id: int) -> int:
+            cur = int(node_id)
+            candidate = ahf_to_halo_index.get(cur)
+            visited: Set[int] = set()
+            while True:
+                parent = parent_of.get(cur, 0)
+                if parent in (0, None):
+                    return candidate if candidate is not None else -1
+                cur = int(parent)
+                if cur in visited:
+                    break
+                visited.add(cur)
+                idx = ahf_to_halo_index.get(cur)
+                if idx is not None:
+                    candidate = idx
+            return candidate if candidate is not None else -1
+
+        for node_id in galaxy_node_ids:
+            if node_id is None or node_id == -1:
+                host_indices.append(-1)
+            else:
+                host_indices.append(_resolve_halo_index(int(node_id)))
+    else:
+        sim._ahf_galaxy_ahf_ids = []
+        host_indices = [-1] * sim.ngalaxies
+
+    for halo in sim.halo_list:
+        halo.galaxy_index_list = []
+
+    unresolved: List[int] = []
+    for gi, host_idx in enumerate(host_indices):
+        if host_idx is not None and 0 <= int(host_idx) < len(sim.halo_list):
+            hidx = int(host_idx)
+            sim.halo_list[hidx].galaxy_index_list.append(gi)
+            galaxies[gi].parent_halo_index = hidx
+        else:
+            galaxies[gi].parent_halo_index = -1
+            unresolved.append(gi)
+
+    if unresolved:
+        mylog.warning('AHF-FAST: %d galaxies had no valid AHF host; using particle-overlap fallback', len(unresolved))
+        h_glist = sim.global_particle_lists.halo_glist
+        h_slist = sim.global_particle_lists.halo_slist
+        for gi in unresolved:
+            galaxy = galaxies[gi]
+            glist = h_glist[galaxy.glist]
+            slist = h_slist[galaxy.slist]
+            combined = np.hstack((glist, slist))
+            valid = np.where(combined > -1)[0]
+            combined = combined[valid]
+            if combined.size > 0:
+                parent_index = int(np.bincount(combined).argmax())
+                galaxy.parent_halo_index = parent_index
+                host_indices[gi] = parent_index
+                if 0 <= parent_index < len(sim.halo_list):
+                    sim.halo_list[parent_index].galaxy_index_list.append(gi)
+            else:
+                host_indices[gi] = -1
+
+    sim._ahf_galaxy_hosts = [int(idx) if idx is not None else -1 for idx in host_indices]
 
     def _refresh_global_indexes(gal) -> None:
         blocks = []

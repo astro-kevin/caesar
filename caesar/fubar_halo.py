@@ -68,7 +68,16 @@ def fubar_halo(obj):
     if use_ahf_halos:
         from caesar.halo_matching import build_halos_from_ahf
 
-        halos = build_halos_from_ahf(obj, obj._kwargs['haloid_file'])
+        full_particle_load = (
+            isinstance(obj._kwargs.get('haloid'), str)
+            and obj._kwargs['haloid'].upper() == 'AHF-FAST'
+        )
+
+        halos = build_halos_from_ahf(
+            obj,
+            obj._kwargs['haloid_file'],
+            full_particle_load=full_particle_load,
+        )
         if halos is None:
             return
     else:
