@@ -544,8 +544,9 @@ class fof6d:
             if mygrp._valid:
                 mygrp.obj_type = self.obj_type
                 if self.obj_type == 'halo':
-                    if self.obj._kwargs['haloid'] == 'AHF':
-                        mygrp.AHF_haloID = self.grouplist[igrp] + 1 # recover to orginal ID, see line 156
+                    haloid_mode = str(self.obj._kwargs.get('haloid', '')).upper()
+                    if haloid_mode in ('AHF', 'AHF-FAST'):
+                        mygrp.AHF_haloID = self.grouplist[igrp] + 1 # recover to original ID, see line 156
                 if parent is not None:
                     ihalo = parent.group_parents[igrp-zero_marker]
                     mygrp.parent_halo_index = ihalo

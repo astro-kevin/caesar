@@ -867,15 +867,42 @@ def build_galaxies_from_ahf_fast(
 
     if unresolved:
         mylog.warning('AHF-FAST: %d galaxies had no valid AHF host; using particle-overlap fallback', len(unresolved))
-        h_glist = sim.global_particle_lists.halo_glist
-        h_slist = sim.global_particle_lists.halo_slist
+
+        def _halo_global_list(attr: str) -> Optional[np.ndarray]:
+            try:
+                data = getattr(sim.global_particle_lists, attr)
+            except AttributeError:
+                return None
+            return np.asarray(data)
+
+        h_glist = _halo_global_list('halo_glist')
+        h_slist = _halo_global_list('halo_slist')
+
+        def _as_index_array(val) -> np.ndarray:
+            if val is None:
+                return np.array([], dtype=np.int64)
+            arr = np.asarray(val)
+            if arr.ndim == 0:
+                try:
+                    arr = np.asarray([int(arr)])
+                except Exception:
+                    return np.array([], dtype=np.int64)
+            return arr.astype(np.int64, copy=False)
+
         for gi in unresolved:
             galaxy = galaxies[gi]
-            glist = h_glist[galaxy.glist]
-            slist = h_slist[galaxy.slist]
-            combined = np.hstack((glist, slist))
-            valid = np.where(combined > -1)[0]
-            combined = combined[valid]
+            gsel = _as_index_array(getattr(galaxy, 'glist', None))
+            ssel = _as_index_array(getattr(galaxy, 'slist', None))
+
+            glist = h_glist[gsel] if h_glist is not None and gsel.size > 0 else np.array([], dtype=np.int64)
+            slist = h_slist[ssel] if h_slist is not None and ssel.size > 0 else np.array([], dtype=np.int64)
+
+            if glist.size or slist.size:
+                combined = np.hstack((glist, slist))
+            else:
+                combined = np.array([], dtype=np.int64)
+            if combined.size:
+                combined = combined[combined >= 0]
             if combined.size > 0:
                 parent_index = int(np.bincount(combined).argmax())
                 galaxy.parent_halo_index = parent_index
@@ -1817,8 +1844,16 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
 
     sim._ahf_galaxy_hosts = host_indices
 
-    for gal, host_idx in zip(sim.galaxy_list, host_indices):
-        gal.parent_halo_index = int(host_idx) if host_idx is not None else -1
+    # Rebuild halo->galaxy links based on the new mapping to avoid stale indices
+    for halo in sim.halo_list:
+        halo.galaxy_index_list = []
+
+    for gi, host_idx in enumerate(host_indices):
+        idx = int(host_idx) if host_idx is not None else -1
+        sim.galaxy_list[gi].parent_halo_index = idx
+        if idx >= 0 and idx < len(sim.halo_list):
+            sim.halo_list[idx].galaxy_index_list.append(gi)
+
     sim._ahf_galaxy_ahf_ids = normalized_ahf_ids
 
     # Stash exclusive DM reverse map for global list construction (none in this path)
