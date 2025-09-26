@@ -67,14 +67,36 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
     if full_particle_load:
         select_all: Dict[str, np.ndarray] = {}
         for ptype, arr in halos.haloid.items():
-            if isinstance(arr, np.ndarray):
-                if ptype in ('gas', 'star', 'bh', 'dust'):
-                    select_all[ptype] = np.zeros_like(arr, dtype=np.int64)
-                else:
-                    select_all[ptype] = arr
-            else:
-                select_all[ptype] = arr
+            arr_np = np.asarray(arr)
+            select_all[ptype] = np.zeros_like(arr_np, dtype=np.int64)
         sim.data_manager._member_search_init(select=select_all)
+
+        flattened: List[np.ndarray] = []
+        for ptype in sim.data_manager.ptypes:
+            source = halos.haloid.get(ptype)
+            if source is None:
+                continue
+            source_arr = np.asarray(source, dtype=np.int64).reshape(-1)
+            if source_arr.size == 0:
+                flattened.append(source_arr)
+                continue
+            selector = select_all.get(ptype, 'all')
+            if isinstance(selector, str):
+                mask = np.ones_like(source_arr, dtype=bool)
+            else:
+                selector_arr = np.asarray(selector).reshape(-1)
+                if selector_arr.shape != source_arr.shape:
+                    raise ValueError(
+                        f"Selection mask for {ptype} has shape {selector_arr.shape} but haloid array has shape {source_arr.shape}."
+                    )
+                mask = selector_arr >= 0
+            source_copy = source_arr.copy()
+            source_copy[source_copy < 0] = 0
+            flattened.append(source_copy[mask])
+        sim.data_manager.haloid = (
+            np.concatenate(flattened).astype(np.int64, copy=False)
+            if flattened else np.empty(0, dtype=np.int64)
+        )
     else:
         sim.data_manager._member_search_init(select=halos.haloid)
     if not halos.plist_init():
@@ -1519,6 +1541,7 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
 
     tasks_by_root: Dict[int, List[Tuple[int, List[int], int, int]]] = {}
     to_remove: Set[int] = set()
+    index_redirect: Dict[int, int] = {}
 
     for ahf_id, gal_indices in mapping.items():
         indices = sorted(set(gal_indices))
@@ -1641,6 +1664,10 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
             if item is None:
                 continue
             base_idx, indices, base_gid, slist_arr, glist_arr, bh_arr, dm_arr, dm_exclusive_idx = item
+            if indices and len(indices) > 1:
+                for dup_idx in indices[1:]:
+                    to_remove.add(dup_idx)
+                    index_redirect[dup_idx] = base_idx
             base = sim.galaxy_list[base_idx]
             base.slist = slist_arr
             base.glist = glist_arr
@@ -1679,9 +1706,6 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
                 pass
             base.global_indexes = np.concatenate(gi).astype(np.int64) if gi else np.array([], dtype=np.int64)
 
-            for gi in indices[1:]:
-                to_remove.add(gi)
-
         if host_progress is not None:
             host_progress.update(1)
 
@@ -1712,17 +1736,41 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
         # Build new galaxy list and renumber GroupIDs
         new_list = []
         new_host_ids: List[int] = []
+        index_map: Dict[int, int] = {}
         for i, g in enumerate(sim.galaxy_list):
             if i in to_remove:
                 continue
+            new_id = len(new_list)
             new_list.append(g)
             new_host_ids.append(galaxy_to_ahf_nodes[i])
+            index_map[i] = new_id
         # Renumber GroupIDs to be sequential
         for new_id, g in enumerate(new_list):
             g.GroupID = new_id
         sim.galaxy_list = new_list
         sim.ngalaxies = len(new_list)
         final_galaxy_ahf_ids = new_host_ids
+
+        def _remap_old_index(old_idx: int) -> Optional[int]:
+            target = index_redirect.get(old_idx, old_idx)
+            return index_map.get(target)
+
+        for halo in sim.halo_list:
+            current = getattr(halo, 'galaxy_index_list', [])
+            if not current:
+                halo.galaxy_index_list = []
+                continue
+            updated: List[int] = []
+            seen: Set[int] = set()
+            for raw_idx in current:
+                mapped = _remap_old_index(int(raw_idx))
+                if mapped is None:
+                    continue
+                if mapped in seen:
+                    continue
+                updated.append(mapped)
+                seen.add(mapped)
+            halo.galaxy_index_list = updated
     else:
         sim.ngalaxies = len(sim.galaxy_list)
         final_galaxy_ahf_ids = list(galaxy_to_ahf_nodes)
@@ -1768,6 +1816,9 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
         host_indices.append(int(host_idx) if host_idx is not None else -1)
 
     sim._ahf_galaxy_hosts = host_indices
+
+    for gal, host_idx in zip(sim.galaxy_list, host_indices):
+        gal.parent_halo_index = int(host_idx) if host_idx is not None else -1
     sim._ahf_galaxy_ahf_ids = normalized_ahf_ids
 
     # Stash exclusive DM reverse map for global list construction (none in this path)
