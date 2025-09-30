@@ -505,6 +505,8 @@ class fof6d:
                 parent.obj.halo_list[ihalo].galaxy_index_list = []
         ngrp = 0
         zero_marker = 0
+        keep_all = bool(getattr(self, 'keep_all_groups', False)) and self.obj_type == 'halo'
+
         for igrp in range(len(self.grouplist)):
             if self.grouplist[igrp] < 0:
                 zero_marker = 1  # if there are particles with tag=-1, these will be in igrp=0 within hid_bins. In this case, group_parents should start their numbering at 1, since igrp=0 is not a valid object.  This should only happen for galaxies/clouds, not halos
@@ -541,7 +543,10 @@ class fof6d:
                     mygrp.dm3list = my_indexes[my_ptype==ptype_ints[p]]-offset
                     mygrp.ndm3 = len(mygrp.dm3list)
                 offset += self.nparttype[p]
-            if mygrp._valid:
+            include_group = mygrp._valid or keep_all
+            if include_group:
+                if keep_all and not mygrp._valid:
+                    setattr(mygrp, '_forced_include', True)
                 mygrp.obj_type = self.obj_type
                 if self.obj_type == 'halo':
                     haloid_mode = str(self.obj._kwargs.get('haloid', '')).upper()
