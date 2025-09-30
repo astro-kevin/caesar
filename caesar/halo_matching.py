@@ -65,11 +65,7 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
     halos.load_haloid()
 
     if full_particle_load:
-        select_all: Dict[str, np.ndarray] = {}
-        for ptype, arr in halos.haloid.items():
-            arr_np = np.asarray(arr)
-            select_all[ptype] = np.zeros_like(arr_np, dtype=np.int64)
-        sim.data_manager._member_search_init(select=select_all)
+        sim.data_manager._member_search_init(select=halos.haloid)
 
         flattened: List[np.ndarray] = []
         for ptype in sim.data_manager.ptypes:
@@ -80,16 +76,7 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
             if source_arr.size == 0:
                 flattened.append(source_arr)
                 continue
-            selector = select_all.get(ptype, 'all')
-            if isinstance(selector, str):
-                mask = np.ones_like(source_arr, dtype=bool)
-            else:
-                selector_arr = np.asarray(selector).reshape(-1)
-                if selector_arr.shape != source_arr.shape:
-                    raise ValueError(
-                        f"Selection mask for {ptype} has shape {selector_arr.shape} but haloid array has shape {source_arr.shape}."
-                    )
-                mask = selector_arr >= 0
+            mask = source_arr >= 0
             source_copy = source_arr.copy()
             source_copy[source_copy < 0] = 0
             flattened.append(source_copy[mask])
@@ -1841,6 +1828,39 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
         normalized_ahf_ids.append(top_id)
         host_idx = _resolve_halo_index(top_id)
         host_indices.append(int(host_idx) if host_idx is not None else -1)
+
+    orphan_set: Set[int] = {i for i, host_idx in enumerate(host_indices) if host_idx is None or int(host_idx) < 0}
+    if orphan_set:
+        mylog.warning('AHF: removing %d galaxies with no valid host mapping', len(orphan_set))
+        new_list: List = []
+        new_host_indices: List[int] = []
+        new_ahf_ids: List[int] = []
+        index_map: Dict[int, int] = {}
+        for old_idx, gal in enumerate(sim.galaxy_list):
+            if old_idx in orphan_set:
+                continue
+            new_idx = len(new_list)
+            new_list.append(gal)
+            new_host_indices.append(host_indices[old_idx])
+            new_ahf_ids.append(normalized_ahf_ids[old_idx])
+            index_map[old_idx] = new_idx
+        for new_idx, gal in enumerate(new_list):
+            gal.GroupID = new_idx
+        for halo in sim.halo_list:
+            current = getattr(halo, 'galaxy_index_list', [])
+            if not current:
+                halo.galaxy_index_list = []
+                continue
+            updated: List[int] = []
+            for old in current:
+                if old in orphan_set:
+                    continue
+                updated.append(index_map.get(old, old))
+            halo.galaxy_index_list = updated
+        sim.galaxy_list = new_list
+        sim.ngalaxies = len(new_list)
+        host_indices = [int(idx) if idx is not None else -1 for idx in new_host_indices]
+        normalized_ahf_ids = new_ahf_ids
 
     sim._ahf_galaxy_hosts = host_indices
 
