@@ -109,7 +109,7 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
 
 
 def _prune_halos_after_galaxies(sim) -> None:
-    """Remove halos with no galaxies or insufficient particles after AHF reconciliation."""
+    """Remove halos that end up with no galaxies after the AHF reconciliation."""
 
     if not hasattr(sim, 'halo_list') or not sim.halo_list:
         return
@@ -839,7 +839,7 @@ def build_galaxies_from_ahf_fast(
         sim._ahf_galaxy_hosts = []
         return
 
-    def _refresh_global_indexes(gal) -> None:
+    def _compute_global_indexes(gal) -> np.ndarray:
         blocks = []
         try:
             if hasattr(gal, 'glist') and gal.glist is not None and len(gal.glist) > 0:
@@ -862,9 +862,11 @@ def build_galaxies_from_ahf_fast(
         except Exception:
             pass
         if blocks:
-            gal.global_indexes = np.concatenate(blocks).astype(np.int64)
-        else:
-            gal.global_indexes = np.array([], dtype=np.int64)
+            return np.concatenate(blocks).astype(np.int64)
+        return np.array([], dtype=np.int64)
+
+    def _refresh_global_indexes(gal) -> None:
+        gal.global_indexes = _compute_global_indexes(gal)
 
     for gal in sim.galaxy_list:
         _refresh_global_indexes(gal)
@@ -874,6 +876,9 @@ def build_galaxies_from_ahf_fast(
         if galaxy_node_ids and gal_index < len(galaxy_node_ids):
             node_id = galaxy_node_ids[gal_index]
         from caesar.group import create_new_group
+        gal = sim.galaxy_list[gal_index]
+        gal.global_indexes = _compute_global_indexes(gal)
+
         halo = create_new_group(sim, 'halo')
         halo.obj_type = 'halo'
         if node_id is not None and node_id != -1:
@@ -881,20 +886,19 @@ def build_galaxies_from_ahf_fast(
                 halo.AHF_haloID = int(node_id)
             except Exception:
                 pass
-        halo.global_indexes = getattr(sim.galaxy_list[gal_index], 'global_indexes', np.array([], dtype=np.int64))
-        for attr in ('glist', 'slist', 'dmlist', 'dm2list', 'dm3list', 'bhlist', 'dlist'):
-            if hasattr(sim.galaxy_list[gal_index], attr):
-                setattr(halo, attr, getattr(sim.galaxy_list[gal_index], attr))
+        halo.global_indexes = gal.global_indexes.copy()
+        halo.glist = getattr(gal, 'glist', np.array([], dtype=np.int64))
+        halo.slist = getattr(gal, 'slist', np.array([], dtype=np.int64))
+        halo.dmlist = getattr(gal, 'dmlist', np.array([], dtype=np.int64))
+        halo.dm2list = getattr(gal, 'dm2list', np.array([], dtype=np.int64)) if hasattr(gal, 'dm2list') else np.array([], dtype=np.int64)
+        halo.dm3list = getattr(gal, 'dm3list', np.array([], dtype=np.int64)) if hasattr(gal, 'dm3list') else np.array([], dtype=np.int64)
+        halo.bhlist = getattr(gal, 'bhlist', np.array([], dtype=np.int64))
+        halo.dlist = getattr(gal, 'dlist', np.array([], dtype=np.int64)) if hasattr(gal, 'dlist') else np.array([], dtype=np.int64)
         halo.GroupID = len(sim.halo_list)
         halo.galaxy_index_list = []
         sim.halo_list.append(halo)
         sim.halos = sim.halo_list
         sim.nhalos = len(sim.halo_list)
-        try:
-            halo._assign_local_data()
-            halo._process_group()
-        except Exception:
-            pass
         return halo.GroupID
 
     host_indices: List[int] = []
