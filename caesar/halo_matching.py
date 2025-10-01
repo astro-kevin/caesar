@@ -191,7 +191,7 @@ if _NUMBA_AVAILABLE:
                 continue
             gset = gal_sets[i]
             best_idx = -1
-            best_overlap = 0
+            best_overlap = -1
             for j in range(nh):
                 hset = halo_sets[j]
                 inter = 0
@@ -204,6 +204,8 @@ if _NUMBA_AVAILABLE:
                 if inter > best_overlap:
                     best_overlap = inter
                     best_idx = j
+            if best_idx == -1 and nh > 0:
+                best_idx = 0
             result[i] = best_idx
             if progress_proxy is not None:
                 progress_proxy.update(1)
