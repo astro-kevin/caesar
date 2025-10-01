@@ -320,8 +320,12 @@ class fof6d:
                         if pdata.size == 0:
                             continue
                         pdata = pdata.reshape(-1, 2)
-                        if pdata.shape[0] < MINIMUM_DM_PER_HALO and np.sum(pdata[:, 1] == 4) < MINIMUM_STARS_PER_GALAXY:
-                            continue
+                        dm_count = np.sum(pdata[:, 1] == 1)
+                        star_count = np.sum(pdata[:, 1] == 4)
+                        if dm_count < MINIMUM_DM_PER_HALO and star_count < 1:
+                            has_children = any(parent_of.get(child) == hid_val for child in node_particles.keys() if child != hid_val)
+                            if not has_children:
+                                continue
                         tmppd = np.zeros((pdata.shape[0], 3), dtype=np.int64)
                         tmppd[:, :2] = pdata
                         tmppd[:, 2] = np.int64(hid_val)

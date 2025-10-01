@@ -871,36 +871,6 @@ def build_galaxies_from_ahf_fast(
     for gal in sim.galaxy_list:
         _refresh_global_indexes(gal)
 
-    def _promote_galaxy_to_halo(gal_index: int) -> int:
-        node_id = None
-        if galaxy_node_ids and gal_index < len(galaxy_node_ids):
-            node_id = galaxy_node_ids[gal_index]
-        from caesar.group import create_new_group
-        gal = sim.galaxy_list[gal_index]
-        gal.global_indexes = _compute_global_indexes(gal)
-
-        halo = create_new_group(sim, 'halo')
-        halo.obj_type = 'halo'
-        if node_id is not None and node_id != -1:
-            try:
-                halo.AHF_haloID = int(node_id)
-            except Exception:
-                pass
-        halo.global_indexes = gal.global_indexes.copy()
-        halo.glist = getattr(gal, 'glist', np.array([], dtype=np.int64))
-        halo.slist = getattr(gal, 'slist', np.array([], dtype=np.int64))
-        halo.dmlist = getattr(gal, 'dmlist', np.array([], dtype=np.int64))
-        halo.dm2list = getattr(gal, 'dm2list', np.array([], dtype=np.int64)) if hasattr(gal, 'dm2list') else np.array([], dtype=np.int64)
-        halo.dm3list = getattr(gal, 'dm3list', np.array([], dtype=np.int64)) if hasattr(gal, 'dm3list') else np.array([], dtype=np.int64)
-        halo.bhlist = getattr(gal, 'bhlist', np.array([], dtype=np.int64))
-        halo.dlist = getattr(gal, 'dlist', np.array([], dtype=np.int64)) if hasattr(gal, 'dlist') else np.array([], dtype=np.int64)
-        halo.GroupID = len(sim.halo_list)
-        halo.galaxy_index_list = []
-        sim.halo_list.append(halo)
-        sim.halos = sim.halo_list
-        sim.nhalos = len(sim.halo_list)
-        return halo.GroupID
-
     host_indices: List[int] = []
     if galaxy_node_ids and len(galaxy_node_ids) == sim.ngalaxies:
         galaxy_node_ids = [int(nid) if nid is not None else -1 for nid in galaxy_node_ids]
@@ -916,7 +886,7 @@ def build_galaxies_from_ahf_fast(
             except Exception:
                 continue
 
-        def _resolve_halo_index(node_id: int, gi: int) -> int:
+        def _resolve_halo_index(node_id: int) -> int:
             cur = int(node_id)
             visited: Set[int] = set()
             while True:
@@ -930,23 +900,25 @@ def build_galaxies_from_ahf_fast(
                 if cur in visited:
                     break
                 visited.add(cur)
-            # promote galaxy to a new halo
-            new_idx = _promote_galaxy_to_halo(gi)
-            if node_id is not None and node_id != -1:
-                try:
-                    ahf_to_halo_index[int(node_id)] = new_idx
-                except Exception:
-                    pass
-            return new_idx
+            return -1
 
-        for gi, node_id in enumerate(galaxy_node_ids):
+        missing_hosts: Set[int] = set()
+        for node_id in galaxy_node_ids:
             if node_id is None or node_id == -1:
-                host_indices.append(_promote_galaxy_to_halo(gi))
-            else:
-                host_indices.append(_resolve_halo_index(int(node_id), gi))
+                host_indices.append(-1)
+                continue
+            resolved = _resolve_halo_index(int(node_id))
+            if resolved < 0:
+                missing_hosts.add(int(node_id))
+            host_indices.append(resolved)
+        if missing_hosts:
+            mylog.warning(
+                'AHF: %d host halo(s) referenced by galaxies were not loaded; keeping parent index = -1',
+                len(missing_hosts),
+            )
     else:
         sim._ahf_galaxy_ahf_ids = []
-        host_indices = [ _promote_galaxy_to_halo(gi) for gi in range(sim.ngalaxies) ]
+        host_indices = [-1 for _ in range(sim.ngalaxies)]
 
     for halo in sim.halo_list:
         halo.galaxy_index_list = []
@@ -1192,6 +1164,7 @@ def match_subhalos_to_galaxies(
 
     updated = []
     used = set()
+    merged_count = 0
     for ahf_id, gal_indices in mapping.items():
         subhalo = ahf_by_id.get(ahf_id)
         if subhalo is None:
@@ -1204,6 +1177,8 @@ def match_subhalos_to_galaxies(
         base.slist = merged_slist
         base.masses['dm'] = float(len(subhalo.parttype1))
         updated.append(base)
+        if len(gal_indices) > 1:
+            merged_count += len(gal_indices) - 1
 
     # add unmatched galaxies
     for idx, gal in enumerate(sim.galaxies):
@@ -1221,6 +1196,10 @@ def match_subhalos_to_galaxies(
         get_group_properties(sim, sim.galaxies)
     except Exception:  # pragma: no cover - optional heavy deps or incomplete sim
         return
+
+    if merged_count > 0:
+        from yt.funcs import mylog
+        mylog.info('AHF: collapsed %d CAESAR galaxy(ies) into matched AHF hosts', merged_count)
 
 
 def _maybe_readlines(file_path: str) -> List[str]:
@@ -1608,40 +1587,8 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
 
     orphan_set: Set[int] = {i for i, host_idx in enumerate(host_indices) if host_idx is None or int(host_idx) < 0}
     if orphan_set:
-        from caesar.group import create_new_group
-
-        created = 0
-        for gi in sorted(orphan_set):
-            node_id = normalized_ahf_ids[gi]
-            if node_id is None or int(node_id) == -1:
-                continue
-            node_id = int(node_id)
-            if node_id not in ahf_to_halo_index:
-                halo = create_new_group(sim, 'halo')
-                halo.obj_type = 'halo'
-                halo.GroupID = len(sim.halo_list)
-                halo.AHF_haloID = node_id
-                halo.global_indexes = np.array([], dtype=np.int64)
-                halo.glist = np.array([], dtype=np.int32)
-                halo.slist = np.array([], dtype=np.int32)
-                halo.dmlist = np.array([], dtype=np.int32)
-                halo.bhlist = np.array([], dtype=np.int32)
-                halo.ngas = halo.nstar = halo.ndm = halo.nbh = 0
-                halo.masses['total'] = halo.masses.get('total', 0.0)
-                halo.radii['total'] = halo.radii.get('total', 0.0)
-                halo.galaxy_index_list = []
-                sim.halo_list.append(halo)
-                ahf_to_halo_index[node_id] = halo.GroupID
-                created += 1
-        if created:
-            sim.nhalos = len(sim.halo_list)
-            sim.halos = sim.halo_list
-        for gi in orphan_set:
-            node_id = normalized_ahf_ids[gi]
-            idx = ahf_to_halo_index.get(int(node_id)) if node_id is not None else None
-            host_indices[gi] = int(idx) if idx is not None else -1
         mylog.warning(
-            'AHF: assigned %d orphan galaxy(ies) to newly created AHF halo placeholders',
+            'AHF: %d galaxy(ies) reference host halos that were not loaded; keeping parent index = -1',
             len(orphan_set),
         )
 
