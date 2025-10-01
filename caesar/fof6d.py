@@ -65,6 +65,7 @@ class fof6d:
     def load_ahf_id(self):
         if 'haloid_file' in self.obj._kwargs and self.obj._kwargs['haloid'] is not None:
             haloid_file = self.obj._kwargs['haloid_file']
+            haloid_flag = str(self.obj._kwargs.get('haloid', '')).lower()
             if os.path.isfile(haloid_file):
                 memlog('Reading AHF halo IDs from %s'%(haloid_file))
                 particles_file = haloid_file
@@ -249,10 +250,11 @@ class fof6d:
                         if tmpp.size:
                             pids.append(tmpp[tmpp >= 0])
 
-                    if pids:
-                        self.obj.data_manager.haloid = np.concatenate(pids).astype(np.int64, copy=False)
-                    else:
-                        self.obj.data_manager.haloid = np.empty(0, dtype=np.int64)
+                    if haloid_flag != 'ahf-fast':
+                        if pids:
+                            self.obj.data_manager.haloid = np.concatenate(pids).astype(np.int64, copy=False)
+                        else:
+                            self.obj.data_manager.haloid = np.empty(0, dtype=np.int64)
                     memlog('Total halo particle IDs = %d'%(nhid))
                     return
                 else: # use subhalo information as well, but very pain to remove these duplicated particles!!!!
@@ -355,7 +357,8 @@ class fof6d:
                     self.haloid[p] = tmpp
                 memlog('Total halo particle IDs = %d'%(nhid))
                 # self.haloid = np.asarray(self.haloid, dtype=object)         # all particles
-                self.obj.data_manager.haloid = np.asarray(pids) # only halo particles
+                if haloid_flag != 'ahf-fast':
+                    self.obj.data_manager.haloid = np.asarray(pids) # only halo particles
             else:
                 sys.exit('No ID data file is found in %s' % haloid_file)   
         else:

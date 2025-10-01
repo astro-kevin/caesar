@@ -66,7 +66,13 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
 
     if full_particle_load:
         halos.keep_all_groups = True
-        sim.data_manager._member_search_init(select=halos.haloid)
+    haloid_mode = str(sim._kwargs.get('haloid', '')).upper() if hasattr(sim, '_kwargs') else ''
+    if haloid_mode == 'AHF-FAST':
+        select_arg = 'all'
+    else:
+        select_arg = halos.haloid
+
+    sim.data_manager._member_search_init(select=select_arg)
 
         flattened: List[np.ndarray] = []
         for ptype in sim.data_manager.ptypes:
