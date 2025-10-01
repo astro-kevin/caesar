@@ -1190,7 +1190,17 @@ def match_subhalos_to_galaxies(
 
     # Recalculate galaxy properties with the merged particle lists if possible
     sim.galaxies = updated
+    sim.galaxy_list = updated
     sim.ngalaxies = len(updated)
+    if fof_helper is not None:
+        try:
+            fof_helper.counts['galaxy'] = len(updated)
+        except Exception:
+            pass
+        try:
+            fof_helper.obj.galaxy_list = updated
+        except Exception:
+            pass
     try:
         from caesar.group import get_group_properties
         get_group_properties(sim, sim.galaxies)
@@ -1337,7 +1347,7 @@ def _pid_to_index_map(arr: np.ndarray) -> Dict[int, int]:
     return {int(pid): int(i) for i, pid in enumerate(arr.tolist())}
 
 
-def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
+def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=None) -> None:
     """Integrate AHF matching per your spec, then prune and reassign.
 
     Matching policy:

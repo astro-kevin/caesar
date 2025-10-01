@@ -140,7 +140,7 @@ def fubar_halo(obj):
             try:
                 from caesar.halo_matching import integrate_ahf_match_prune_inplace
 
-                integrate_ahf_match_prune_inplace(obj, obj._kwargs['haloid_file'])
+                integrate_ahf_match_prune_inplace(obj, obj._kwargs['haloid_file'], fof_helper=galaxies)
                 setattr(obj, "_ahf_matched", True)
                 setattr(obj, "_include_dm_in_galaxies", True)
             except Exception as exc:  # pragma: no cover - optional heavy deps
