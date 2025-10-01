@@ -1608,36 +1608,42 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str) -> None:
 
     orphan_set: Set[int] = {i for i, host_idx in enumerate(host_indices) if host_idx is None or int(host_idx) < 0}
     if orphan_set:
-        mylog.warning('AHF: removing %d galaxies with no valid host mapping', len(orphan_set))
-        new_list: List = []
-        new_host_indices: List[int] = []
-        new_ahf_ids: List[int] = []
-        index_map: Dict[int, int] = {}
-        for old_idx, gal in enumerate(sim.galaxy_list):
-            if old_idx in orphan_set:
+        from caesar.group import create_new_group
+
+        created = 0
+        for gi in sorted(orphan_set):
+            node_id = normalized_ahf_ids[gi]
+            if node_id is None or int(node_id) == -1:
                 continue
-            new_idx = len(new_list)
-            new_list.append(gal)
-            new_host_indices.append(host_indices[old_idx])
-            new_ahf_ids.append(normalized_ahf_ids[old_idx])
-            index_map[old_idx] = new_idx
-        for new_idx, gal in enumerate(new_list):
-            gal.GroupID = new_idx
-        for halo in sim.halo_list:
-            current = getattr(halo, 'galaxy_index_list', [])
-            if not current:
+            node_id = int(node_id)
+            if node_id not in ahf_to_halo_index:
+                halo = create_new_group(sim, 'halo')
+                halo.obj_type = 'halo'
+                halo.GroupID = len(sim.halo_list)
+                halo.AHF_haloID = node_id
+                halo.global_indexes = np.array([], dtype=np.int64)
+                halo.glist = np.array([], dtype=np.int32)
+                halo.slist = np.array([], dtype=np.int32)
+                halo.dmlist = np.array([], dtype=np.int32)
+                halo.bhlist = np.array([], dtype=np.int32)
+                halo.ngas = halo.nstar = halo.ndm = halo.nbh = 0
+                halo.masses['total'] = halo.masses.get('total', 0.0)
+                halo.radii['total'] = halo.radii.get('total', 0.0)
                 halo.galaxy_index_list = []
-                continue
-            updated: List[int] = []
-            for old in current:
-                if old in orphan_set:
-                    continue
-                updated.append(index_map.get(old, old))
-            halo.galaxy_index_list = updated
-        sim.galaxy_list = new_list
-        sim.ngalaxies = len(new_list)
-        host_indices = [int(idx) if idx is not None else -1 for idx in new_host_indices]
-        normalized_ahf_ids = new_ahf_ids
+                sim.halo_list.append(halo)
+                ahf_to_halo_index[node_id] = halo.GroupID
+                created += 1
+        if created:
+            sim.nhalos = len(sim.halo_list)
+            sim.halos = sim.halo_list
+        for gi in orphan_set:
+            node_id = normalized_ahf_ids[gi]
+            idx = ahf_to_halo_index.get(int(node_id)) if node_id is not None else None
+            host_indices[gi] = int(idx) if idx is not None else -1
+        mylog.warning(
+            'AHF: assigned %d orphan galaxy(ies) to newly created AHF halo placeholders',
+            len(orphan_set),
+        )
 
     sim._ahf_galaxy_hosts = host_indices
 
