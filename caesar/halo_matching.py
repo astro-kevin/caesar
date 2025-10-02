@@ -74,7 +74,7 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
 
     sim.data_manager._member_search_init(select=select_arg)
 
-    if haloid_mode != 'AHF-FAST' and isinstance(halos.haloid, dict):
+    if isinstance(halos.haloid, dict):
         flattened: List[np.ndarray] = []
         for ptype in sim.data_manager.ptypes:
             source = halos.haloid.get(ptype)
@@ -88,6 +88,8 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
                 flattened.append(source_arr[mask])
         if flattened:
             sim.data_manager.haloid = np.concatenate(flattened).astype(np.int64, copy=False)
+        else:
+            sim.data_manager.haloid = np.empty(0, dtype=np.int64)
     if not halos.plist_init():
         return None
 

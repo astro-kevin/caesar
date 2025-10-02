@@ -97,8 +97,11 @@ class Group(object):
     def _valid(self):
         """Check against the minimum number of particles to see if
         this object is 'valid'."""
-        if self.obj_type == 'halo' and self.ngas+self.ndm+self.nstar < MINIMUM_DM_PER_HALO:
-            return False
+        if self.obj_type == 'halo':
+            total_particles = self.ngas + self.ndm + self.nstar
+            if total_particles < MINIMUM_DM_PER_HALO and self.nstar == 0:
+                return False
+            return True
         elif self.obj_type == 'galaxy' and self.nstar < MINIMUM_STARS_PER_GALAXY:
             return False
         elif self.obj_type == 'cloud' and self.ngas < MINIMUM_GAS_PER_CLOUD:
