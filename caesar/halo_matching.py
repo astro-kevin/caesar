@@ -1493,7 +1493,7 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
         best_hid, _ = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
         best_hid = int(best_hid)
 
-        if primary == -1 and total <= 0 and counts[best_hid] > 0:
+        if primary == -1 and counts.get(best_hid, 0) > 0:
             primary = best_hid
 
         return primary, best_hid
