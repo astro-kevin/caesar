@@ -14,6 +14,8 @@ import gzip
 
 from yt.funcs import mylog
 
+from caesar.group import create_new_group
+
 try:  # pragma: no cover - optional acceleration
     from numba import njit, prange, types, set_num_threads
     from numba.typed import List as NumbaList, Set as NumbaSet
@@ -68,7 +70,7 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
         halos.keep_all_groups = True
     haloid_mode = str(sim._kwargs.get('haloid', '')).upper() if hasattr(sim, '_kwargs') else ''
     if haloid_mode == 'AHF-FAST':
-        select_arg = 'all'
+        select_arg = halos.haloid
     else:
         select_arg = halos.haloid
 
@@ -567,9 +569,145 @@ def _read_memberships_for_ids(
                 elif ptype == 5:
                     cur_pm.parttype5.add(pid)
         # finalize last
-        if cur_pm is not None and cur_pm.id in needed:
-            out[cur_pm.id] = cur_pm
+    if cur_pm is not None and cur_pm.id in needed:
+        out[cur_pm.id] = cur_pm
     return out
+
+
+def _ensure_missing_ahf_halos(
+    sim,
+    missing_ids: Set[int],
+    ahf_particles_file: str,
+    pid_maps_sel: Dict[str, Dict[int, int]],
+) -> Dict[int, int]:
+    """Guarantee that each requested AHF halo ID has a CAESAR halo entry.
+
+    Returns a map of AHF haloID -> newly created halo index for any halos that
+    were synthesized. Existing halos are ignored.
+    """
+
+    needed = {int(h) for h in missing_ids if h is not None and int(h) >= 0}
+    if not needed:
+        return {}
+
+    existing = {
+        int(getattr(halo, 'AHF_haloID', -1))
+        for halo in getattr(sim, 'halo_list', [])
+        if getattr(halo, 'AHF_haloID', None) is not None
+    }
+    pending = {hid for hid in needed if hid not in existing}
+    if not pending:
+        return {}
+
+    memberships = _read_memberships_for_ids(ahf_particles_file, pending, load_dm=True)
+    if not memberships:
+        return {}
+
+    created: Dict[int, int] = {}
+
+    def _map_pidset(pidset: Iterable[int], key: str) -> np.ndarray:
+        mapping = pid_maps_sel.get(key, {})
+        if not mapping or not pidset:
+            return np.empty(0, dtype=np.int64)
+        idx = [mapping.get(int(pid)) for pid in pidset if int(pid) in mapping]
+        if not idx:
+            return np.empty(0, dtype=np.int64)
+        return np.unique(np.array(idx, dtype=np.int64))
+
+    def _concat_indices(ptype: str, sel_idx: np.ndarray) -> np.ndarray:
+        if sel_idx.size == 0:
+            return np.empty(0, dtype=np.int64)
+        try:
+            concat = sim.data_manager.selected_to_concat(ptype, sel_idx)
+            return np.asarray(concat, dtype=np.int64)
+        except Exception:
+            return np.empty(0, dtype=np.int64)
+
+    dataset = getattr(sim, 'yt_dataset', None)
+    units = getattr(sim, 'units', {})
+    mass_unit = units.get('mass', None)
+
+    def _to_quan(val: float):
+        if dataset is not None and mass_unit is not None:
+            try:
+                return dataset.quan(val, mass_unit)
+            except Exception:
+                pass
+        return val
+
+    def _mass_from_concat(concat_idx: np.ndarray) -> float:
+        if concat_idx.size == 0:
+            return 0.0
+        return float(np.sum(sim.data_manager.mass[concat_idx]))
+
+    for hid in sorted(pending):
+        pm = memberships.get(hid)
+        if pm is None:
+            continue
+
+        halo = create_new_group(sim, 'halo')
+        halo.obj_type = 'halo'
+        halo.AHF_haloID = int(hid)
+
+        gas_sel = _map_pidset(pm.parttype0, 'gas')
+        star_sel = _map_pidset(pm.parttype4, 'star')
+        bh_sel = _map_pidset(pm.parttype5, 'bh')
+        dm_sel = _map_pidset(pm.parttype1, 'dm')
+
+        halo.glist = gas_sel
+        halo.ngas = gas_sel.size
+        halo.slist = star_sel
+        halo.nstar = star_sel.size
+        halo.bhlist = bh_sel
+        halo.nbh = bh_sel.size
+        halo.dmlist = dm_sel
+        halo.ndm = dm_sel.size
+
+        concat_parts = []
+        gas_concat = _concat_indices('gas', gas_sel)
+        if gas_concat.size:
+            concat_parts.append(gas_concat)
+        star_concat = _concat_indices('star', star_sel)
+        if star_concat.size:
+            concat_parts.append(star_concat)
+        bh_concat = _concat_indices('bh', bh_sel)
+        if bh_concat.size:
+            concat_parts.append(bh_concat)
+        dm_concat = _concat_indices('dm', dm_sel)
+        if dm_concat.size:
+            concat_parts.append(dm_concat)
+
+        halo.global_indexes = (
+            np.sort(np.concatenate(concat_parts)).astype(np.int64)
+            if concat_parts
+            else np.empty(0, dtype=np.int64)
+        )
+
+        halo.galaxy_index_list = []
+        halo._forced_include = True
+
+        mass_gas = _mass_from_concat(gas_concat)
+        mass_star = _mass_from_concat(star_concat)
+        mass_bh = _mass_from_concat(bh_concat)
+        mass_dm = _mass_from_concat(dm_concat)
+        total_mass = mass_gas + mass_star + mass_bh + mass_dm
+
+        halo.masses['gas'] = _to_quan(mass_gas)
+        halo.masses['stellar'] = _to_quan(mass_star)
+        halo.masses['bh'] = _to_quan(mass_bh)
+        halo.masses['dm'] = _to_quan(mass_dm)
+        halo.masses['baryon'] = _to_quan(mass_gas + mass_star + mass_bh)
+        halo.masses['total'] = _to_quan(total_mass)
+
+        halo.GroupID = len(sim.halo_list)
+        sim.halo_list.append(halo)
+        created[hid] = halo.GroupID
+
+    if created:
+        sim.halos = sim.halo_list
+        sim.nhalos = len(sim.halo_list)
+
+    return created
 
 
 def _root_of(node: int, parent_of: Dict[int, Optional[int]]) -> int:
@@ -1561,19 +1699,21 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     final_galaxy_ahf_ids = list(galaxy_to_ahf_nodes)
 
     # Determine halo ownership using the AHF hierarchy
-    ahf_to_halo_index: Dict[int, int] = {}
-    for halo_index, halo in enumerate(sim.halo_list):
-        ahf_hid = getattr(halo, 'AHF_haloID', None)
-        if ahf_hid is None:
-            continue
-        try:
-            ahf_to_halo_index[int(ahf_hid)] = halo_index
-        except Exception:
-            continue
+    def _build_ahf_index_map() -> Dict[int, int]:
+        mapping: Dict[int, int] = {}
+        for halo_index, halo in enumerate(sim.halo_list):
+            ahf_hid = getattr(halo, 'AHF_haloID', None)
+            if ahf_hid is None:
+                continue
+            try:
+                mapping[int(ahf_hid)] = halo_index
+            except Exception:
+                continue
+        return mapping
 
-    def _resolve_halo_index(node_id: int) -> int:
+    def _resolve_halo_index(node_id: int, index_map: Dict[int, int]) -> int:
         cur = int(node_id)
-        candidate = ahf_to_halo_index.get(cur)
+        candidate = index_map.get(cur)
         visited: Set[int] = set()
         while True:
             parent = parent_of.get(cur, 0)
@@ -1583,24 +1723,40 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
             if cur in visited:
                 break
             visited.add(cur)
-            idx = ahf_to_halo_index.get(cur)
+            idx = index_map.get(cur)
             if idx is not None:
                 candidate = idx
         return candidate if candidate is not None else -1
 
-    host_indices: List[int] = []
-    normalized_ahf_ids: List[int] = []
-    for node_id in final_galaxy_ahf_ids:
-        if node_id is None or node_id == -1:
-            normalized_ahf_ids.append(-1)
-            host_indices.append(-1)
-            continue
-        top_id = int(node_id)
-        normalized_ahf_ids.append(top_id)
-        host_idx = _resolve_halo_index(top_id)
-        host_indices.append(int(host_idx) if host_idx is not None else -1)
+    def _assign_host_indices(index_map: Dict[int, int]) -> Tuple[List[int], List[int], Set[int]]:
+        host_list: List[int] = []
+        normalized_ids: List[int] = []
+        for node_id in final_galaxy_ahf_ids:
+            if node_id is None or node_id == -1:
+                normalized_ids.append(-1)
+                host_list.append(-1)
+                continue
+            top_id = int(node_id)
+            normalized_ids.append(top_id)
+            host_idx = _resolve_halo_index(top_id, index_map)
+            host_list.append(int(host_idx) if host_idx is not None else -1)
+        orphan_indices = {i for i, host_idx in enumerate(host_list) if host_idx is None or int(host_idx) < 0}
+        return host_list, normalized_ids, orphan_indices
 
-    orphan_set: Set[int] = {i for i, host_idx in enumerate(host_indices) if host_idx is None or int(host_idx) < 0}
+    ahf_to_halo_index = _build_ahf_index_map()
+    host_indices, normalized_ahf_ids, orphan_set = _assign_host_indices(ahf_to_halo_index)
+
+    if orphan_set:
+        missing_halo_ids: Set[int] = {
+            normalized_ahf_ids[i]
+            for i in orphan_set
+            if i < len(normalized_ahf_ids) and normalized_ahf_ids[i] is not None and normalized_ahf_ids[i] >= 0
+        }
+        created_map = _ensure_missing_ahf_halos(sim, missing_halo_ids, ahf_particles_file, pid_maps_sel)
+        if created_map:
+            ahf_to_halo_index = _build_ahf_index_map()
+            host_indices, normalized_ahf_ids, orphan_set = _assign_host_indices(ahf_to_halo_index)
+
     if orphan_set:
         mylog.warning(
             'AHF: %d galaxy(ies) reference host halos that were not loaded; keeping parent index = -1',
