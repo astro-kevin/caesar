@@ -16,12 +16,28 @@ from caesar.utils import memlog
 from caesar.group import group_types
 from joblib import Parallel, delayed
 from scipy import stats
+from typing import Dict, Iterable, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 ###################
 # DRIVER ROUTINES #
 ###################
 
-def run_progen(snapdirs, snapname, snapnums, prefix='caesar_', suffix='hdf5', **kwargs):
+def run_progen(
+        snapdirs,
+        snapname,
+        snapnums,
+        prefix='caesar_',
+        suffix='hdf5',
+        method='particle',
+        ahf_tree_dir=None,
+        ahf_mode='main',
+        write_mode='both',
+        parallel=True,
+        n_jobs=None,
+        **kwargs,
+    ):
     """Function to run progenitor/descendant finder in specified snapshots (or redshifts) in a given directory.
 
     Parameters
@@ -36,7 +52,21 @@ def run_progen(snapdirs, snapname, snapnums, prefix='caesar_', suffix='hdf5', **
         Prefix for caesar filename; assumes these are in 'Groups' subdir
     suffix : str
         Filetype suffix for caesar filename
-    kwargs : Passed to progen_finder()
+    method : {'particle', 'ahf'}
+        Matching backend forwarded to :func:`progen_finder` for every snapshot pair.
+    ahf_tree_dir : str, optional
+        Directory containing the AHF tree outputs. Required when ``method='ahf'``.
+    ahf_mode : {'main', 'all'}
+        AHF branch selection forwarded to :func:`progen_finder` (only used when ``method='ahf'``).
+    write_mode : {'both', 'progen', 'descend'}
+        Controls which ancestry datasets are written back to disk for each pair.
+    parallel : bool
+        If ``True`` (default) pairs are processed in parallel using a thread pool.
+    n_jobs : int, optional
+        Maximum number of worker threads to spawn when ``parallel`` is enabled. Defaults to the
+        number of pairs (capped by the thread pool default).
+    kwargs : dict
+        Additional keywords passed directly to :func:`progen_finder`.
 
     """
 
@@ -84,25 +114,132 @@ def run_progen(snapdirs, snapname, snapnums, prefix='caesar_', suffix='hdf5', **
     for i in range(0,len(verified_snaps)-1):
         progen_pairs.append((verified_snaps[i],verified_snaps[i+1]))
 
-    # Loop over pairs, find progens
-    for progen_pair in progen_pairs:
-        snap_current = progen_pair[0]
-        snap_progens = progen_pair[1]
+    if len(progen_pairs) == 0:
+        mylog.warning('No valid snapshot pairs found for run_progen.')
+        return
 
-        if snap_current.snapnum < snap_progens.snapnum: 
-            mylog.info('Progen: Finding descendants of snap %d in snap %d'%(snap_current.snapnum,snap_progens.snapnum))
+    pf_kwargs = dict(kwargs)
+    method_val = pf_kwargs.setdefault('method', method)
+    method_key = method_val.lower() if isinstance(method_val, str) else method_val
+    pf_kwargs['method'] = method_key
+    if method_key == 'ahf':
+        pf_kwargs.setdefault('ahf_tree_dir', ahf_tree_dir)
+        pf_kwargs.setdefault('ahf_mode', ahf_mode)
+        if pf_kwargs.get('ahf_tree_dir') is None:
+            raise ValueError('ahf_tree_dir must be provided when method="ahf" in run_progen')
+
+    should_save = pf_kwargs.pop('save', True)
+    pf_kwargs['save'] = False
+    data_type = pf_kwargs.get('data_type', 'galaxy')
+    part_type = pf_kwargs.get('part_type', 'star')
+    match_frac_flag = pf_kwargs.get('match_frac', False)
+
+    write_mode_l = write_mode.lower()
+    if write_mode_l not in ('both', 'progen', 'descend'):
+        raise ValueError("write_mode must be 'both', 'progen', or 'descend'")
+    allow_descend = write_mode_l in ('both', 'descend')
+    allow_progen = write_mode_l in ('both', 'progen')
+
+    base_snap_dir = snapdirs[0] if isinstance(snapdirs, (list, tuple)) and len(snapdirs) > 0 else (snapdirs if isinstance(snapdirs, str) else None)
+
+    def _index_name(src, dst):
+        if getattr(src.simulation, 'redshift', 0.0) > getattr(dst.simulation, 'redshift', 0.0):
+            return f'descend_{data_type}_{part_type}'
+        return f'progen_{data_type}_{part_type}'
+
+    def _unpack(result):
+        if match_frac_flag:
+            return result[0], result[1]
+        return result, None
+
+    def _should_write(index_name: str) -> bool:
+        if index_name.startswith('descend'):
+            return allow_descend
+        return allow_progen
+
+    def _write_package(pkg):
+        write_progens(pkg['obj'], pkg['data'], pkg['file'], pkg['index_name'], pkg['redshift'])
+
+    def _compute_pkg(src_obj, dst_obj, out_path):
+        res = progen_finder(src_obj, dst_obj, out_path, snap_dir=base_snap_dir, **pf_kwargs)
+        data, match = _unpack(res)
+        return {
+            'obj': src_obj,
+            'file': out_path,
+            'index_name': _index_name(src_obj, dst_obj),
+            'data': data,
+            'match': match,
+            'redshift': getattr(dst_obj.simulation, 'redshift', 0.0),
+        }
+
+    def _process_pair(snap_current, snap_target, barrier=None):
+        current_path = caesar_filename(snap_current, prefix, suffix)
+        target_path = caesar_filename(snap_target, prefix, suffix)
+
+        obj_current = caesar.load(current_path)
+        obj_target = caesar.load(target_path)
+
+        if snap_current.snapnum < snap_target.snapnum:
+            mylog.info(
+                'Progen: Finding descendants of snap %d in snap %d',
+                snap_current.snapnum,
+                snap_target.snapnum,
+            )
         else:
-            mylog.info('Progen: Finding progenitors of snap %d in snap %d'%(snap_current.snapnum,snap_progens.snapnum))
+            mylog.info(
+                'Progen: Finding progenitors of snap %d in snap %d',
+                snap_current.snapnum,
+                snap_target.snapnum,
+            )
 
-        obj_current = caesar.load(caesar_filename(snap_current,prefix,suffix))
-        obj_progens = caesar.load(caesar_filename(snap_progens,prefix,suffix))
+        upper_pkg = _compute_pkg(obj_current, obj_target, current_path)
+        lower_pkg = _compute_pkg(obj_target, obj_current, target_path)
 
-        progen_finder(obj_current, obj_progens, caesar_filename(snap_current,prefix,suffix), snap_dir=snapdirs[0], **kwargs)
+        if should_save and _should_write(upper_pkg['index_name']):
+            _write_package(upper_pkg)
+
+        if barrier is not None:
+            barrier.wait()
+
+        if should_save and _should_write(lower_pkg['index_name']):
+            _write_package(lower_pkg)
+
+    use_parallel = parallel and len(progen_pairs) > 1
+    need_second_phase = should_save and allow_descend and allow_progen and len(progen_pairs) > 1
+    barrier = threading.Barrier(len(progen_pairs)) if use_parallel and need_second_phase else None
+
+    if use_parallel:
+        max_workers = n_jobs or min(len(progen_pairs), (os.cpu_count() or 1))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_process_pair, snap_curr, snap_next, barrier)
+                for snap_curr, snap_next in progen_pairs
+            ]
+            for fut in futures:
+                fut.result()
+    else:
+        for snap_curr, snap_next in progen_pairs:
+            _process_pair(snap_curr, snap_next, barrier if barrier and barrier.parties == 1 else None)
 
 
-def progen_finder(obj_current, obj_target, caesar_file, snap_dir=None, data_type='galaxy', 
-                  part_type='star', recompute=True, save=True, n_most=None, min_in_common=0.1, 
-                  nproc=1, match_frac=False, reverse_match=False):
+def progen_finder(
+        obj_current,
+        obj_target,
+        caesar_file,
+        snap_dir=None,
+        data_type='galaxy',
+        part_type='star',
+        recompute=True,
+        save=True,
+        n_most=None,
+        min_in_common=0.1,
+        nproc=1,
+        match_frac=False,
+        reverse_match=False,
+        method='particle',
+        ahf_tree_dir=None,
+        ahf_mode='main',
+    ):
     """Function to find the most massive progenitor of each Caesar object in obj_current
     in the previous snapshot.
     Returns list of progenitors in obj_target associated with objects in obj_current
@@ -141,6 +278,15 @@ def progen_finder(obj_current, obj_target, caesar_file, snap_dir=None, data_type
         False = match all objects where fraction of _current_ is above min_in_common
         True = match all objects where fraction of _target_ is above min_in_common
         if match_fracs=True, returned fraction is the fraction of the current/target (False/True)
+    method : {'particle', 'ahf'}
+        Matching backend. ``'particle'`` reproduces the legacy particle-overlap matcher
+        while ``'ahf'`` uses the external AHF merger tree.
+    ahf_tree_dir : str
+        Directory containing the AHF outputs (``*_mtree``/``*_mtree_idx``). Required when
+        ``method='ahf'``.
+    ahf_mode : {'main', 'all'}
+        ``'main'`` records only the primary progenitor/descendant using the ``*_mtree_idx`` file.
+        ``'all'`` records every branch listed in ``*_mtree``.
 
     """
 
@@ -155,36 +301,52 @@ def progen_finder(obj_current, obj_target, caesar_file, snap_dir=None, data_type
         prog_indexes = f['tree_data/%s'%index_name]
         return np.asarray(prog_indexes)
 
-    ng_current, pid_current, gid_current, pid_hash = collect_group_IDs(obj_current, data_type, part_type, snap_dir)
-    ng_target, pid_target, gid_target, _ = collect_group_IDs(obj_target, data_type, part_type, snap_dir)
+    method = (method or 'particle').lower()
+    if method not in ('particle', 'ahf'):
+        raise ValueError("Unknown progen matching method '%s'" % method)
 
-    'gas', 'dm', 'dm2', 'star', 'bh'
-    if part_type == 'gas':
-        if 'gal' in data_type: npart_target = np.array([len(_g.glist) for _g in obj_target.galaxies])
-        if 'halo' in data_type: npart_target = np.array([len(_g.glist) for _g in obj_target.halos])
-        if 'cloud' in data_type: npart_target = np.array([len(_g.glist) for _g in obj_target.clouds])
-    elif part_type == 'star':
-        if 'gal' in data_type: npart_target = np.array([len(_g.slist) for _g in obj_target.galaxies])
-        if 'halo' in data_type: npart_target = np.array([len(_g.slist) for _g in obj_target.halos])
-        if 'cloud' in data_type: npart_target = np.array([len(_g.slist) for _g in obj_target.clouds])
-    elif part_type == 'bh':
-        if 'gal' in data_type: npart_target = np.array([len(_g.bhlist) for _g in obj_target.galaxies])
-        if 'halo' in data_type: npart_target = np.array([len(_g.bhlist) for _g in obj_target.halos])
-        if 'cloud' in data_type: npart_target = np.array([len(_g.bhlist) for _g in obj_target.clouds])
-    elif part_type in ['dm','dm2']:
-        if 'gal' in data_type: npart_target = np.array([len(_g.dmlist) for _g in obj_target.galaxies])
-        if 'halo' in data_type: npart_target = np.array([len(_g.dmlist) for _g in obj_target.halos])
-        if 'cloud' in data_type: npart_target = np.array([len(_g.dmlist) for _g in obj_target.clouds])
+    if method == 'ahf':
+        prog_indexes, match_fracs = _progen_from_ahf(
+            obj_current,
+            obj_target,
+            index_name=index_name,
+            data_type=data_type,
+            part_type=part_type,
+            n_most=n_most,
+            ahf_tree_dir=ahf_tree_dir,
+            ahf_mode=ahf_mode,
+        )
+    else:
+        ng_current, pid_current, gid_current, pid_hash = collect_group_IDs(obj_current, data_type, part_type, snap_dir)
+        ng_target, pid_target, gid_target, _ = collect_group_IDs(obj_target, data_type, part_type, snap_dir)
+
+        'gas', 'dm', 'dm2', 'star', 'bh'
+        if part_type == 'gas':
+            if 'gal' in data_type: npart_target = np.array([len(_g.glist) for _g in obj_target.galaxies])
+            if 'halo' in data_type: npart_target = np.array([len(_g.glist) for _g in obj_target.halos])
+            if 'cloud' in data_type: npart_target = np.array([len(_g.glist) for _g in obj_target.clouds])
+        elif part_type == 'star':
+            if 'gal' in data_type: npart_target = np.array([len(_g.slist) for _g in obj_target.galaxies])
+            if 'halo' in data_type: npart_target = np.array([len(_g.slist) for _g in obj_target.halos])
+            if 'cloud' in data_type: npart_target = np.array([len(_g.slist) for _g in obj_target.clouds])
+        elif part_type == 'bh':
+            if 'gal' in data_type: npart_target = np.array([len(_g.bhlist) for _g in obj_target.galaxies])
+            if 'halo' in data_type: npart_target = np.array([len(_g.bhlist) for _g in obj_target.halos])
+            if 'cloud' in data_type: npart_target = np.array([len(_g.bhlist) for _g in obj_target.clouds])
+        elif part_type in ['dm','dm2']:
+            if 'gal' in data_type: npart_target = np.array([len(_g.dmlist) for _g in obj_target.galaxies])
+            if 'halo' in data_type: npart_target = np.array([len(_g.dmlist) for _g in obj_target.halos])
+            if 'cloud' in data_type: npart_target = np.array([len(_g.dmlist) for _g in obj_target.clouds])
 
 
-    if ng_current == 0 or ng_target == 0:
-        mylog.warning('No %s found in current caesar/target file (%d/%d) -- exiting progen_finder'%(data_type,ng_current,ng_target))
-        return None
+        if ng_current == 0 or ng_target == 0:
+            mylog.warning('No %s found in current caesar/target file (%d/%d) -- exiting progen_finder'%(data_type,ng_current,ng_target))
+            return None
 
-    prog_indexes, match_fracs = \
-            find_progens(pid_current, pid_target, gid_current, gid_target, pid_hash, 
-                         npart_target, n_most=n_most, min_in_common=min_in_common, 
-                         nproc=nproc, reverse_match=reverse_match)
+        prog_indexes, match_fracs = \
+                find_progens(pid_current, pid_target, gid_current, gid_target, pid_hash, 
+                             npart_target, n_most=n_most, min_in_common=min_in_common, 
+                             nproc=nproc, reverse_match=reverse_match)
 
     if save:
         if n_most is not None:
@@ -374,6 +536,290 @@ def collect_group_IDs(obj, data_type, part_type, snap_dir):
     return ngroups, pids, gids, pid_hash
 
 
+def _progen_from_ahf(
+        obj_current,
+        obj_target,
+        *,
+        index_name: str,
+        data_type: str,
+        part_type: str,
+        n_most: Optional[int],
+        ahf_tree_dir: Optional[str],
+        ahf_mode: str,
+    ):
+    """Match groups using an external AHF merger tree."""
+
+    if data_type not in ('halo', 'galaxy'):
+        raise ValueError("AHF merger-tree matching currently supports 'halo' and 'galaxy' data types only")
+    if part_type not in ('dm', 'dm2', 'star', 'bh', 'gas'):
+        mylog.warning('Ignoring part_type=%s for AHF tree matching; tree links are particle-type agnostic', part_type)
+
+    if not ahf_tree_dir:
+        raise ValueError("ahf_tree_dir must be provided when method='ahf'")
+
+    descendant_obj = obj_current if index_name.startswith('progen_') else obj_target
+    progenitor_obj = obj_target if index_name.startswith('progen_') else obj_current
+
+    ahf_mode = (ahf_mode or 'main').lower()
+    if ahf_mode not in ('main', 'all'):
+        raise ValueError("ahf_mode must be 'main' or 'all'")
+
+    files = _locate_ahf_tree_files(descendant_obj, ahf_tree_dir)
+    mtree_path = files.get('mtree')
+    idx_path = files.get('idx')
+
+    if ahf_mode == 'main':
+        if not idx_path or not os.path.isfile(idx_path):
+            raise FileNotFoundError('AHF idx file not found for main-branch progenitors')
+        primary_map = _parse_ahf_mtree_idx(idx_path)
+        mtree = {hid: [pid] for hid, pid in primary_map.items()}
+        # Fill gaps with the first progenitor from the full tree if available
+        if mtree_path and os.path.isfile(mtree_path):
+            full_tree = _parse_ahf_mtree(mtree_path)
+            for hid, progs in full_tree.items():
+                if hid not in mtree and progs:
+                    mtree[hid] = [progs[0]]
+        n_most_effective = 1
+    else:
+        if not mtree_path or not os.path.isfile(mtree_path):
+            raise FileNotFoundError(f"AHF merger tree file not found: {mtree_path}")
+        mtree = _parse_ahf_mtree(mtree_path)
+        primary_map = _parse_ahf_mtree_idx(idx_path) if idx_path and os.path.isfile(idx_path) else {}
+        n_most_effective = n_most
+
+    descendant_ids, descendant_lookup = _extract_ahf_ids(descendant_obj, data_type)
+    progenitor_ids, progenitor_lookup = _extract_ahf_ids(progenitor_obj, data_type)
+
+    if index_name.startswith('progen_'):
+        prog_indexes = _map_descendant_to_progenitors(
+            descendant_ids,
+            progenitor_lookup,
+            mtree,
+            primary_map,
+            n_most=n_most_effective,
+        )
+    else:
+        prog_indexes = _map_progenitor_to_descendants(
+            progenitor_ids,
+            progenitor_lookup,
+            descendant_lookup,
+            mtree,
+            primary_map,
+            n_most=n_most_effective,
+        )
+
+    match_fracs = _ahf_match_fracs(prog_indexes, n_most_effective)
+    return prog_indexes, match_fracs
+
+
+def _locate_ahf_tree_files(descendant_obj, ahf_tree_dir: str) -> Dict[str, Optional[str]]:
+    base = _infer_ahf_base(descendant_obj)
+    if base is None:
+        raise ValueError('Unable to infer AHF base filename; ensure haloid_file is stored on the CAESAR object')
+
+    mtree_replacements = (
+        ('AHF_particles.gz', 'AHF_mtree'),
+        ('AHF_particles', 'AHF_mtree'),
+    )
+    idx_replacements = (
+        ('AHF_particles.gz', 'AHF_mtree_idx'),
+        ('AHF_particles', 'AHF_mtree_idx'),
+    )
+
+    mtree_name = None
+    for old, new in mtree_replacements:
+        if base.endswith(old):
+            mtree_name = base[:-len(old)] + new
+            break
+    if mtree_name is None:
+        mtree_name = base + '.AHF_mtree'
+
+    idx_name = None
+    for old, new in idx_replacements:
+        if base.endswith(old):
+            idx_name = base[:-len(old)] + new
+            break
+    if idx_name is None:
+        idx_name = base + '.AHF_mtree_idx'
+
+    mtree_path = os.path.join(ahf_tree_dir, mtree_name)
+    idx_path = os.path.join(ahf_tree_dir, idx_name)
+
+    return {'mtree': mtree_path, 'idx': idx_path}
+
+
+def _infer_ahf_base(descendant_obj) -> Optional[str]:
+    kwargs = getattr(descendant_obj, '_kwargs', {}) or {}
+    haloid_file = kwargs.get('haloid_file')
+    if not haloid_file:
+        haloid_file = getattr(descendant_obj, 'haloid_file', None)
+    if not haloid_file:
+        return None
+    return os.path.basename(haloid_file)
+
+
+def _parse_ahf_mtree(path: str) -> Dict[int, List[int]]:
+    mapping: Dict[int, List[int]] = {}
+    with open(path, 'r') as fh:
+        header = fh.readline()
+        if not header:
+            return mapping
+        try:
+            total = int(header.strip())
+        except Exception:
+            total = None
+        while True:
+            line = fh.readline()
+            if not line:
+                break
+            parts = line.strip().split()
+            if len(parts) < 2:
+                continue
+            try:
+                desc = int(parts[0])
+                nprog = int(parts[1])
+            except Exception:
+                continue
+            progs: List[int] = []
+            for _ in range(nprog):
+                entry = fh.readline()
+                if not entry:
+                    break
+                try:
+                    progs.append(int(entry.strip()))
+                except Exception:
+                    continue
+            mapping[desc] = progs
+    return mapping
+
+
+def _parse_ahf_mtree_idx(path: str) -> Dict[int, int]:
+    mapping: Dict[int, int] = {}
+    if not path or not os.path.isfile(path):
+        return mapping
+    with open(path, 'r') as fh:
+        header = fh.readline()
+        for line in fh:
+            parts = line.strip().split()
+            if len(parts) != 2:
+                continue
+            try:
+                descendant = int(parts[0])
+                primary = int(parts[1])
+            except Exception:
+                continue
+            mapping[descendant] = primary
+    return mapping
+
+
+def _extract_ahf_ids(obj, data_type: str) -> Tuple[List[int], Dict[int, int]]:
+    ids: List[int] = []
+    lookup: Dict[int, int] = {}
+    if data_type == 'halo':
+        source = getattr(obj, 'halo_list', [])
+        for idx, halo in enumerate(source):
+            hid = getattr(halo, 'AHF_haloID', None)
+            hid_val = -1 if hid is None else int(hid)
+            ids.append(hid_val)
+            if hid_val is not None and hid_val >= 0:
+                lookup[hid_val] = idx
+    elif data_type == 'galaxy':
+        source = getattr(obj, '_ahf_galaxy_ahf_ids', None)
+        if source is None:
+            raise ValueError('Galaxy AHF IDs not present; run AHF matcher before using method="ahf"')
+        for idx, hid in enumerate(source):
+            if hid is None:
+                hid_val = -1
+            else:
+                hid_val = int(hid)
+            ids.append(hid_val)
+            if hid_val >= 0:
+                lookup[hid_val] = idx
+    else:
+        raise ValueError(f'Unsupported data_type={data_type} for AHF tree matching')
+    return ids, lookup
+
+
+def _ahf_match_fracs(prog_indexes, n_most):
+    if n_most is not None:
+        frac = np.zeros_like(prog_indexes, dtype=np.float32)
+        mask = prog_indexes >= 0
+        frac[mask] = 1.0
+        return frac
+
+    out = np.empty(len(prog_indexes), dtype=object)
+    for idx, entry in enumerate(prog_indexes):
+        if entry is None:
+            out[idx] = []
+            continue
+        if isinstance(entry, (list, tuple)):
+            out[idx] = [1.0 if val is not None and val >= 0 else 0.0 for val in entry]
+        else:
+            arr = np.asarray(entry)
+            out[idx] = [1.0 if val >= 0 else 0.0 for val in arr.tolist()]
+    return out
+
+
+def _map_descendant_to_progenitors(descendant_ids, progenitor_lookup, mtree, primary_map, *, n_most):
+    ng = len(descendant_ids)
+    if n_most is not None:
+        out = np.full((ng, n_most), -1, dtype=np.int32)
+    else:
+        out = np.empty(ng, dtype=object)
+
+    for idx, hid in enumerate(descendant_ids):
+        if hid is None or hid < 0:
+            if n_most is None:
+                out[idx] = []
+            continue
+        progenitors = list(mtree.get(hid, []))
+        primary = primary_map.get(hid)
+        if primary is not None and primary in progenitors:
+            progenitors = [primary] + [p for p in progenitors if p != primary]
+        mapped = [progenitor_lookup.get(pid, -1) for pid in progenitors]
+        if n_most is not None:
+            limit = min(n_most, len(mapped))
+            if limit > 0:
+                out[idx, :limit] = mapped[:limit]
+        else:
+            out[idx] = mapped
+    return out
+
+
+def _map_progenitor_to_descendants(progenitor_ids, progenitor_lookup, descendant_lookup, mtree, primary_map, *, n_most):
+    reverse: Dict[int, List[int]] = {}
+
+    for desc_hid, prog_list in mtree.items():
+        desc_idx = descendant_lookup.get(desc_hid)
+        if desc_idx is None:
+            continue
+        primary = primary_map.get(desc_hid)
+        ordered = list(prog_list)
+        if primary is not None and primary in ordered:
+            ordered = [primary] + [p for p in ordered if p != primary]
+        for pid in ordered:
+            prog_idx = progenitor_lookup.get(pid)
+            if prog_idx is None:
+                continue
+            reverse.setdefault(prog_idx, []).append(desc_idx)
+
+    ng = len(progenitor_ids)
+    if n_most is not None:
+        out = np.full((ng, n_most), -1, dtype=np.int32)
+    else:
+        out = np.empty(ng, dtype=object)
+
+    for idx in range(ng):
+        descendants = reverse.get(idx, [])
+        if n_most is not None:
+            limit = min(n_most, len(descendants))
+            if limit > 0:
+                out[idx, :limit] = descendants[:limit]
+        else:
+            out[idx] = descendants
+    return out
+
+
 
 ################
 # I/O ROUTINES #
@@ -510,5 +956,3 @@ def z_to_snap(redshift, snaplist_file='Simba', mode='closest'):
             idx = min(idx+1,len(z_output)-1)
 
     return idx,z_output[idx]
-
-

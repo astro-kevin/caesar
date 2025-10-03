@@ -1,5 +1,6 @@
 six
 numpy
+bidict
 h5py
 cython>=3.0
 psutil

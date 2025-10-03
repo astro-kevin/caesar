@@ -23,6 +23,7 @@ import functools
 from pprint import pprint
 from collections import defaultdict
 from collections.abc import Sequence, Mapping
+from typing import List
 
 import h5py
 import numpy as np
@@ -32,6 +33,7 @@ from yt.funcs import mylog, get_hash
 from caesar.property_manager import DatasetType
 from caesar.utils import info_printer
 from caesar.simulation_attributes import SimulationAttributes
+from bidict import bidict
 
 
 class LazyDataset:
@@ -320,6 +322,8 @@ class CAESAR:
                 self.nclouds = hd.attrs['nclouds']
                 self.clouds = LazyList(self.nclouds, lambda i: Cloud(self, i))
                 mylog.info('Found {} clouds'.format(len(self.clouds)))
+
+        self._build_ahf_maps()
 
     @property
     def yt_dataset(self):
@@ -624,6 +628,56 @@ class Cloud(Group):
                 lambda d: self.obj._cloud_dicts[attr][d][self._index])
         raise AttributeError("'{}' object as no attribute '{}'".format(
             self.__class__.__name__, attr))
+
+    def _build_ahf_maps(self):
+        """Reconstruct bidirectional AHF ID lookups from stored datasets."""
+
+        halo_map = bidict()
+        halo_ids = None
+        if 'AHF_haloID' in self._halo_data:
+            try:
+                halo_ids = self._halo_data['AHF_haloID'][:]
+            except Exception:
+                halo_ids = None
+        if halo_ids is not None:
+            for idx, raw in enumerate(np.asarray(halo_ids).tolist()):
+                try:
+                    hid_val = int(raw)
+                except Exception:
+                    continue
+                if hid_val < 0:
+                    continue
+                halo_map[hid_val] = idx
+
+        self._ahf_halo_map = halo_map
+        self._ahf_halo_id_to_index = halo_map
+        self._ahf_halo_index_to_id = halo_map.inv
+
+        galaxy_map = bidict()
+        clean_ids: List[int] = []
+        galaxy_ids = None
+        if 'AHF_haloID' in self._galaxy_data:
+            try:
+                galaxy_ids = self._galaxy_data['AHF_haloID'][:]
+            except Exception:
+                galaxy_ids = None
+        if galaxy_ids is not None:
+            for idx, raw in enumerate(np.asarray(galaxy_ids).tolist()):
+                try:
+                    hid_val = int(raw)
+                except Exception:
+                    hid_val = -1
+                if hid_val < 0:
+                    clean_ids.append(-1)
+                    continue
+                clean_ids.append(hid_val)
+                galaxy_map[hid_val] = idx
+        if not clean_ids and self.ngalaxies:
+            clean_ids = [-1] * self.ngalaxies
+        self._ahf_galaxy_map = galaxy_map
+        self._ahf_galaxy_id_to_index = galaxy_map
+        self._ahf_galaxy_index_to_id = galaxy_map.inv
+        self._ahf_galaxy_ahf_ids = clean_ids
 
 
 def load(filename, skip_hash_check=False):

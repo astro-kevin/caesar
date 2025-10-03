@@ -12,6 +12,8 @@ from tqdm import tqdm
 import numpy as np
 import gzip
 
+from bidict import bidict
+
 from yt.funcs import mylog
 
 from caesar.group import create_new_group
@@ -42,6 +44,53 @@ def _open_ahf_particles(path: str):
     if path.endswith('.gz'):
         return gzip.open(path, 'rt')
     return open(path, 'r')
+
+
+def _update_ahf_halo_maps(sim) -> None:
+    """Cache halo AHF ID lookups for O(1) access."""
+
+    halo_map = bidict()
+
+    for idx, halo in enumerate(getattr(sim, 'halo_list', [])):
+        hid_raw = getattr(halo, 'AHF_haloID', None)
+        try:
+            hid_val = int(hid_raw) if hid_raw is not None else None
+        except Exception:
+            hid_val = None
+        if hid_val is not None and hid_val < 0:
+            hid_val = None
+        if hid_val is not None:
+            halo_map[hid_val] = idx
+
+    sim._ahf_halo_map = halo_map
+    sim._ahf_halo_id_to_index = halo_map
+    sim._ahf_halo_index_to_id = halo_map.inv
+
+
+def _update_ahf_galaxy_maps(sim, ids: Optional[Iterable]) -> None:
+    """Cache galaxy AHF ID lookups for O(1) access."""
+
+    if ids is None:
+        ids_iter = list(getattr(sim, '_ahf_galaxy_ahf_ids', []))
+    else:
+        ids_iter = list(ids)
+        sim._ahf_galaxy_ahf_ids = list(ids_iter)
+
+    gal_map = bidict()
+
+    for idx, hid in enumerate(ids_iter):
+        try:
+            hid_val = int(hid)
+        except Exception:
+            hid_val = None
+        if hid_val is not None and hid_val < 0:
+            hid_val = None
+        if hid_val is not None:
+            gal_map[hid_val] = idx
+
+    sim._ahf_galaxy_map = gal_map
+    sim._ahf_galaxy_id_to_index = gal_map
+    sim._ahf_galaxy_index_to_id = gal_map.inv
 
 
 def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bool = False):
@@ -105,6 +154,8 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
 
     get_group_properties(halos, sim.halo_list)
 
+    _update_ahf_halo_maps(sim)
+
     if 'halo' not in sim.group_types:
         sim.group_types.append('halo')
     sim.halos = sim.halo_list
@@ -149,6 +200,8 @@ def _prune_halos_after_galaxies(sim) -> None:
     sim.halo_list = keep
     sim.halos = keep
     sim.nhalos = len(keep)
+
+    _update_ahf_halo_maps(sim)
 
 @dataclass
 class ParticleMembership:
@@ -706,6 +759,7 @@ def _ensure_missing_ahf_halos(
     if created:
         sim.halos = sim.halo_list
         sim.nhalos = len(sim.halo_list)
+        _update_ahf_halo_maps(sim)
 
     return created
 
@@ -868,6 +922,7 @@ def build_galaxies_from_ahf_fast(
             dm_pm = bucket.get(node_id)
             dm_inclusive = dm_pm.parttype1 if dm_pm is not None else set()
             grp = create_new_group(sim, 'galaxy')
+            grp.AHF_haloID = int(node_id)
             grp.slist = map_sel(star_set, 'star')
             grp.glist = map_sel(gas_set, 'gas')
             if 'bh' in pid_maps_sel:
@@ -979,6 +1034,7 @@ def build_galaxies_from_ahf_fast(
     setattr(sim, "_include_dm_in_galaxies", True)
     if sim.ngalaxies == 0:
         sim._ahf_galaxy_ahf_ids = []
+        _update_ahf_galaxy_maps(sim, [])
         sim._ahf_galaxy_hosts = []
         return
 
@@ -1018,6 +1074,7 @@ def build_galaxies_from_ahf_fast(
     if galaxy_node_ids and len(galaxy_node_ids) == sim.ngalaxies:
         galaxy_node_ids = [int(nid) if nid is not None else -1 for nid in galaxy_node_ids]
         sim._ahf_galaxy_ahf_ids = list(galaxy_node_ids)
+        _update_ahf_galaxy_maps(sim, sim._ahf_galaxy_ahf_ids)
 
         ahf_to_halo_index: Dict[int, int] = {}
         for halo_index, halo in enumerate(sim.halo_list):
@@ -1061,6 +1118,7 @@ def build_galaxies_from_ahf_fast(
             )
     else:
         sim._ahf_galaxy_ahf_ids = []
+        _update_ahf_galaxy_maps(sim, [])
         host_indices = [-1 for _ in range(sim.ngalaxies)]
 
     for halo in sim.halo_list:
@@ -1677,6 +1735,11 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     if not mapping:
         sim._ahf_galaxy_hosts = [-1] * len(sim.galaxy_list)
         sim._ahf_galaxy_ahf_ids = galaxy_to_ahf_nodes
+        for gi, node_id in enumerate(galaxy_to_ahf_nodes):
+            ahf_val = int(node_id) if node_id is not None and node_id >= 0 else -1
+            if gi < len(sim.galaxy_list):
+                setattr(sim.galaxy_list[gi], 'AHF_haloID', ahf_val)
+        _update_ahf_galaxy_maps(sim, galaxy_to_ahf_nodes)
         return
 
     matched_ids = set(mapping.keys())
@@ -1776,6 +1839,11 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
             sim.halo_list[idx].galaxy_index_list.append(gi)
 
     sim._ahf_galaxy_ahf_ids = normalized_ahf_ids
+    for gi, ahf_id in enumerate(normalized_ahf_ids):
+        ahf_val = int(ahf_id) if ahf_id is not None and ahf_id >= 0 else -1
+        if gi < len(sim.galaxy_list):
+            setattr(sim.galaxy_list[gi], 'AHF_haloID', ahf_val)
+    _update_ahf_galaxy_maps(sim, normalized_ahf_ids)
 
     _prune_halos_after_galaxies(sim)
 

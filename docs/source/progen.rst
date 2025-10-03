@@ -59,6 +59,9 @@ The following options can be passed to ``run_progen()`` or ``progen_finder()``:
 * ``min_in_common``: Requires that the current group and the prog/desc group have at least this fraction of particles in common to be considered valid.  *Default:* 0.1
 * ``overwrite``: If ``True``, (over)writes info into ``CAESAR`` file.  If ``False``, then if it already exists read it in and return it; but if it doesn't already exist, compute and return it but don't touch the ``CAESAR`` file. *Default:* ``True``
 * ``nproc``: Number of OpenMP cores (using `joblib <https://joblib.readthedocs.io/en/latest/generated/joblib.Parallel.html>`_, passed as ``n_jobs``).  ``progen`` is already very fast, so this isn't terribly useful, except maybe for DM halos where there are lots of groups and particles.  *Default:* 1
+* ``method``: Set to ``'ahf'`` to source progenitors/descendants from AHF merger-tree files instead of particle overlaps. Requires ``ahf_tree_dir``.
+* ``ahf_tree_dir``: Directory containing the AHF ``*_mtree``/``*_mtree_idx`` outputs. Used only when ``method='ahf'``.
+* ``ahf_mode``: ``'main'`` uses the AHF index file to record only the primary progenitor/descendant, while ``'all'`` records every branch present in ``*_mtree`` (subject to ``n_most`` if provided).
 
 
 Where is the info stored?
@@ -87,4 +90,3 @@ Some other potentially useful routines are available in ``progen``:
 * ``wipe_progen_info(caesar_file, [index_name])`` removes ``index_name`` info from ``caesar_file``.  With no ``index_name`` (default), it wipes all datasets containing the word ``progen`` or ``descend``; this should return the ``CAESAR`` file to the state before any progen was run.
 * ``check_if_progen_is_present(caesar_file, index_name)`` checks if the dataset ``index_name`` is in the ``CAESAR`` file ``caesar_file``
 * ``collect_group_IDs(obj, data_type, part_type, snap_dir)`` collects all groups IDs for a given ``data_type`` and ``part_type`` into a single array, and returns the particle and group IDs along with a hash array of length ``ngroups`` which marks the locations of the start of each group.
-
