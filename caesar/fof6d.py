@@ -267,6 +267,7 @@ class fof6d:
                             lines = f.readlines()
                     hpp = 1  # halo particle numbers and halo ID position
                     node_particles = {}
+                    all_memberships = []
                     total_blocks = int(lines[0])
                     for _ in range(total_blocks):
                         npt, hid = [int(x) for x in lines[hpp].split()]
@@ -278,6 +279,16 @@ class fof6d:
                         hpp += npt
                         arr = np.atleast_2d(block).astype(np.int64, copy=False)
                         node_particles[int(hid)] = arr
+                        if arr.size:
+                            tmp_all = np.empty((arr.shape[0], 3), dtype=np.int64)
+                            tmp_all[:, :2] = arr
+                            tmp_all[:, 2] = np.int64(hid)
+                            all_memberships.append(tmp_all)
+
+                    if all_memberships:
+                        full_membership = np.vstack(all_memberships)
+                    else:
+                        full_membership = np.empty((0, 3), dtype=np.int64)
 
                     parent_of = {int(row[0]): int(row[1]) for row in halo_info}
                     depth_cache = {}
@@ -343,6 +354,8 @@ class fof6d:
                 pids = []
                 nhid = 0
                 memlog('Reading simulation data IDs and mapping halo particle to them')
+                missing_pid_cache = {}
+                pid_to_index = {}
                 for p in self.obj.data_manager.ptypes:
                     if has_ptype(self.obj, p):
                         data = get_property(self.obj, 'pid', p).d.astype(np.int64)
@@ -352,9 +365,41 @@ class fof6d:
                         tmpp[x_ind] = tmppd[y_ind,2]
                         nhid += len(com)
                         pids.extend(tmpp[tmpp>=0])
+                        if full_membership.size and np.any(tmpp < 0):
+                            missing_mask = tmpp < 0
+                            missing_pid_cache[p] = set(data[missing_mask].astype(np.int64))
+                            pid_to_index[p] = {int(pid): idx for idx, pid in enumerate(data)}
+                        else:
+                            missing_pid_cache[p] = set()
                     else:
                         tmpp = np.empty(0,dtype=np.int64)
+                        missing_pid_cache[p] = set()
                     self.haloid[p] = tmpp
+
+                if full_membership.size:
+                    code_to_ptype = {0: 'gas', 1: 'dm', 4: 'star', 5: 'bh'}
+                    remaining = {ptype for ptype, cache in missing_pid_cache.items() if cache}
+                    if remaining:
+                        for pid_val, code_val, hid_val in full_membership:
+                            ptype = code_to_ptype.get(int(code_val))
+                            if ptype not in remaining:
+                                continue
+                            cache = missing_pid_cache.get(ptype)
+                            if not cache:
+                                continue
+                            pid_int = int(pid_val)
+                            if pid_int not in cache:
+                                continue
+                            idx = pid_to_index[ptype].get(pid_int)
+                            if idx is None:
+                                continue
+                            self.haloid[ptype][idx] = int(hid_val)
+                            cache.discard(pid_int)
+                            if not cache:
+                                remaining.discard(ptype)
+                                if not remaining:
+                                    break
+
                 memlog('Total halo particle IDs = %d'%(nhid))
                 # self.haloid = np.asarray(self.haloid, dtype=object)         # all particles
                 if haloid_flag != 'ahf-fast':
