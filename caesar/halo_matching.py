@@ -757,6 +757,46 @@ def _ensure_missing_ahf_halos(
         created[hid] = halo.GroupID
 
     if created:
+        try:
+            from types import SimpleNamespace
+            from caesar.group import get_group_properties
+            new_halos = [sim.halo_list[idx] for idx in created.values()]
+            valid_halos = [halo for halo in new_halos if halo is not None]
+            if valid_halos:
+                nparttot = sum(len(getattr(halo, 'global_indexes', [])) for halo in valid_halos)
+                mapping = {}
+                dm = sim.data_manager
+                for ptype in getattr(dm, 'ptypes', []):
+                    if ptype == 'gas':
+                        attr = 'glist'
+                    elif ptype == 'star':
+                        attr = 'slist'
+                    elif ptype == 'bh':
+                        attr = 'bhlist'
+                    elif ptype == 'dust':
+                        attr = 'dlist'
+                    elif ptype == 'dm':
+                        attr = 'dmlist'
+                    elif ptype == 'dm2':
+                        attr = 'dm2list'
+                    elif ptype == 'dm3':
+                        attr = 'dm3list'
+                    else:
+                        continue
+                    mapping[ptype] = len(getattr(dm, attr, []))
+                context = SimpleNamespace(
+                    obj=sim,
+                    obj_type='halo',
+                    nproc=int(getattr(sim, 'nproc', 1)),
+                    nparttot=max(int(nparttot), 0),
+                    nparttype=mapping,
+                )
+                original_ids = {halo: halo.GroupID for halo in valid_halos}
+                get_group_properties(context, valid_halos)
+                for halo in valid_halos:
+                    halo.GroupID = original_ids.get(halo, halo.GroupID)
+        except Exception as exc:  # pragma: no cover - defensive
+            mylog.warning('Failed to recompute properties for synthesized AHF halos: %s', exc)
         sim.halos = sim.halo_list
         sim.nhalos = len(sim.halo_list)
         _update_ahf_halo_maps(sim)
