@@ -51,9 +51,6 @@ class fof6d:
             sys.exit('Sorry, reading from rockstar files not implemented yet')
         elif 'haloid' in self.obj._kwargs and 'AHF' in self.obj._kwargs['haloid']:
             haloid_flag = str(self.obj._kwargs['haloid']).lower()
-            if haloid_flag == 'ahf-fast' and not self.obj._kwargs.get('AHF_use_subhalos', False):
-                mylog.info('AHF-FAST detected; enabling AHF_use_subhalos')
-                self.obj._kwargs['AHF_use_subhalos'] = True
             self.load_ahf_id()
         else:
             memlog('No Halo ID source specified -- running FOF.  This is the yt 3D FOF for halos and our homegrown 6D FOF for galaxies ...')
@@ -228,10 +225,13 @@ class fof6d:
 
                     pids = []
                     nhid = 0
+                    missing_pid_cache = {}
+                    pid_to_index = {}
                     memlog('Reading simulation data IDs and mapping halo particle to them')
                     for code, info in type_buffers.items():
                         pid_buffer = info['pid_buffer']
                         if pid_buffer.size == 0:
+                            missing_pid_cache[info['particle_type']] = set()
                             continue
                         hid_buffer = info['hid_buffer']
                         if info['offset'] != pid_buffer.size:
@@ -249,14 +249,63 @@ class fof6d:
                         nhid += len(com)
                         if tmpp.size:
                             pids.append(tmpp[tmpp >= 0])
-
-                    if haloid_flag != 'ahf-fast':
-                        if pids:
-                            self.obj.data_manager.haloid = np.concatenate(pids).astype(np.int64, copy=False)
+                        missing_mask = tmpp < 0
+                        if np.any(missing_mask):
+                            misses = data[missing_mask].astype(np.int64)
+                            missing_pid_cache[info['particle_type']] = set(misses.tolist())
+                            pid_to_index[info['particle_type']] = {int(pid): idx for idx, pid in enumerate(data)}
                         else:
-                            self.obj.data_manager.haloid = np.empty(0, dtype=np.int64)
-                    memlog('Total halo particle IDs = %d'%(nhid))
-                    return
+                            missing_pid_cache[info['particle_type']] = set()
+
+                    combined = (
+                        np.concatenate(pids).astype(np.int64, copy=False)
+                        if pids else np.empty(0, dtype=np.int64)
+                    )
+
+                    if haloid_flag == 'ahf-fast':
+                        remaining = {ptype for ptype, cache in missing_pid_cache.items() if cache}
+                        if remaining:
+                            for _, hid, block in _stream_particle_blocks(host_only=False):
+                                if not remaining:
+                                    break
+                                if block.size == 0:
+                                    continue
+                                block = np.atleast_2d(block)
+                                part_ids = block[:, 0].astype(np.int64, copy=False)
+                                part_types = block[:, 1]
+                                for ptype in list(remaining):
+                                    cache = missing_pid_cache.get(ptype)
+                                    lookup = pid_to_index.get(ptype)
+                                    if not cache or lookup is None:
+                                        remaining.discard(ptype)
+                                        continue
+                                    code = ptype_ints.get(ptype)
+                                    if code is None:
+                                        remaining.discard(ptype)
+                                        continue
+                                    mask = part_types == code
+                                    if not np.any(mask):
+                                        continue
+                                    for pid_val in part_ids[mask]:
+                                        pid_int = int(pid_val)
+                                        if pid_int not in cache:
+                                            continue
+                                        idx = lookup.get(pid_int)
+                                        if idx is None:
+                                            continue
+                                        self.haloid[ptype][idx] = int(hid)
+                                        cache.discard(pid_int)
+                                        if not cache:
+                                            remaining.discard(ptype)
+                                            break
+                                # end for ptype
+                        self.obj.data_manager.haloid = combined
+                        memlog('Total halo particle IDs = %d'%(nhid))
+                        return
+                    else:
+                        self.obj.data_manager.haloid = combined
+                        memlog('Total halo particle IDs = %d'%(nhid))
+                        return
                 else: # use subhalo information as well, but very pain to remove these duplicated particles!!!!
                     if particles_file.endswith('.gz'):
                         import gzip
