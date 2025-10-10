@@ -76,7 +76,25 @@ def _populate_hydrogen_masses(sim, halos: Iterable) -> None:
             h2_mass = 0.0
         else:
             gas_sel = np.asarray(gl, dtype=np.int64)
+            valid = (gas_sel >= 0) & (gas_sel < gas_index.size)
+            gas_sel = gas_sel[valid]
+            if gas_sel.size == 0:
+                hi_mass = 0.0
+                h2_mass = 0.0
+                masses['HI'] = _compute_mass_quantity(sim, hi_mass)
+                masses['H2'] = _compute_mass_quantity(sim, h2_mass)
+                continue
+
             concat_idx = gas_index[gas_sel]
+            valid_concat = (concat_idx >= 0) & (concat_idx < mass_arr.size)
+            concat_idx = concat_idx[valid_concat]
+            if concat_idx.size == 0:
+                hi_mass = 0.0
+                h2_mass = 0.0
+                masses['HI'] = _compute_mass_quantity(sim, hi_mass)
+                masses['H2'] = _compute_mass_quantity(sim, h2_mass)
+                continue
+
             gas_mass = _values(mass_arr, concat_idx)
             hi_frac = _values(gfHI_arr, gas_sel)
             h2_frac = _values(gfH2_arr, gas_sel)
