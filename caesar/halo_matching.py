@@ -18,6 +18,74 @@ from yt.funcs import mylog
 
 from caesar.group import create_new_group
 
+
+def _compute_mass_quantity(sim, value: float):
+    yt_dataset = getattr(sim, 'yt_dataset', None)
+    units = getattr(sim, 'units', None)
+    if yt_dataset is not None and units is not None and isinstance(units, dict):
+        mass_unit = units.get('mass')
+        if mass_unit is not None:
+            try:
+                return yt_dataset.quan(value, mass_unit)
+            except Exception:
+                pass
+    return value
+
+
+def _populate_hydrogen_masses(sim, halos: Iterable) -> None:
+    dm = getattr(sim, 'data_manager', None)
+    if dm is None:
+        return
+
+    if 'gas' not in getattr(dm, 'ptypes', []):
+        return
+
+    gas_index = getattr(dm, 'glist', None)
+    mass_arr = getattr(dm, 'mass', None)
+    gfHI_arr = getattr(dm, 'gfHI', None)
+    gfH2_arr = getattr(dm, 'gfH2', None)
+
+    if (
+        gas_index is None
+        or mass_arr is None
+        or gfHI_arr is None
+        or gfH2_arr is None
+        or len(gas_index) == 0
+    ):
+        return
+
+    gas_index = np.asarray(gas_index, dtype=np.int64)
+    hydrogen_fraction = getattr(getattr(sim, 'simulation', None), 'XH', None)
+    if hydrogen_fraction is None:
+        hydrogen_fraction = 0.76
+
+    def _values(array, indices):
+        subset = array[indices]
+        if hasattr(subset, 'd'):
+            return np.asarray(subset.d, dtype=np.float64)
+        return np.asarray(subset, dtype=np.float64)
+
+    for halo in halos:
+        masses = getattr(halo, 'masses', None)
+        if not isinstance(masses, dict):
+            continue
+
+        gl = getattr(halo, 'glist', None)
+        if gl is None or len(gl) == 0:
+            hi_mass = 0.0
+            h2_mass = 0.0
+        else:
+            gas_sel = np.asarray(gl, dtype=np.int64)
+            concat_idx = gas_index[gas_sel]
+            gas_mass = _values(mass_arr, concat_idx)
+            hi_frac = _values(gfHI_arr, gas_sel)
+            h2_frac = _values(gfH2_arr, gas_sel)
+            hi_mass = float(np.sum(gas_mass * hi_frac) * hydrogen_fraction)
+            h2_mass = float(np.sum(gas_mass * h2_frac) * hydrogen_fraction)
+
+        masses['HI'] = _compute_mass_quantity(sim, hi_mass)
+        masses['H2'] = _compute_mass_quantity(sim, h2_mass)
+
 try:  # pragma: no cover - optional acceleration
     from numba import njit, prange, types, set_num_threads
     from numba.typed import List as NumbaList, Set as NumbaSet
@@ -154,19 +222,7 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
 
     get_group_properties(halos, sim.halo_list)
 
-    if hasattr(sim, 'yt_dataset') and hasattr(sim, 'units') and 'mass' in sim.units:
-        try:
-            zero_mass = sim.yt_dataset.quan(0.0, sim.units['mass'])
-        except Exception:
-            zero_mass = 0.0
-        for halo in sim.halo_list:
-            masses = getattr(halo, 'masses', None)
-            if not isinstance(masses, dict):
-                continue
-            if 'HI' not in masses:
-                masses['HI'] = zero_mass
-            if 'H2' not in masses:
-                masses['H2'] = zero_mass
+    _populate_hydrogen_masses(sim, sim.halo_list)
 
     _update_ahf_halo_maps(sim)
 
@@ -771,12 +827,6 @@ def _ensure_missing_ahf_halos(
         created[hid] = halo.GroupID
 
     if created:
-        zero_mass = 0.0
-        if hasattr(sim, 'yt_dataset') and hasattr(sim, 'units') and 'mass' in sim.units:
-            try:
-                zero_mass = sim.yt_dataset.quan(0.0, sim.units['mass'])
-            except Exception:
-                zero_mass = 0.0
         try:
             from types import SimpleNamespace
             from caesar.group import get_group_properties
@@ -815,12 +865,7 @@ def _ensure_missing_ahf_halos(
                 get_group_properties(context, valid_halos)
                 for halo in valid_halos:
                     halo.GroupID = original_ids.get(halo, halo.GroupID)
-                    masses = getattr(halo, 'masses', None)
-                    if isinstance(masses, dict):
-                        if 'HI' not in masses:
-                            masses['HI'] = zero_mass
-                        if 'H2' not in masses:
-                            masses['H2'] = zero_mass
+                _populate_hydrogen_masses(sim, valid_halos)
         except Exception as exc:  # pragma: no cover - defensive
             mylog.warning('Failed to recompute properties for synthesized AHF halos: %s', exc)
         sim.halos = sim.halo_list
