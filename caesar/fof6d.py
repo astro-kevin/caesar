@@ -267,7 +267,6 @@ class fof6d:
                             lines = f.readlines()
                     hpp = 1  # halo particle numbers and halo ID position
                     node_particles = {}
-                    all_memberships = []
                     total_blocks = int(lines[0])
                     for _ in range(total_blocks):
                         npt, hid = [int(x) for x in lines[hpp].split()]
@@ -279,16 +278,6 @@ class fof6d:
                         hpp += npt
                         arr = np.atleast_2d(block).astype(np.int64, copy=False)
                         node_particles[int(hid)] = arr
-                        if arr.size:
-                            tmp_all = np.empty((arr.shape[0], 3), dtype=np.int64)
-                            tmp_all[:, :2] = arr
-                            tmp_all[:, 2] = np.int64(hid)
-                            all_memberships.append(tmp_all)
-
-                    if all_memberships:
-                        full_membership = np.vstack(all_memberships)
-                    else:
-                        full_membership = np.empty((0, 3), dtype=np.int64)
 
                     parent_of = {int(row[0]): int(row[1]) for row in halo_info}
                     depth_cache = {}
@@ -376,29 +365,32 @@ class fof6d:
                         missing_pid_cache[p] = set()
                     self.haloid[p] = tmpp
 
-                if full_membership.size:
-                    code_to_ptype = {0: 'gas', 1: 'dm', 4: 'star', 5: 'bh'}
-                    remaining = {ptype for ptype, cache in missing_pid_cache.items() if cache}
-                    if remaining:
-                        for pid_val, code_val, hid_val in full_membership:
-                            ptype = code_to_ptype.get(int(code_val))
-                            if ptype not in remaining:
-                                continue
-                            cache = missing_pid_cache.get(ptype)
-                            if not cache:
-                                continue
+                remaining = {ptype for ptype, cache in missing_pid_cache.items() if cache}
+                if remaining and hid_info.size:
+                    code_map = {ptype: ptype_ints[ptype] for ptype in remaining if ptype in ptype_ints}
+                    for ptype, code in list(code_map.items()):
+                        cache = missing_pid_cache.get(ptype)
+                        pid_lookup = pid_to_index.get(ptype)
+                        if not cache or pid_lookup is None:
+                            remaining.discard(ptype)
+                            continue
+                        mask = hid_info[:, 1] == code
+                        if not np.any(mask):
+                            remaining.discard(ptype)
+                            continue
+                        entries = hid_info[mask]
+                        for pid_val, _, hid_val in entries:
                             pid_int = int(pid_val)
                             if pid_int not in cache:
                                 continue
-                            idx = pid_to_index[ptype].get(pid_int)
+                            idx = pid_lookup.get(pid_int)
                             if idx is None:
                                 continue
                             self.haloid[ptype][idx] = int(hid_val)
                             cache.discard(pid_int)
                             if not cache:
                                 remaining.discard(ptype)
-                                if not remaining:
-                                    break
+                                break
 
                 memlog('Total halo particle IDs = %d'%(nhid))
                 # self.haloid = np.asarray(self.haloid, dtype=object)         # all particles
