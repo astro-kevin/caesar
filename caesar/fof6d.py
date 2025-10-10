@@ -82,97 +82,97 @@ class fof6d:
 
                 total_halos = len(halo_info)
 
-                if 'AHF_use_subhalos' not in self.obj._kwargs:  #only use particles in distinct halo. this is default.
-                    host_mask = halo_info[:, 1] == 0
+                host_mask = halo_info[:, 1] == 0
+                mpi_warning_logged = False
 
-                    mpi_warning_logged = False
+                def _open_particles(path):
+                    if path.endswith('.gz'):
+                        import gzip
+                        return gzip.open(path, 'rt')
+                    return open(path, 'r')
 
-                    def _open_particles(path):
-                        if path.endswith('.gz'):
-                            import gzip
-                            return gzip.open(path, 'rt')
-                        return open(path, 'r')
+                def _stream_particle_blocks(host_only=True):
+                    fh = _open_particles(particles_file)
 
-                    def _stream_particle_blocks(host_only=True):
-                        fh = _open_particles(particles_file)
+                    def _read_nonempty_line():
+                        while True:
+                            raw = fh.readline()
+                            if not raw:
+                                return None
+                            stripped = raw.strip()
+                            if stripped:
+                                return stripped
 
-                        def _read_nonempty_line():
-                            while True:
-                                raw = fh.readline()
-                                if not raw:
-                                    return None
-                                stripped = raw.strip()
-                                if stripped:
-                                    return stripped
+                    def _skip_rows(count):
+                        for _ in range(count):
+                            fh.readline()
 
-                        def _skip_rows(count):
-                            for _ in range(count):
-                                fh.readline()
+                    def _read_block(count):
+                        if count <= 0:
+                            return np.empty((0, 2), dtype=np.int64)
+                        block = np.loadtxt(fh, max_rows=count, dtype=np.int64)
+                        if block.size == 0:
+                            return np.empty((0, 2), dtype=np.int64)
+                        block = np.atleast_2d(block)
+                        return block.reshape(-1, 2)
 
-                        def _read_block(count):
-                            if count <= 0:
-                                return np.empty((0, 2), dtype=np.int64)
-                            block = np.loadtxt(fh, max_rows=count, dtype=np.int64)
-                            if block.size == 0:
-                                return np.empty((0, 2), dtype=np.int64)
-                            block = np.atleast_2d(block)
-                            return block.reshape(-1, 2)
+                    first_line = _read_nonempty_line()
+                    if first_line is None:
+                        fh.close()
+                        return
+                    expected = int(first_line)
+                    mpi_mode = expected != total_halos
+                    if mpi_mode:
+                        nonlocal mpi_warning_logged
+                        if not mpi_warning_logged:
+                            memlog('!!Warning!! reading AHF halo IDs from merged files!!')
+                            mpi_warning_logged = True
 
-                        first_line = _read_nonempty_line()
-                        if first_line is None:
-                            fh.close()
-                            return
-                        expected = int(first_line)
-                        mpi_mode = expected != total_halos
-                        if mpi_mode:
-                            nonlocal mpi_warning_logged
-                            if not mpi_warning_logged:
-                                memlog('!!Warning!! reading AHF halo IDs from merged files!!')
-                                mpi_warning_logged = True
-
-                        try:
-                            if not mpi_mode:
-                                for idx in range(total_halos):
-                                    header = _read_nonempty_line()
-                                    if header is None:
+                    try:
+                        if not mpi_mode:
+                            for idx in range(total_halos):
+                                header = _read_nonempty_line()
+                                if header is None:
+                                    break
+                                parts = header.split()
+                                if len(parts) != 2:
+                                    continue
+                                npt = int(parts[0])
+                                hid = int(parts[1])
+                                if host_only and not host_mask[idx]:
+                                    _skip_rows(npt)
+                                    continue
+                                block = _read_block(npt)
+                                yield idx, hid, block
+                        else:
+                            remaining_in_block = expected
+                            idx = 0
+                            while idx < total_halos:
+                                if remaining_in_block == 0:
+                                    block_line = _read_nonempty_line()
+                                    if block_line is None:
                                         break
-                                    parts = header.split()
-                                    if len(parts) != 2:
-                                        continue
-                                    npt = int(parts[0])
-                                    hid = int(parts[1])
-                                    if host_only and not host_mask[idx]:
-                                        _skip_rows(npt)
-                                        continue
+                                    remaining_in_block = int(block_line)
+                                    continue
+                                header = _read_nonempty_line()
+                                if header is None:
+                                    break
+                                parts = header.split()
+                                if len(parts) != 2:
+                                    continue
+                                npt = int(parts[0])
+                                hid = int(parts[1])
+                                if host_only and not host_mask[idx]:
+                                    _skip_rows(npt)
+                                else:
                                     block = _read_block(npt)
                                     yield idx, hid, block
-                            else:
-                                remaining_in_block = expected
-                                idx = 0
-                                while idx < total_halos:
-                                    if remaining_in_block == 0:
-                                        block_line = _read_nonempty_line()
-                                        if block_line is None:
-                                            break
-                                        remaining_in_block = int(block_line)
-                                        continue
-                                    header = _read_nonempty_line()
-                                    if header is None:
-                                        break
-                                    parts = header.split()
-                                    if len(parts) != 2:
-                                        continue
-                                    npt = int(parts[0])
-                                    hid = int(parts[1])
-                                    if host_only and not host_mask[idx]:
-                                        _skip_rows(npt)
-                                    else:
-                                        block = _read_block(npt)
-                                        yield idx, hid, block
-                                    remaining_in_block -= 1
-                                    idx += 1
-                        finally:
-                            fh.close()
+                                remaining_in_block -= 1
+                                idx += 1
+                    finally:
+                        fh.close()
+
+                if 'AHF_use_subhalos' not in self.obj._kwargs:  #only use particles in distinct halo. this is default.
 
                     counts_by_code = {}
                     for p in self.obj.data_manager.ptypes:
