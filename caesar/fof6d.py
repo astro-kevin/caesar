@@ -51,6 +51,9 @@ class fof6d:
             sys.exit('Sorry, reading from rockstar files not implemented yet')
         elif 'haloid' in self.obj._kwargs and 'AHF' in self.obj._kwargs['haloid']:
             haloid_flag = str(self.obj._kwargs['haloid']).lower()
+            if haloid_flag == 'ahf-fast' and not self.obj._kwargs.get('AHF_use_subhalos', False):
+                mylog.info('AHF-FAST detected; enabling AHF_use_subhalos')
+                self.obj._kwargs['AHF_use_subhalos'] = True
             self.load_ahf_id()
         else:
             memlog('No Halo ID source specified -- running FOF.  This is the yt 3D FOF for halos and our homegrown 6D FOF for galaxies ...')
@@ -225,13 +228,10 @@ class fof6d:
 
                     pids = []
                     nhid = 0
-                    missing_pid_cache = {}
-                    pid_to_index = {}
                     memlog('Reading simulation data IDs and mapping halo particle to them')
                     for code, info in type_buffers.items():
                         pid_buffer = info['pid_buffer']
                         if pid_buffer.size == 0:
-                            missing_pid_cache[info['particle_type']] = set()
                             continue
                         hid_buffer = info['hid_buffer']
                         if info['offset'] != pid_buffer.size:
@@ -249,86 +249,19 @@ class fof6d:
                         nhid += len(com)
                         if tmpp.size:
                             pids.append(tmpp[tmpp >= 0])
-                        missing_mask = tmpp < 0
-                        if np.any(missing_mask):
-                            misses = data[missing_mask].astype(np.int64)
-                            missing_pid_cache[info['particle_type']] = set(misses.tolist())
-                            pid_to_index[info['particle_type']] = {int(pid): idx for idx, pid in enumerate(data)}
-                        else:
-                            missing_pid_cache[info['particle_type']] = set()
 
-                    combined = (
-                        np.concatenate(pids).astype(np.int64, copy=False)
-                        if pids else np.empty(0, dtype=np.int64)
-                    )
-
-                    if haloid_flag == 'ahf-fast':
-                        remaining = {ptype for ptype, cache in missing_pid_cache.items() if cache}
-                        if remaining:
-                            for _, hid, block in _stream_particle_blocks(host_only=False):
-                                if not remaining:
-                                    break
-                                if block.size == 0:
-                                    continue
-                                block = np.atleast_2d(block)
-                                part_ids = block[:, 0].astype(np.int64, copy=False)
-                                part_types = block[:, 1]
-                                for ptype in list(remaining):
-                                    cache = missing_pid_cache.get(ptype)
-                                    lookup = pid_to_index.get(ptype)
-                                    if not cache or lookup is None:
-                                        remaining.discard(ptype)
-                                        continue
-                                    code = ptype_ints.get(ptype)
-                                    if code is None:
-                                        remaining.discard(ptype)
-                                        continue
-                                    mask = part_types == code
-                                    if not np.any(mask):
-                                        continue
-                                    for pid_val in part_ids[mask]:
-                                        pid_int = int(pid_val)
-                                        if pid_int not in cache:
-                                            continue
-                                        idx = lookup.get(pid_int)
-                                        if idx is None:
-                                            continue
-                                        self.haloid[ptype][idx] = int(hid)
-                                        cache.discard(pid_int)
-                                        if not cache:
-                                            remaining.discard(ptype)
-                                            break
-                                # end for ptype
-                        self.obj.data_manager.haloid = combined
-                        memlog('Total halo particle IDs = %d'%(nhid))
-                        return
+                    if pids:
+                        self.obj.data_manager.haloid = np.concatenate(pids).astype(np.int64, copy=False)
                     else:
-                        self.obj.data_manager.haloid = combined
-                        memlog('Total halo particle IDs = %d'%(nhid))
-                        return
+                        self.obj.data_manager.haloid = np.empty(0, dtype=np.int64)
+                    memlog('Total halo particle IDs = %d'%(nhid))
+                    return
                 else: # use subhalo information as well, but very pain to remove these duplicated particles!!!!
-                    if particles_file.endswith('.gz'):
-                        import gzip
-                        with gzip.open(particles_file) as f:
-                            lines = f.readlines()
-                    else:
-                        with open(particles_file) as f:
-                            lines = f.readlines()
-                    hpp = 1  # halo particle numbers and halo ID position
-                    node_particles = {}
-                    total_blocks = int(lines[0])
-                    for _ in range(total_blocks):
-                        npt, hid = [int(x) for x in lines[hpp].split()]
-                        hpp += 1
-                        if npt == 0:
-                            node_particles[int(hid)] = np.empty((0, 2), dtype=np.int64)
-                            continue
-                        block = np.loadtxt(lines[hpp:hpp + npt], dtype=np.int64)
-                        hpp += npt
-                        arr = np.atleast_2d(block).astype(np.int64, copy=False)
-                        node_particles[int(hid)] = arr
-
                     parent_of = {int(row[0]): int(row[1]) for row in halo_info}
+                    children_of = {}
+                    for hid_val, host_val in parent_of.items():
+                        children_of.setdefault(int(host_val), []).append(int(hid_val))
+
                     depth_cache = {}
 
                     def _depth(h):
@@ -342,48 +275,96 @@ class fof6d:
                             depth_cache[h] = _depth(parent) + 1
                         return depth_cache[h]
 
-                    for hid in sorted(node_particles.keys(), key=_depth, reverse=True):
-                        parent = parent_of.get(hid, 0)
-                        if parent <= 0 or parent not in node_particles:
-                            continue
-                        child_arr = node_particles[hid]
-                        parent_arr = node_particles[parent]
-                        if child_arr.size == 0 or parent_arr.size == 0:
-                            continue
-                        child_arr = child_arr.reshape(-1, 2)
-                        parent_arr = parent_arr.reshape(-1, 2)
-                        child_bary = child_arr[child_arr[:, 1] != 1]
-                        if child_bary.size == 0:
-                            continue
-                        _, parent_idx, _ = np.intersect1d(parent_arr[:, 0], child_bary[:, 0], return_indices=True)
-                        if parent_idx.size == 0:
-                            continue
-                        parent_arr = np.delete(parent_arr, parent_idx, axis=0)
-                        if parent_arr.size == 0:
-                            parent_arr = np.empty((0, 2), dtype=np.int64)
-                        else:
-                            parent_arr = parent_arr.reshape(-1, 2)
-                        node_particles[parent] = parent_arr
+                    node_to_root = {}
+                    host_to_nodes = {}
 
-                    tmpp = []  # particle ID, particle type, halo_ID
-                    for hid_val, pdata in node_particles.items():
-                        pdata = np.asarray(pdata, dtype=np.int64)
-                        if pdata.size == 0:
-                            continue
-                        pdata = pdata.reshape(-1, 2)
-                        dm_count = np.sum(pdata[:, 1] == 1)
-                        star_count = np.sum(pdata[:, 1] == 4)
-                        if dm_count < MINIMUM_DM_PER_HALO and star_count < 1:
-                            has_children = any(parent_of.get(child) == hid_val for child in node_particles.keys() if child != hid_val)
-                            if not has_children:
+                    def _resolve_root(node):
+                        cur = int(node)
+                        path = []
+                        while True:
+                            parent = parent_of.get(cur, 0)
+                            if parent <= 0 or parent == cur:
+                                root = cur
+                                break
+                            path.append(cur)
+                            cur = int(parent)
+                        for item in path:
+                            node_to_root[item] = root
+                        node_to_root[int(node)] = root
+                        return root
+
+                    for hid_val in parent_of.keys():
+                        root = node_to_root.get(int(hid_val))
+                        if root is None:
+                            root = _resolve_root(hid_val)
+                        host_to_nodes.setdefault(root, set()).add(int(hid_val))
+
+                    nodes_remaining = {root: len(nodes) for root, nodes in host_to_nodes.items()}
+                    pending_members = {}
+                    records = []
+
+                    def _process_host(root_id, bucket):
+                        members = {}
+                        for hid_val, block in bucket.items():
+                            arr = np.asarray(block, dtype=np.int64)
+                            if arr.size == 0:
+                                arr = np.empty((0, 2), dtype=np.int64)
+                            else:
+                                arr = np.atleast_2d(arr).reshape(-1, 2)
+                            members[int(hid_val)] = arr
+
+                        for hid_val in sorted(members.keys(), key=lambda h: _depth(h), reverse=True):
+                            parent = parent_of.get(hid_val, 0)
+                            if parent <= 0 or parent not in members:
                                 continue
-                        tmppd = np.zeros((pdata.shape[0], 3), dtype=np.int64)
-                        tmppd[:, :2] = pdata
-                        tmppd[:, 2] = np.int64(hid_val)
-                        tmpp.append(tmppd)
+                            child_arr = members[hid_val]
+                            parent_arr = members[parent]
+                            if child_arr.size == 0 or parent_arr.size == 0:
+                                continue
+                            bary_mask = child_arr[:, 1] != 1
+                            if not np.any(bary_mask):
+                                continue
+                            baryons = child_arr[bary_mask]
+                            if baryons.size == 0:
+                                continue
+                            _, parent_idx, _ = np.intersect1d(parent_arr[:, 0], baryons[:, 0], return_indices=True)
+                            if parent_idx.size == 0:
+                                continue
+                            parent_arr = np.delete(parent_arr, parent_idx, axis=0)
+                            members[parent] = parent_arr
 
-                    if tmpp:
-                        hid_info = np.vstack(tmpp)
+                        for hid_val, pdata in members.items():
+                            if pdata.size == 0:
+                                continue
+                            dm_count = np.sum(pdata[:, 1] == 1)
+                            star_count = np.sum(pdata[:, 1] == 4)
+                            if dm_count < MINIMUM_DM_PER_HALO and star_count < MINIMUM_STARS_PER_GALAXY:
+                                local_children = [child for child in children_of.get(hid_val, []) if child in members]
+                                if not local_children:
+                                    continue
+                            tmppd = np.zeros((pdata.shape[0], 3), dtype=np.int64)
+                            tmppd[:, :2] = pdata
+                            tmppd[:, 2] = np.int64(hid_val)
+                            records.append(tmppd)
+
+                    for _, hid_val, block in _stream_particle_blocks(host_only=False):
+                        hid_int = int(hid_val)
+                        root = node_to_root.get(hid_int)
+                        if root is None:
+                            continue
+                        bucket = pending_members.setdefault(root, {})
+                        bucket[hid_int] = np.array(block, copy=False)
+                        nodes_remaining[root] -= 1
+                        if nodes_remaining[root] <= 0:
+                            _process_host(root, bucket)
+                            pending_members.pop(root, None)
+                            nodes_remaining.pop(root, None)
+
+                    for root, bucket in pending_members.items():
+                        _process_host(root, bucket)
+
+                    if records:
+                        hid_info = np.vstack(records)
                     else:
                         hid_info = np.empty((0, 3), dtype=np.int64)
 
@@ -392,8 +373,6 @@ class fof6d:
                 pids = []
                 nhid = 0
                 memlog('Reading simulation data IDs and mapping halo particle to them')
-                missing_pid_cache = {}
-                pid_to_index = {}
                 for p in self.obj.data_manager.ptypes:
                     if has_ptype(self.obj, p):
                         data = get_property(self.obj, 'pid', p).d.astype(np.int64)
@@ -403,43 +382,9 @@ class fof6d:
                         tmpp[x_ind] = tmppd[y_ind,2]
                         nhid += len(com)
                         pids.extend(tmpp[tmpp>=0])
-                        if full_membership.size and np.any(tmpp < 0):
-                            missing_mask = tmpp < 0
-                            missing_pid_cache[p] = set(data[missing_mask].astype(np.int64))
-                            pid_to_index[p] = {int(pid): idx for idx, pid in enumerate(data)}
-                        else:
-                            missing_pid_cache[p] = set()
                     else:
                         tmpp = np.empty(0,dtype=np.int64)
-                        missing_pid_cache[p] = set()
                     self.haloid[p] = tmpp
-
-                remaining = {ptype for ptype, cache in missing_pid_cache.items() if cache}
-                if remaining and hid_info.size:
-                    code_map = {ptype: ptype_ints[ptype] for ptype in remaining if ptype in ptype_ints}
-                    for ptype, code in list(code_map.items()):
-                        cache = missing_pid_cache.get(ptype)
-                        pid_lookup = pid_to_index.get(ptype)
-                        if not cache or pid_lookup is None:
-                            remaining.discard(ptype)
-                            continue
-                        mask = hid_info[:, 1] == code
-                        if not np.any(mask):
-                            remaining.discard(ptype)
-                            continue
-                        entries = hid_info[mask]
-                        for pid_val, _, hid_val in entries:
-                            pid_int = int(pid_val)
-                            if pid_int not in cache:
-                                continue
-                            idx = pid_lookup.get(pid_int)
-                            if idx is None:
-                                continue
-                            self.haloid[ptype][idx] = int(hid_val)
-                            cache.discard(pid_int)
-                            if not cache:
-                                remaining.discard(ptype)
-                                break
 
                 memlog('Total halo particle IDs = %d'%(nhid))
                 # self.haloid = np.asarray(self.haloid, dtype=object)         # all particles
