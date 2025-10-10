@@ -32,13 +32,13 @@ def _compute_mass_quantity(sim, value: float):
     return value
 
 
-def _populate_hydrogen_masses(sim, halos: Iterable) -> None:
+def _populate_hydrogen_masses(sim, halos: Iterable) -> bool:
     dm = getattr(sim, 'data_manager', None)
     if dm is None:
-        return
+        return False
 
     if 'gas' not in getattr(dm, 'ptypes', []):
-        return
+        return False
 
     gas_index = getattr(dm, 'glist', None)
     mass_arr = getattr(dm, 'mass', None)
@@ -52,7 +52,7 @@ def _populate_hydrogen_masses(sim, halos: Iterable) -> None:
         or gfH2_arr is None
         or len(gas_index) == 0
     ):
-        return
+        return False
 
     gas_index = np.asarray(gas_index, dtype=np.int64)
     hydrogen_fraction = getattr(getattr(sim, 'simulation', None), 'XH', None)
@@ -103,6 +103,8 @@ def _populate_hydrogen_masses(sim, halos: Iterable) -> None:
 
         masses['HI'] = _compute_mass_quantity(sim, hi_mass)
         masses['H2'] = _compute_mass_quantity(sim, h2_mass)
+
+    return True
 
 try:  # pragma: no cover - optional acceleration
     from numba import njit, prange, types, set_num_threads
@@ -240,7 +242,15 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
 
     get_group_properties(halos, sim.halo_list)
 
-    _populate_hydrogen_masses(sim, sim.halo_list)
+    computed_hydrogen = _populate_hydrogen_masses(sim, sim.halo_list)
+
+    if not computed_hydrogen:
+        try:
+            import caesar.hydrogen_mass_calc as hydrogen_mass_calc
+            mylog.info('HI/H2 fractions unavailable; running hydrogen_mass_calc() for halos')
+            hydrogen_mass_calc.hydrogen_mass_calc(sim)
+        except Exception as exc:  # pragma: no cover - defensive
+            mylog.warning('Failed to compute HI/H2 masses via hydrogen_mass_calc: %s', exc)
 
     _update_ahf_halo_maps(sim)
 
@@ -883,7 +893,14 @@ def _ensure_missing_ahf_halos(
                 get_group_properties(context, valid_halos)
                 for halo in valid_halos:
                     halo.GroupID = original_ids.get(halo, halo.GroupID)
-                _populate_hydrogen_masses(sim, valid_halos)
+                computed = _populate_hydrogen_masses(sim, valid_halos)
+                if not computed:
+                    try:
+                        import caesar.hydrogen_mass_calc as hydrogen_mass_calc
+                        mylog.info('Recomputing HI/H2 via hydrogen_mass_calc() for synthesized halos')
+                        hydrogen_mass_calc.hydrogen_mass_calc(sim)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        mylog.warning('Failed to compute HI/H2 masses for synthesized AHF halos: %s', exc)
         except Exception as exc:  # pragma: no cover - defensive
             mylog.warning('Failed to recompute properties for synthesized AHF halos: %s', exc)
         sim.halos = sim.halo_list
