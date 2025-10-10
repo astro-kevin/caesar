@@ -154,6 +154,20 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
 
     get_group_properties(halos, sim.halo_list)
 
+    if hasattr(sim, 'yt_dataset') and hasattr(sim, 'units') and 'mass' in sim.units:
+        try:
+            zero_mass = sim.yt_dataset.quan(0.0, sim.units['mass'])
+        except Exception:
+            zero_mass = 0.0
+        for halo in sim.halo_list:
+            masses = getattr(halo, 'masses', None)
+            if not isinstance(masses, dict):
+                continue
+            if 'HI' not in masses:
+                masses['HI'] = zero_mass
+            if 'H2' not in masses:
+                masses['H2'] = zero_mass
+
     _update_ahf_halo_maps(sim)
 
     if 'halo' not in sim.group_types:
@@ -757,6 +771,12 @@ def _ensure_missing_ahf_halos(
         created[hid] = halo.GroupID
 
     if created:
+        zero_mass = 0.0
+        if hasattr(sim, 'yt_dataset') and hasattr(sim, 'units') and 'mass' in sim.units:
+            try:
+                zero_mass = sim.yt_dataset.quan(0.0, sim.units['mass'])
+            except Exception:
+                zero_mass = 0.0
         try:
             from types import SimpleNamespace
             from caesar.group import get_group_properties
@@ -795,6 +815,12 @@ def _ensure_missing_ahf_halos(
                 get_group_properties(context, valid_halos)
                 for halo in valid_halos:
                     halo.GroupID = original_ids.get(halo, halo.GroupID)
+                    masses = getattr(halo, 'masses', None)
+                    if isinstance(masses, dict):
+                        if 'HI' not in masses:
+                            masses['HI'] = zero_mass
+                        if 'H2' not in masses:
+                            masses['H2'] = zero_mass
         except Exception as exc:  # pragma: no cover - defensive
             mylog.warning('Failed to recompute properties for synthesized AHF halos: %s', exc)
         sim.halos = sim.halo_list
