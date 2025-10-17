@@ -895,6 +895,8 @@ def _ensure_missing_ahf_halos(
                     nproc=int(getattr(sim, 'nproc', 1)),
                     nparttot=max(int(nparttot), 0),
                     nparttype=mapping,
+                    counts={'halo': len(valid_halos)},
+                    load_pot=getattr(sim, 'load_pot', True),
                 )
                 original_ids = {halo: halo.GroupID for halo in valid_halos}
                 get_group_properties(context, valid_halos)
@@ -2015,16 +2017,23 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
         except Exception:
             pass
 
-    final_ok, final_map = _populate_hydrogen_masses(sim, sim.halo_list)
-    if not final_ok:
-        mylog.info('Final halo pass missing HI/H2; invoking hydrogen_mass_calc()')
-        import caesar.hydrogen_mass_calc as hydrogen_mass_calc
-        hydrogen_mass_calc.hydrogen_mass_calc(sim)
-        final_ok, final_map = _populate_hydrogen_masses(sim, sim.halo_list)
+    missing_halo_masses = [
+        halo for halo in sim.halo_list
+        if not isinstance(getattr(halo, 'masses', None), dict)
+        or 'H2' not in halo.masses
+    ]
+
+    if missing_halo_masses:
+        final_ok, final_map = _populate_hydrogen_masses(sim, missing_halo_masses)
         if not final_ok:
-            mylog.warning('Unable to populate HI/H2 masses after hydrogen_mass_calc(); halos may lack gas data')
-            final_map = {}
-    if final_map:
-        existing = getattr(sim, '_ahf_halo_hydrogen_masses', {})
-        existing.update(final_map)
-        setattr(sim, '_ahf_halo_hydrogen_masses', existing)
+            mylog.info('Final halo pass missing HI/H2; invoking hydrogen_mass_calc()')
+            import caesar.hydrogen_mass_calc as hydrogen_mass_calc
+            hydrogen_mass_calc.hydrogen_mass_calc(sim)
+            final_ok, final_map = _populate_hydrogen_masses(sim, missing_halo_masses)
+            if not final_ok:
+                mylog.warning('Unable to populate HI/H2 masses after hydrogen_mass_calc(); affected halos may lack gas data')
+                final_map = {}
+        if final_map:
+            existing = getattr(sim, '_ahf_halo_hydrogen_masses', {})
+            existing.update(final_map)
+            setattr(sim, '_ahf_halo_hydrogen_masses', existing)
