@@ -822,6 +822,12 @@ def _ensure_missing_ahf_halos(
         halo.ndm = dm_sel.size
         halo.dlist = np.empty(0, dtype=np.int64)
         halo.ndust = 0
+        if 'dm2' in sim.data_manager.ptypes:
+            halo.dm2list = np.empty(0, dtype=np.int64)
+            halo.ndm2 = 0
+        if 'dm3' in sim.data_manager.ptypes:
+            halo.dm3list = np.empty(0, dtype=np.int64)
+            halo.ndm3 = 0
 
         concat_parts = []
         gas_concat = _concat_indices('gas', gas_sel)
@@ -856,6 +862,10 @@ def _ensure_missing_ahf_halos(
         halo.masses['stellar'] = _to_quan(mass_star)
         halo.masses['bh'] = _to_quan(mass_bh)
         halo.masses['dm'] = _to_quan(mass_dm)
+        if 'dm2' in sim.data_manager.ptypes:
+            halo.masses.setdefault('dm2', _to_quan(0.0))
+        if 'dm3' in sim.data_manager.ptypes:
+            halo.masses.setdefault('dm3', _to_quan(0.0))
         halo.masses['baryon'] = _to_quan(mass_gas + mass_star + mass_bh)
         halo.masses['total'] = _to_quan(total_mass)
         halo.masses.setdefault('dust', _to_quan(0.0))
