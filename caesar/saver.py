@@ -98,10 +98,6 @@ def serialize_attributes(obj_list, hd, hd_dicts):
             _write_attrib(obj_list, k, v, hd)
 
 def _write_attrib(obj_list, k, v, hd):
-    #print('obj_list: ',dir(obj_list))
-    #print('k: ',k)
-    #print('v: ', v)
-    
     unit = False
     if isinstance(v, YTQuantity):
         data = [getattr(i,k).d for i in obj_list]
@@ -115,7 +111,7 @@ def _write_attrib(obj_list, k, v, hd):
     elif isinstance(v, np.ndarray) and np.shape(v)[0] == 3 and 'list' not in k:
         try:
             data = np.vstack([getattr(i,k) for i in obj_list])
-        except:
+        except Exception:
             mylog.warning('Saver unable to stack: %s %s %s',k,v,np.shape(v))
             return
     elif isinstance(v, (int, float, bool, np.number)):
@@ -139,6 +135,52 @@ def _write_dict(obj_list, k, v, hd):
         _write_dataset('%s.%s' % (k,kk), data, hd)
         if unit:
             hd['%s.%s' % (k,kk)].attrs.create('unit', str(vv.units).encode('utf8'))        
+
+######################################################################
+
+def _ensure_dm_bookkeeping(obj):
+    """Guarantee halo DM bookkeeping exists when low-resolution species are enabled."""
+    dm_ptypes = getattr(getattr(obj, 'data_manager', None), 'ptypes', [])
+    if not dm_ptypes:
+        return
+
+    dataset = getattr(obj, 'yt_dataset', None)
+    units = getattr(obj, 'units', {}) or {}
+    mass_unit = units.get('mass', 'Msun')
+
+    def _zero_mass():
+        if dataset is not None:
+            try:
+                return dataset.quan(0.0, mass_unit)
+            except Exception:
+                pass
+        return 0.0
+
+    halos = getattr(obj, 'halos', [])
+    if not halos:
+        return
+
+    for halo in halos:
+        if 'dm2' in dm_ptypes:
+            dm2list = getattr(halo, 'dm2list', None)
+            if dm2list is None:
+                dm2list = np.empty(0, dtype=np.int64)
+            else:
+                dm2list = np.asarray(dm2list, dtype=np.int64)
+            halo.dm2list = dm2list
+            halo.ndm2 = int(dm2list.size)
+            if isinstance(getattr(halo, 'masses', None), dict):
+                halo.masses.setdefault('dm2', _zero_mass())
+        if 'dm3' in dm_ptypes:
+            dm3list = getattr(halo, 'dm3list', None)
+            if dm3list is None:
+                dm3list = np.empty(0, dtype=np.int64)
+            else:
+                dm3list = np.asarray(dm3list, dtype=np.int64)
+            halo.dm3list = dm3list
+            halo.ndm3 = int(dm3list.size)
+            if isinstance(getattr(halo, 'masses', None), dict):
+                halo.masses.setdefault('dm3', _zero_mass())
 
 ######################################################################
 
@@ -206,6 +248,7 @@ def save(obj, filename='test.hdf5'):
 
     serialize_global_attribs(obj, outfile)
     obj.simulation._serialize(obj, outfile)
+    _ensure_dm_bookkeeping(obj)
 
     if hasattr(obj, 'halos') and obj.nhalos > 0:
         hd   = outfile.create_group('halo_data')
