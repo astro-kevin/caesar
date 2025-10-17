@@ -314,6 +314,8 @@ class ParticleMembership:
     id: int
     parttype0: Set[int] = field(default_factory=set)
     parttype1: Set[int] = field(default_factory=set)
+    parttype2: Set[int] = field(default_factory=set)
+    parttype3: Set[int] = field(default_factory=set)
     parttype4: Set[int] = field(default_factory=set)
     parttype5: Set[int] = field(default_factory=set)
 
@@ -435,6 +437,10 @@ def read_file_to_structure(
                 membership.parttype0.add(pid)
             elif ptype == 1:
                 membership.parttype1.add(pid)
+            elif ptype == 2:
+                membership.parttype2.add(pid)
+            elif ptype == 3:
+                membership.parttype3.add(pid)
             elif ptype == 4:
                 membership.parttype4.add(pid)
             elif ptype == 5:
@@ -566,6 +572,8 @@ def _build_selected_pid_maps(sim) -> Dict[str, Dict[int, int]]:
     add_map('gas', 'glist')
     add_map('bh', 'bhlist')
     add_map('dm', 'dmlist')
+    add_map('dm2', 'dm2list')
+    add_map('dm3', 'dm3list')
     return maps
 
 
@@ -663,8 +671,12 @@ def _iter_memberships_stream(
                     cur_pm.parttype4.add(pid)
                 elif ptype == 5:
                     cur_pm.parttype5.add(pid)
-                elif load_dm and ptype == 1:
+                elif ptype == 1 and load_dm:
                     cur_pm.parttype1.add(pid)
+                elif ptype == 2 and load_dm:
+                    cur_pm.parttype2.add(pid)
+                elif ptype == 3 and load_dm:
+                    cur_pm.parttype3.add(pid)
 
         if cur_pm is not None and cur_pm.id in needed:
             yield cur_pm
@@ -722,6 +734,10 @@ def _read_memberships_for_ids(
                     cur_pm.parttype0.add(pid)
                 elif ptype == 1 and load_dm:
                     cur_pm.parttype1.add(pid)
+                elif ptype == 2 and load_dm:
+                    cur_pm.parttype2.add(pid)
+                elif ptype == 3 and load_dm:
+                    cur_pm.parttype3.add(pid)
                 elif ptype == 4:
                     cur_pm.parttype4.add(pid)
                 elif ptype == 5:
@@ -811,6 +827,8 @@ def _ensure_missing_ahf_halos(
         star_sel = _map_pidset(pm.parttype4, 'star')
         bh_sel = _map_pidset(pm.parttype5, 'bh')
         dm_sel = _map_pidset(pm.parttype1, 'dm')
+        dm2_sel = _map_pidset(pm.parttype2, 'dm2') if 'dm2' in pid_maps_sel else np.empty(0, dtype=np.int64)
+        dm3_sel = _map_pidset(pm.parttype3, 'dm3') if 'dm3' in pid_maps_sel else np.empty(0, dtype=np.int64)
 
         halo.glist = gas_sel
         halo.ngas = gas_sel.size
@@ -823,11 +841,11 @@ def _ensure_missing_ahf_halos(
         halo.dlist = np.empty(0, dtype=np.int64)
         halo.ndust = 0
         if 'dm2' in sim.data_manager.ptypes:
-            halo.dm2list = np.empty(0, dtype=np.int64)
-            halo.ndm2 = 0
+            halo.dm2list = dm2_sel
+            halo.ndm2 = dm2_sel.size
         if 'dm3' in sim.data_manager.ptypes:
-            halo.dm3list = np.empty(0, dtype=np.int64)
-            halo.ndm3 = 0
+            halo.dm3list = dm3_sel
+            halo.ndm3 = dm3_sel.size
 
         concat_parts = []
         gas_concat = _concat_indices('gas', gas_sel)
@@ -842,6 +860,18 @@ def _ensure_missing_ahf_halos(
         dm_concat = _concat_indices('dm', dm_sel)
         if dm_concat.size:
             concat_parts.append(dm_concat)
+        if 'dm2' in sim.data_manager.ptypes:
+            dm2_concat = _concat_indices('dm2', dm2_sel)
+            if dm2_concat.size:
+                concat_parts.append(dm2_concat)
+        else:
+            dm2_concat = np.empty(0, dtype=np.int64)
+        if 'dm3' in sim.data_manager.ptypes:
+            dm3_concat = _concat_indices('dm3', dm3_sel)
+            if dm3_concat.size:
+                concat_parts.append(dm3_concat)
+        else:
+            dm3_concat = np.empty(0, dtype=np.int64)
 
         halo.global_indexes = (
             np.sort(np.concatenate(concat_parts)).astype(np.int64)
@@ -856,12 +886,18 @@ def _ensure_missing_ahf_halos(
         mass_star = _mass_from_concat(star_concat)
         mass_bh = _mass_from_concat(bh_concat)
         mass_dm = _mass_from_concat(dm_concat)
-        total_mass = mass_gas + mass_star + mass_bh + mass_dm
+        mass_dm2 = _mass_from_concat(dm2_concat) if dm2_concat.size else 0.0
+        mass_dm3 = _mass_from_concat(dm3_concat) if dm3_concat.size else 0.0
+        total_mass = mass_gas + mass_star + mass_bh + mass_dm + mass_dm2 + mass_dm3
 
         halo.masses['gas'] = _to_quan(mass_gas)
         halo.masses['stellar'] = _to_quan(mass_star)
         halo.masses['bh'] = _to_quan(mass_bh)
         halo.masses['dm'] = _to_quan(mass_dm)
+        if 'dm2' in sim.data_manager.ptypes:
+            halo.masses['dm2'] = _to_quan(mass_dm2)
+        if 'dm3' in sim.data_manager.ptypes:
+            halo.masses['dm3'] = _to_quan(mass_dm3)
         if 'dm2' in sim.data_manager.ptypes:
             halo.masses.setdefault('dm2', _to_quan(0.0))
         if 'dm3' in sim.data_manager.ptypes:
