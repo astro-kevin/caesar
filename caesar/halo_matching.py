@@ -2014,3 +2014,17 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
             get_group_properties(sim, sim.galaxy_list)
         except Exception:
             pass
+
+    final_ok, final_map = _populate_hydrogen_masses(sim, sim.halo_list)
+    if not final_ok:
+        mylog.info('Final halo pass missing HI/H2; invoking hydrogen_mass_calc()')
+        import caesar.hydrogen_mass_calc as hydrogen_mass_calc
+        hydrogen_mass_calc.hydrogen_mass_calc(sim)
+        final_ok, final_map = _populate_hydrogen_masses(sim, sim.halo_list)
+        if not final_ok:
+            mylog.warning('Unable to populate HI/H2 masses after hydrogen_mass_calc(); halos may lack gas data')
+            final_map = {}
+    if final_map:
+        existing = getattr(sim, '_ahf_halo_hydrogen_masses', {})
+        existing.update(final_map)
+        setattr(sim, '_ahf_halo_hydrogen_masses', existing)
