@@ -2082,7 +2082,25 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
             if not final_ok:
                 mylog.warning('Unable to populate HI/H2 masses after hydrogen_mass_calc(); affected halos may lack gas data')
                 final_map = {}
-        if final_map:
-            existing = getattr(sim, '_ahf_halo_hydrogen_masses', {})
-            existing.update(final_map)
-            setattr(sim, '_ahf_halo_hydrogen_masses', existing)
+    if final_map:
+        existing = getattr(sim, '_ahf_halo_hydrogen_masses', {})
+        existing.update(final_map)
+        setattr(sim, '_ahf_halo_hydrogen_masses', existing)
+
+    # Ensure synthesized halos expose mandatory DM bookkeeping
+    def _ensure_dm_attributes(halo):
+        if 'dm2' in getattr(sim.data_manager, 'ptypes', []):
+            if not hasattr(halo, 'dm2list'):
+                halo.dm2list = np.empty(0, dtype=np.int64)
+            if not hasattr(halo, 'ndm2'):
+                halo.ndm2 = len(halo.dm2list)
+            halo.masses.setdefault('dm2', _compute_mass_quantity(sim, 0.0))
+        if 'dm3' in getattr(sim.data_manager, 'ptypes', []):
+            if not hasattr(halo, 'dm3list'):
+                halo.dm3list = np.empty(0, dtype=np.int64)
+            if not hasattr(halo, 'ndm3'):
+                halo.ndm3 = len(halo.dm3list)
+            halo.masses.setdefault('dm3', _compute_mass_quantity(sim, 0.0))
+
+    for halo in sim.halo_list:
+        _ensure_dm_attributes(halo)
