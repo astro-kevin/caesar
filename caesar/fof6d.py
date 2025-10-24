@@ -203,7 +203,9 @@ class fof6d:
                     finally:
                         fh.close()
 
-                if 'AHF_use_subhalos' not in self.obj._kwargs:  # only use particles in distinct halos. this is default.
+                use_subhalos = self.obj._kwargs.get('AHF_use_subhalos', False)
+
+                if not use_subhalos:  # only use particles in distinct halos. this is default.
 
                     self.haloid = {}
 
