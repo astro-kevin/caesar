@@ -205,6 +205,8 @@ class fof6d:
 
                 if 'AHF_use_subhalos' not in self.obj._kwargs:  # only use particles in distinct halos. this is default.
 
+                    self.haloid = {}
+
                     lookup_map = {}
                     tmpp_by_ptype = {}
                     for p in self.obj.data_manager.ptypes:
