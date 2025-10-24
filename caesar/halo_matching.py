@@ -538,17 +538,54 @@ def find_best_matches(
         results.append((int(list1_ids[i]), hid))
     return results
 
-def _build_selected_pid_maps(sim) -> Dict[str, Dict[int, int]]:
+
+class _PidLookup:
+    """Memory-efficient PID -> index mapper backed by sorted NumPy arrays."""
+
+    __slots__ = ('sorted_pids', 'index_order')
+
+    def __init__(self, values: np.ndarray):
+        arr = np.asarray(values, dtype=np.int64)
+        if arr.ndim != 1:
+            arr = arr.reshape(-1)
+        if arr.size == 0:
+            self.sorted_pids = arr
+            self.index_order = np.empty(0, dtype=np.int32)
+            return
+        order = np.argsort(arr, kind='mergesort')
+        self.sorted_pids = arr[order]
+        self.index_order = order.astype(np.int32, copy=False)
+
+    @property
+    def size(self) -> int:
+        return int(self.sorted_pids.size)
+
+    def map(self, pidset: Iterable[int]) -> np.ndarray:
+        if isinstance(pidset, np.ndarray):
+            arr = np.asarray(pidset, dtype=np.int64)
+        else:
+            length = len(pidset) if hasattr(pidset, '__len__') else -1
+            if length == 0:
+                return np.empty(0, dtype=np.int32)
+            arr = np.fromiter((int(pid) for pid in pidset), dtype=np.int64, count=length)
+        if arr.size == 0:
+            return np.empty(0, dtype=np.int32)
+        idx = np.searchsorted(self.sorted_pids, arr)
+        mask = (idx < self.sorted_pids.size) & (self.sorted_pids[idx] == arr)
+        if not mask.any():
+            return np.empty(0, dtype=np.int32)
+        return self.index_order[idx[mask]]
+
+
+def _build_selected_pid_maps(sim) -> Dict[str, _PidLookup]:
     """Build PID -> selected-index maps for each ptype present in the CAESAR-selected subset.
 
     The selected index is the index within the CAESAR DataManager per-type lists
     (e.g., ``data_manager.slist``, ``glist``, etc.), not the full-snapshot index.
-
-    Returns a dict like { 'star': {pid: sel_idx}, ... } for the ptypes available.
     """
     from caesar.property_manager import get_property, has_ptype
 
-    maps: Dict[str, Dict[int, int]] = {}
+    maps: Dict[str, _PidLookup] = {}
 
     def add_map(ptype: str, list_name: str) -> None:
         if not has_ptype(sim, ptype):
@@ -556,15 +593,25 @@ def _build_selected_pid_maps(sim) -> Dict[str, Dict[int, int]]:
         sel = getattr(sim.data_manager, list_name, None)
         if sel is None or len(sel) == 0:
             return
-        # Map CAESAR-selected per-type indices back to full-snapshot per-type indices
-        # via DataManager.indexes, then obtain PIDs and build pid->selected-index map.
         try:
-            full_indices = sim.data_manager.indexes[sel]
-            full_pids = get_property(sim, 'pid', ptype).d.astype(np.int64)
-            sel_pids = full_pids[full_indices]
-            maps[ptype] = {int(pid): int(i) for i, pid in enumerate(sel_pids.tolist())}
+            sel_arr = np.asarray(sel, dtype=np.intp)
+            full_indices = np.asarray(sim.data_manager.indexes[sel_arr], dtype=np.int64)
+            full_pids = get_property(sim, 'pid', ptype).d
+            pid_array = np.asarray(full_pids, dtype=np.int64)
+            selected = pid_array[full_indices]
+            lookup = _PidLookup(selected)
+            if lookup.size > 0:
+                maps[ptype] = lookup
+            del selected
+            del pid_array
+            del full_indices
         except Exception:
             return
+        finally:
+            try:
+                del full_pids
+            except NameError:
+                pass
 
     add_map('star', 'slist')
     add_map('gas', 'glist')
@@ -750,7 +797,7 @@ def _ensure_missing_ahf_halos(
     sim,
     missing_ids: Set[int],
     ahf_particles_file: str,
-    pid_maps_sel: Dict[str, Dict[int, int]],
+    pid_maps_sel: Dict[str, _PidLookup],
 ) -> Dict[int, int]:
     """Guarantee that each requested AHF halo ID has a CAESAR halo entry.
 
@@ -778,13 +825,13 @@ def _ensure_missing_ahf_halos(
     created: Dict[int, int] = {}
 
     def _map_pidset(pidset: Iterable[int], key: str) -> np.ndarray:
-        mapping = pid_maps_sel.get(key, {})
-        if not mapping or not pidset:
+        lookup = pid_maps_sel.get(key)
+        if lookup is None or pidset is None:
             return np.empty(0, dtype=np.int64)
-        idx = [mapping.get(int(pid)) for pid in pidset if int(pid) in mapping]
-        if not idx:
+        mapped = lookup.map(pidset)
+        if mapped.size == 0:
             return np.empty(0, dtype=np.int64)
-        return np.unique(np.array(idx, dtype=np.int64))
+        return np.unique(mapped.astype(np.int64, copy=False))
 
     def _concat_indices(ptype: str, sel_idx: np.ndarray) -> np.ndarray:
         if sel_idx.size == 0:
@@ -1000,14 +1047,16 @@ def build_galaxies_from_ahf_fast(
     from caesar.property_manager import get_property, has_ptype
 
     pid_maps_sel = _build_selected_pid_maps(sim)
-    dm_pid_map: Dict[int, int] = pid_maps_sel.get('dm', {})
-    pid_to_dm_fullidx: Dict[int, int] = {}
+    dm_pid_lookup = pid_maps_sel.get('dm')
+    dm_full_lookup: Optional[_PidLookup] = None
     ndm_full = 0
-    if dm_pid_map and has_ptype(sim, 'dm'):
-        dm_pids_full = get_property(sim, 'pid', 'dm').d.astype(np.int64)
-        ndm_full = len(dm_pids_full)
+    if dm_pid_lookup is not None and has_ptype(sim, 'dm'):
+        dm_pids_full = get_property(sim, 'pid', 'dm').d
+        dm_pids_full = np.asarray(dm_pids_full, dtype=np.int64)
+        ndm_full = dm_pids_full.size
         if ndm_full > 0:
-            pid_to_dm_fullidx = {int(pid): int(i) for i, pid in enumerate(dm_pids_full.tolist())}
+            dm_full_lookup = _PidLookup(dm_pids_full)
+        del dm_pids_full
 
     parent_of, children_of = _read_ahf_hierarchy(ahf_particles_file)
     if not parent_of:
@@ -1048,13 +1097,13 @@ def build_galaxies_from_ahf_fast(
     )
 
     def map_sel(pidset: Set[int], key: str) -> np.ndarray:
-        mp = pid_maps_sel.get(key, {})
-        if not mp or not pidset:
-            return np.array([], dtype=np.int32)
-        arr = np.array([mp[pid] for pid in pidset if pid in mp], dtype=np.int32)
-        if arr.size == 0:
-            return arr
-        return np.unique(arr)
+        lookup = pid_maps_sel.get(key)
+        if lookup is None or not pidset:
+            return np.empty(0, dtype=np.int32)
+        mapped = lookup.map(pidset)
+        if mapped.size == 0:
+            return mapped
+        return np.unique(mapped)
 
     from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, ALL_COMPLETED
 
@@ -1191,7 +1240,7 @@ def build_galaxies_from_ahf_fast(
                 host_progress.update(1)
             next_to_emit += 1
 
-    load_dm = bool(dm_pid_map)
+    load_dm = dm_pid_lookup is not None
 
     with ThreadPoolExecutor(max_workers=jobs) as executor:
         pending_futures: Dict = {}
@@ -1386,16 +1435,20 @@ def build_galaxies_from_ahf_fast(
     except Exception:
         pass
 
-    if ndm_full > 0 and dm_pid_map:
+    if ndm_full > 0 and dm_full_lookup is not None:
         exclusive_gal_dm = np.full(ndm_full, -1, dtype=np.int32)
         for gal in sim.galaxy_list:
             dm_exc = getattr(gal, '_dm_exclusive_pids', None)
             if not dm_exc:
                 continue
-            for pid in dm_exc:
-                mapped = pid_to_dm_fullidx.get(int(pid))
-                if mapped is not None:
-                    exclusive_gal_dm[mapped] = int(getattr(gal, 'GroupID', -1))
+            mapped = dm_full_lookup.map(dm_exc)
+            if mapped.size == 0:
+                try:
+                    del gal.__dict__['_dm_exclusive_pids']
+                except KeyError:
+                    pass
+                continue
+            exclusive_gal_dm[mapped] = int(getattr(gal, 'GroupID', -1))
             # drop the cached set to free memory
             try:
                 del gal.__dict__['_dm_exclusive_pids']
@@ -1951,16 +2004,16 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     if not matched_ids:
         return
 
-    pid_maps_sel: Dict[str, Dict[int, int]] = _build_selected_pid_maps(sim)
+    pid_maps_sel: Dict[str, _PidLookup] = _build_selected_pid_maps(sim)
 
     def map_set(pidset: Set[int], key: str) -> np.ndarray:
-        mp = pid_maps_sel.get(key, {})
-        if not mp or not pidset:
-            return np.array([], dtype=np.int32)
-        arr = np.fromiter((mp[pid] for pid in pidset if pid in mp), dtype=np.int32)
-        if arr.size == 0:
-            return arr
-        return np.unique(arr)
+        lookup = pid_maps_sel.get(key)
+        if lookup is None or not pidset:
+            return np.empty(0, dtype=np.int32)
+        mapped = lookup.map(pidset)
+        if mapped.size == 0:
+            return mapped
+        return np.unique(mapped)
 
     exclusive_gal_dm = None
 
