@@ -112,7 +112,15 @@ def _populate_hydrogen_masses(sim, halos: Iterable) -> Tuple[bool, Dict[int, Tup
 
 try:
     from numba import njit, prange, types, set_num_threads
-    from numba.typed import List as NumbaList, Set as NumbaSet
+    from numba.typed import List as NumbaList
+    try:
+        from numba.typed import Set as NumbaSet
+        _HAS_NUMBA_TYPED_SET = True
+        NumbaDict = None
+    except (ImportError, AttributeError):  # older numba lacks typed.Set
+        from numba.typed import Dict as NumbaDict
+        _HAS_NUMBA_TYPED_SET = False
+        NumbaSet = None
 except ImportError as exc:  # pragma: no cover - explicit dependency
     raise ImportError(
         "CAESAR AHF matching requires the 'numba' package. Install numba before running "
@@ -326,9 +334,14 @@ def _build_numba_star_sets(memberships: List["ParticleMembership"]):
     sizes = np.empty(len(memberships), dtype=np.int64)
     key_type = types.int64
     for idx, pm in enumerate(memberships):
-        nb_set = NumbaSet.empty(key_type)
-        for pid in pm.parttype4:
-            nb_set.add(int(pid))
+        if _HAS_NUMBA_TYPED_SET:
+            nb_set = NumbaSet.empty(key_type)
+            for pid in pm.parttype4:
+                nb_set.add(int(pid))
+        else:
+            nb_set = NumbaDict.empty(key_type, types.boolean)
+            for pid in pm.parttype4:
+                nb_set[int(pid)] = True
         nb_list.append(nb_set)
         sizes[idx] = len(pm.parttype4)
     return nb_list, sizes
