@@ -110,18 +110,16 @@ def _populate_hydrogen_masses(sim, halos: Iterable) -> Tuple[bool, Dict[int, Tup
 
     return True, per_halo
 
-try:  # pragma: no cover - optional acceleration
+try:
     from numba import njit, prange, types, set_num_threads
     from numba.typed import List as NumbaList, Set as NumbaSet
+except ImportError as exc:  # pragma: no cover - explicit dependency
+    raise ImportError(
+        "CAESAR AHF matching requires the 'numba' package. Install numba before running "
+        "AHF-integrated member_search()."
+    ) from exc
+else:
     _NUMBA_AVAILABLE = True
-except Exception:  # pragma: no cover
-    _NUMBA_AVAILABLE = False
-    njit = None
-    prange = range
-    types = None
-    set_num_threads = None
-    NumbaList = None
-    NumbaSet = None
 
 try:  # optional progress bar for numba kernels
     from numba_progress import ProgressBar
