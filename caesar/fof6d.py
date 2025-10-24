@@ -19,6 +19,37 @@ from caesar.utils import memlog
 from caesar.property_manager import MY_DTYPE, get_property,has_ptype,ptype_ints
 from caesar.group import MINIMUM_STARS_PER_GALAXY, MINIMUM_DM_PER_HALO
 
+
+class _PidLookup(object):
+    """Compact PID -> index mapper backed by sorted numpy arrays."""
+
+    __slots__ = ('sorted_pids', 'indices')
+
+    def __init__(self, values: np.ndarray):
+        arr = np.asarray(values, dtype=np.int64)
+        if arr.ndim != 1:
+            arr = arr.reshape(-1)
+        if arr.size == 0:
+            self.sorted_pids = arr
+            self.indices = np.empty(0, dtype=np.int64)
+            return
+        order = np.argsort(arr, kind='mergesort')
+        self.sorted_pids = arr[order]
+        self.indices = order.astype(np.int64, copy=False)
+
+    def search(self, values: np.ndarray):
+        """Return (indices, match_mask) for the supplied PID array."""
+        arr = np.asarray(values, dtype=np.int64)
+        if arr.ndim != 1:
+            arr = arr.reshape(-1)
+        if arr.size == 0 or self.sorted_pids.size == 0:
+            empty = np.empty(0, dtype=np.int64)
+            mask = np.empty(0, dtype=bool)
+            return empty, mask
+        idx = np.searchsorted(self.sorted_pids, arr, side='left')
+        mask = (idx < self.sorted_pids.size) & (self.sorted_pids[idx] == arr)
+        return self.indices[idx[mask]], mask
+
 class fof6d:
 
     def __init__(self, obj, group_type):
@@ -172,89 +203,55 @@ class fof6d:
                     finally:
                         fh.close()
 
-                if 'AHF_use_subhalos' not in self.obj._kwargs:  #only use particles in distinct halo. this is default.
+                if 'AHF_use_subhalos' not in self.obj._kwargs:  # only use particles in distinct halos. this is default.
 
-                    counts_by_code = {}
+                    lookup_map = {}
+                    tmpp_by_ptype = {}
                     for p in self.obj.data_manager.ptypes:
                         if has_ptype(self.obj, p):
-                            code = ptype_ints[p]
-                            counts_by_code[code] = 0
-
-                    for _, _, block in _stream_particle_blocks(host_only=True):
-                        if block.size == 0:
-                            continue
-                        part_types = block[:, 1]
-                        for code in counts_by_code:
-                            counts_by_code[code] += int(np.count_nonzero(part_types == code))
-
-                    self.haloid = {}
-                    type_buffers = {}
-                    for p in self.obj.data_manager.ptypes:
-                        if has_ptype(self.obj, p):
-                            code = ptype_ints[p]
                             data = get_property(self.obj, 'pid', p).d.astype(np.int64)
                             tmpp = np.full(len(data), -1, dtype=np.int64)
                             self.haloid[p] = tmpp
-                            size = counts_by_code.get(code, 0)
-                            pid_buffer = np.empty(size, dtype=np.int64)
-                            hid_buffer = np.empty(size, dtype=np.int64)
-                            type_buffers[code] = {
-                                'particle_type': p,
-                                'data': data,
-                                'tmpp': tmpp,
-                                'pid_buffer': pid_buffer,
-                                'hid_buffer': hid_buffer,
-                                'offset': 0,
-                            }
+                            lookup_map[ptype_ints[p]] = (_PidLookup(data), tmpp)
+                            tmpp_by_ptype[p] = tmpp
                         else:
-                            self.haloid[p] = np.empty(0, dtype=np.int64)
+                            tmpp = np.empty(0, dtype=np.int64)
+                            self.haloid[p] = tmpp
+                            tmpp_by_ptype[p] = tmpp
 
+                    nhid = 0
+                    memlog('Reading simulation data IDs and mapping halo particle to them')
                     for _, hid, block in _stream_particle_blocks(host_only=True):
                         if block.size == 0:
                             continue
-                        for code, info in type_buffers.items():
-                            pid_buffer = info['pid_buffer']
-                            if pid_buffer.size == 0:
-                                continue
-                            mask = block[:, 1] == code
+                        block = np.asarray(block, dtype=np.int64)
+                        pid_vals = block[:, 0]
+                        type_vals = block[:, 1]
+                        hid_val = int(hid)
+                        for code, (lookup, tmpp) in lookup_map.items():
+                            mask = type_vals == code
                             if not np.any(mask):
                                 continue
-                            chunk = block[mask, 0].astype(np.int64, copy=False)
-                            n = chunk.size
-                            start = info['offset']
-                            info['pid_buffer'][start:start + n] = chunk
-                            info['hid_buffer'][start:start + n] = hid
-                            info['offset'] += n
+                            indices, matched_mask = lookup.search(pid_vals[mask])
+                            if indices.size == 0:
+                                continue
+                            tmpp[indices] = hid_val
+                            nhid += indices.size
 
-                    pids = []
-                    nhid = 0
-                    memlog('Reading simulation data IDs and mapping halo particle to them')
-                    for code, info in type_buffers.items():
-                        pid_buffer = info['pid_buffer']
-                        if pid_buffer.size == 0:
-                            continue
-                        hid_buffer = info['hid_buffer']
-                        if info['offset'] != pid_buffer.size:
-                            pid_buffer = pid_buffer[:info['offset']]
-                            hid_buffer = hid_buffer[:info['offset']]
-                        uniq_pid, first_indices = np.unique(pid_buffer, return_index=True)
-                        if uniq_pid.size != pid_buffer.size:
-                            memlog('!!Warning!! duplicated particle IDs in different halos!! removing them %d, %d' % (uniq_pid.size , pid_buffer.size))
-                            pid_buffer = uniq_pid
-                            hid_buffer = hid_buffer[first_indices]
-                        data = info['data']
-                        tmpp = info['tmpp']
-                        com, x_ind, y_ind = np.intersect1d(data, pid_buffer, return_indices=True)
-                        tmpp[x_ind] = hid_buffer[y_ind]
-                        nhid += len(com)
-                        if tmpp.size:
-                            pids.append(tmpp[tmpp >= 0])
-
-                    if pids:
-                        self.obj.data_manager.haloid = np.concatenate(pids).astype(np.int64, copy=False)
-                    else:
-                        self.obj.data_manager.haloid = np.empty(0, dtype=np.int64)
-                    memlog('Total halo particle IDs = %d'%(nhid))
+                    if haloid_flag != 'ahf-fast':
+                        assigned = []
+                        for tmpp in tmpp_by_ptype.values():
+                            if tmpp.size:
+                                mapped = tmpp[tmpp >= 0]
+                                if mapped.size:
+                                    assigned.append(mapped)
+                        all_halo_ids = (
+                            np.concatenate(assigned).astype(np.int64, copy=False)
+                            if assigned
+                            else np.empty(0, dtype=np.int64)
+                        )
+                        self.obj.data_manager.haloid = all_halo_ids
+                    memlog('Total halo particle IDs = %d' % (nhid))
                     return
                 else: # use subhalo information as well, but very pain to remove these duplicated particles!!!!
                     parent_of = {int(row[0]): int(row[1]) for row in halo_info}
@@ -370,26 +367,51 @@ class fof6d:
 
                 # Now load the simulation particle IDs # map back to the position
                 self.haloid = {}
-                pids = []
-                nhid = 0
-                memlog('Reading simulation data IDs and mapping halo particle to them')
+                lookup_map = {}
+                tmpp_by_ptype = {}
                 for p in self.obj.data_manager.ptypes:
                     if has_ptype(self.obj, p):
                         data = get_property(self.obj, 'pid', p).d.astype(np.int64)
-                        tmpp = np.zeros(len(data),dtype=np.int64)-1
-                        tmppd=hid_info[hid_info[:,1]==ptype_ints[p]]
-                        com, x_ind, y_ind = np.intersect1d(data,tmppd[:,0],return_indices=True)
-                        tmpp[x_ind] = tmppd[y_ind,2]
-                        nhid += len(com)
-                        pids.extend(tmpp[tmpp>=0])
+                        tmpp = np.full(len(data), -1, dtype=np.int64)
+                        self.haloid[p] = tmpp
+                        lookup_map[ptype_ints[p]] = (_PidLookup(data), tmpp)
+                        tmpp_by_ptype[p] = tmpp
                     else:
-                        tmpp = np.empty(0,dtype=np.int64)
-                    self.haloid[p] = tmpp
+                        tmpp = np.empty(0, dtype=np.int64)
+                        self.haloid[p] = tmpp
+                        tmpp_by_ptype[p] = tmpp
 
-                memlog('Total halo particle IDs = %d'%(nhid))
-                # self.haloid = np.asarray(self.haloid, dtype=object)         # all particles
+                nhid = 0
+                memlog('Reading simulation data IDs and mapping halo particle to them')
+                if hid_info.size:
+                    pid_vals = hid_info[:, 0]
+                    type_vals = hid_info[:, 1]
+                    halo_vals = hid_info[:, 2]
+                    for code, (lookup, tmpp) in lookup_map.items():
+                        mask = type_vals == code
+                        if not np.any(mask):
+                            continue
+                        subset_pids = pid_vals[mask]
+                        indices, matched_mask = lookup.search(subset_pids)
+                        if indices.size == 0:
+                            continue
+                        tmpp[indices] = halo_vals[mask][matched_mask]
+                        nhid += indices.size
+
+                memlog('Total halo particle IDs = %d' % (nhid))
                 if haloid_flag != 'ahf-fast':
-                    self.obj.data_manager.haloid = np.asarray(pids) # only halo particles
+                    assigned = []
+                    for tmpp in tmpp_by_ptype.values():
+                        if tmpp.size:
+                            mapped = tmpp[tmpp >= 0]
+                            if mapped.size:
+                                assigned.append(mapped)
+                    all_halo_ids = (
+                        np.concatenate(assigned).astype(np.int64, copy=False)
+                        if assigned
+                        else np.empty(0, dtype=np.int64)
+                    )
+                    self.obj.data_manager.haloid = all_halo_ids
             else:
                 sys.exit('No ID data file is found in %s' % haloid_file)   
         else:

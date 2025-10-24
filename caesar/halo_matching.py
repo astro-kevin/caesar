@@ -1370,19 +1370,45 @@ def build_galaxies_from_ahf_fast(
             return -1
 
         missing_hosts: Set[int] = set()
+        preliminary_indices: List[int] = []
         for node_id in galaxy_node_ids:
             if node_id is None or node_id == -1:
-                host_indices.append(-1)
+                preliminary_indices.append(-1)
                 continue
             resolved = _resolve_halo_index(int(node_id))
             if resolved < 0:
                 missing_hosts.add(int(node_id))
-            host_indices.append(resolved)
+            preliminary_indices.append(resolved)
         if missing_hosts:
+            sample = list(sorted(missing_hosts))[:5]
             mylog.warning(
-                'AHF: %d host halo(s) referenced by galaxies were not loaded; keeping parent index = -1',
+                'AHF-FAST: %d galaxy host halo(s) were not resolved; example IDs %s',
                 len(missing_hosts),
+                sample,
             )
+            created_map = _ensure_missing_ahf_halos(sim, missing_hosts, ahf_particles_file, pid_maps_sel)
+            if created_map:
+                ahf_to_halo_index = _build_ahf_index_map()
+                missing_hosts = set()
+                preliminary_indices = []
+                for node_id in galaxy_node_ids:
+                    if node_id is None or node_id == -1:
+                        preliminary_indices.append(-1)
+                        continue
+                    resolved = _resolve_halo_index(int(node_id))
+                    if resolved < 0:
+                        missing_hosts.add(int(node_id))
+                    preliminary_indices.append(resolved)
+                if missing_hosts:
+                    sample = list(sorted(missing_hosts))[:5]
+                    mylog.warning(
+                        'AHF-FAST: %d galaxy host halo(s) still unresolved after synthesis; example IDs %s (parent index set = -1)',
+                        len(missing_hosts),
+                        sample,
+                    )
+            host_indices = preliminary_indices
+        else:
+            host_indices = preliminary_indices
     else:
         sim._ahf_galaxy_ahf_ids = []
         _update_ahf_galaxy_maps(sim, [])
