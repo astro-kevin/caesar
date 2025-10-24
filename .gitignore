@@ -100,9 +100,7 @@ dmypy.json
 cython_debug/
 group_func.c
 # Ignore Cython-generated C files (rebuilt during install)
-caesar/group_funcs/group_funcs.c
-caesar/hydrogen_mass_calc/hydrogen_mass_calc.c
-caesar/pyloser/cyloser.c
+*.c
 
 # VS Code
 .vscode/
