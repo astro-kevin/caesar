@@ -2072,6 +2072,7 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
         or 'H2' not in halo.masses
     ]
 
+    final_map: Dict[int, Tuple[float, float]] = {}
     if missing_halo_masses:
         final_ok, final_map = _populate_hydrogen_masses(sim, missing_halo_masses)
         if not final_ok:
