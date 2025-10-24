@@ -98,6 +98,16 @@ def serialize_attributes(obj_list, hd, hd_dicts):
             _write_attrib(obj_list, k, v, hd)
 
 def _write_attrib(obj_list, k, v, hd):
+    # Skip optional particle-type fields when the simulation did not load that species.
+    owner = obj_list[0] if obj_list else None
+    sim = getattr(owner, 'obj', None)
+    dmgr = getattr(sim, 'data_manager', None) if sim is not None else None
+    ptypes = getattr(dmgr, 'ptypes', []) if dmgr is not None else []
+    if (k in ('dm2list', 'ndm2') and 'dm2' not in ptypes) or (
+        k in ('dm3list', 'ndm3') and 'dm3' not in ptypes
+    ):
+        return
+
     unit = False
     if isinstance(v, YTQuantity):
         data = [getattr(i,k).d for i in obj_list]
