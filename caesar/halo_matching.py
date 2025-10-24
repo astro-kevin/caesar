@@ -216,8 +216,9 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
     if full_particle_load:
         halos.keep_all_groups = True
     haloid_mode = str(sim._kwargs.get('haloid', '')).upper() if hasattr(sim, '_kwargs') else ''
-    if haloid_mode == 'AHF-FAST':
-        select_arg = halos.haloid
+
+    if haloid_mode in ('AHF', 'AHF-FAST'):
+        select_arg = getattr(halos, 'haloid', 'all')
     else:
         select_arg = halos.haloid
 
