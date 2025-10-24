@@ -1395,7 +1395,7 @@ def build_galaxies_from_ahf_fast(
                     if node_id is None or node_id == -1:
                         preliminary_indices.append(-1)
                         continue
-                    resolved = _resolve_halo_index(int(node_id))
+                    resolved = _resolve_halo_index(int(node_id), ahf_to_halo_index)
                     if resolved < 0:
                         missing_hosts.add(int(node_id))
                     preliminary_indices.append(resolved)

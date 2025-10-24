@@ -507,10 +507,14 @@ class fof6d:
         self.sfflag = sfflag  # if True, always include particles with nonzero SF regardless of other crit
         self.minstars = minstars
         # set eligible galaxy gas: nH>nHlim, with T<Tlim OR star-forming
-        if self.sfflag:
-            self.dense_crit = lambda gnh, gtemp, gsfr: (gnh>self.nHlim)&((gtemp<self.Tlim)|(gsfr>0))
+        haloid_mode = str(self.obj._kwargs.get('haloid', '')).upper() if hasattr(self.obj, '_kwargs') else ''
+        if haloid_mode in ('AHF', 'AHF-FAST'):
+            self.dense_crit = lambda gnh, gtemp, gsfr: np.ones_like(gnh, dtype=np.bool_)
         else:
-            self.dense_crit = lambda gnh, gtemp, gsfr: (gnh>self.nHlim)&(gtemp<self.Tlim)
+            if self.sfflag:
+                self.dense_crit = lambda gnh, gtemp, gsfr: (gnh > self.nHlim) & ((gtemp < self.Tlim) | (gsfr > 0))
+            else:
+                self.dense_crit = lambda gnh, gtemp, gsfr: (gnh > self.nHlim) & (gtemp < self.Tlim)
 
         # collect indices for eligible particles
         memlog('Running fof6d on %d halos w/%d proc(s), LL=%g'%(len(self.obj.halo_list),self.nproc,self.fof_LL))
