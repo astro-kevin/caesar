@@ -2016,40 +2016,6 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
 
     galaxy_to_ahf_nodes = [int(h) if h is not None else -1 for h in selected]
 
-    # Build mapping from selected AHF ID -> list of galaxy indices
-    from collections import defaultdict as _dd
-    mapping: Dict[int, List[int]] = _dd(list)
-    for gi, hid in enumerate(selected):
-        if hid is not None and int(hid) != -1:
-            mapping[int(hid)].append(gi)
-
-    if not mapping:
-        sim._ahf_galaxy_hosts = [-1] * len(sim.galaxy_list)
-        sim._ahf_galaxy_ahf_ids = galaxy_to_ahf_nodes
-        for gi, node_id in enumerate(galaxy_to_ahf_nodes):
-            ahf_val = int(node_id) if node_id is not None and node_id >= 0 else -1
-            if gi < len(sim.galaxy_list):
-                setattr(sim.galaxy_list[gi], 'AHF_haloID', ahf_val)
-        _update_ahf_galaxy_maps(sim, galaxy_to_ahf_nodes)
-        return
-
-    matched_ids = set(mapping.keys())
-    if not matched_ids:
-        return
-
-    pid_maps_sel: Dict[str, _PidLookup] = _build_selected_pid_maps(sim)
-
-    def map_set(pidset: Set[int], key: str) -> np.ndarray:
-        lookup = pid_maps_sel.get(key)
-        if lookup is None or not pidset:
-            return np.empty(0, dtype=np.int32)
-        mapped = lookup.map(pidset)
-        if mapped.size == 0:
-            return mapped
-        return np.unique(mapped)
-
-    exclusive_gal_dm = None
-
     final_galaxy_ahf_ids = list(galaxy_to_ahf_nodes)
 
     # Determine halo ownership using the AHF hierarchy
@@ -2096,6 +2062,40 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
             host_list.append(int(host_idx) if host_idx is not None else -1)
         orphan_indices = {i for i, host_idx in enumerate(host_list) if host_idx is None or int(host_idx) < 0}
         return host_list, normalized_ids, orphan_indices
+
+    # Build mapping from selected AHF ID -> list of galaxy indices
+    from collections import defaultdict as _dd
+    mapping: Dict[int, List[int]] = _dd(list)
+    for gi, hid in enumerate(selected):
+        if hid is not None and int(hid) != -1:
+            mapping[int(hid)].append(gi)
+
+    if not mapping:
+        sim._ahf_galaxy_hosts = [-1] * len(sim.galaxy_list)
+        sim._ahf_galaxy_ahf_ids = galaxy_to_ahf_nodes
+        for gi, node_id in enumerate(galaxy_to_ahf_nodes):
+            ahf_val = int(node_id) if node_id is not None and node_id >= 0 else -1
+            if gi < len(sim.galaxy_list):
+                setattr(sim.galaxy_list[gi], 'AHF_haloID', ahf_val)
+        _update_ahf_galaxy_maps(sim, galaxy_to_ahf_nodes)
+        return
+
+    matched_ids = set(mapping.keys())
+    if not matched_ids:
+        return
+
+    pid_maps_sel: Dict[str, _PidLookup] = _build_selected_pid_maps(sim)
+
+    def map_set(pidset: Set[int], key: str) -> np.ndarray:
+        lookup = pid_maps_sel.get(key)
+        if lookup is None or not pidset:
+            return np.empty(0, dtype=np.int32)
+        mapped = lookup.map(pidset)
+        if mapped.size == 0:
+            return mapped
+        return np.unique(mapped)
+
+    exclusive_gal_dm = None
 
     ahf_to_halo_index = _build_ahf_index_map()
     host_indices, normalized_ahf_ids, orphan_set = _assign_host_indices(ahf_to_halo_index)
