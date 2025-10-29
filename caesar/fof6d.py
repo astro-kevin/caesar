@@ -590,6 +590,7 @@ class fof6d:
         # create valid caesar groups, populate index lists
         from caesar.group import create_new_group, group_types
         from caesar.property_manager import ptype_ints, has_ptype
+        import os as _os
         grp_list = []
         if parent is not None:
             for ihalo in range(len(parent.obj.halo_list)):
@@ -597,6 +598,12 @@ class fof6d:
         ngrp = 0
         zero_marker = 0
         keep_all = bool(getattr(self, 'keep_all_groups', False)) and self.obj_type == 'halo'
+        _check = _os.environ.get('CAESAR_FOF6D_CHECK', '0') == '1'
+        try:
+            _check_n = int(_os.environ.get('CAESAR_FOF6D_CHECK_N', '50'))
+        except Exception:
+            _check_n = 50
+        _checked = 0
 
         for igrp in range(len(self.grouplist)):
             if self.grouplist[igrp] < 0:
@@ -634,6 +641,25 @@ class fof6d:
                     mygrp.dm3list = my_indexes[my_ptype==ptype_ints[p]]-offset
                     mygrp.ndm3 = len(mygrp.dm3list)
                 offset += self.nparttype[p]
+
+            # Optional lightweight correctness checks for mapping (first N groups only)
+            if _check and _checked < _check_n and self.obj_type == 'galaxy':
+                try:
+                    gas_concat = my_indexes[my_ptype==ptype_ints['gas']]
+                    exp_gas = int(gas_concat.size)
+                except Exception:
+                    exp_gas = 0
+                got_gas = int(getattr(mygrp, 'ngas', 0))
+                if exp_gas != got_gas:
+                    from yt.funcs import mylog
+                    # Validate a small sample via concat_to_selected to avoid memory blowup
+                    sample = gas_concat[:min(8, gas_concat.size)] if exp_gas>0 else gas_concat
+                    try:
+                        sel_map = self.obj.data_manager.concat_to_selected('gas', sample)
+                        mylog.warning('fof6d load_lists gas mismatch: group=%d exp=%d got=%d sample_sel=%s', igrp, exp_gas, got_gas, sel_map)
+                    except Exception as _e:
+                        mylog.warning('fof6d load_lists gas mismatch: group=%d exp=%d got=%d (map err: %s)', igrp, exp_gas, got_gas, _e)
+                _checked += 1
             include_group = mygrp._valid or keep_all
             if include_group:
                 if keep_all and not mygrp._valid:
