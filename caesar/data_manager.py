@@ -32,6 +32,14 @@ class DataManager(object):
         self.load_particle_data(select=select)
         memlog(f'Loaded particle data for mode={mode}')
         self._assign_particle_counts()
+        memlog(
+            f'Particle counts after selection: '
+            f'ngas={self.obj.simulation.ngas}, '
+            f'nstar={self.obj.simulation.nstar}, '
+            f'ndm={self.obj.simulation.ndm}, '
+            f'nbh={self.obj.simulation.nbh}, '
+            f'ndust={self.obj.simulation.ndust}'
+        )
         if ('Gas' in self.obj._ds_type.ds.particle_fields_by_type) or ('PartType0' in self.obj._ds_type.ds.particle_fields_by_type):
             if isinstance(select,str) and select == 'all': self._load_gas_data()
             else: self._load_gas_data(select=select['gas'])

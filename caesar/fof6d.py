@@ -519,15 +519,38 @@ class fof6d:
                 self.dense_crit = lambda gnh, gtemp, gsfr: (gnh > self.nHlim) & ((gtemp < self.Tlim) | (gsfr > 0))
             else:
                 self.dense_crit = lambda gnh, gtemp, gsfr: (gnh > self.nHlim) & (gtemp < self.Tlim)
+        memlog(f'fof6d run for target={target_type}, mode={haloid_mode}, nHlim={self.nHlim}, Tlim={self.Tlim}, sfflag={self.sfflag}')
 
         # collect indices for eligible particles
         memlog('Running fof6d on %d halos w/%d proc(s), LL=%g'%(len(self.obj.halo_list),self.nproc,self.fof_LL))
         g_inds = []  # indexes of (gas star BH dust) particle eligible for being in a group
+        halos_with_any_gas = 0
+        halos_with_no_gas = 0
+        total_gas_candidates = 0
+        total_star_candidates = 0
         len_hi = len_gi = 0
         for ih in range(len(self.obj.halo_list)):
-            g_inds.append(setup_indexes(self,self.obj.halo_list[ih].global_indexes))
+            eligible = setup_indexes(self,self.obj.halo_list[ih].global_indexes)
+            g_inds.append(eligible)
+            # diagnostics: count components
+            if eligible.size > 0:
+                ptypes_e = self.obj.data_manager.ptype[eligible]
+                gas_c = int(np.sum(ptypes_e == ptype_ints['gas']))
+                star_c = int(np.sum(ptypes_e == ptype_ints['star']))
+                total_gas_candidates += gas_c
+                total_star_candidates += star_c
+                if gas_c > 0:
+                    halos_with_any_gas += 1
+                else:
+                    halos_with_no_gas += 1
             len_hi += len(self.obj.halo_list[ih].global_indexes)
-            len_gi += len(g_inds[ih])
+            len_gi += len(eligible)
+        if len(self.obj.halo_list) > 0:
+            memlog(
+                f'fof6d eligibility: halos={len(self.obj.halo_list)}, '
+                f'with_gas={halos_with_any_gas}, no_gas={halos_with_no_gas}, '
+                f'gas_candidates={total_gas_candidates}, star_candidates={total_star_candidates}'
+            )
         memlog('%d halo particles, %g%% eligible for galaxies'%(len_hi, np.round(100*len_gi/len_hi,2)))
 
         # get tags using fof6d
