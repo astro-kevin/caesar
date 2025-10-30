@@ -577,7 +577,7 @@ class Group(object):
 
     def _calculate_radial_quantities(self):
         """ Calculate various component radii and half radii """
-        from caesar.group_funcs import get_half_mass_radius, get_full_mass_radius
+        from caesar.group_funcs.group_funcs import get_half_mass_radius, get_full_mass_radius
 
         r = np.empty(len(self.global_indexes), dtype=np.float64)
         get_periodic_r(self.obj.simulation.boxsize.d, self.pos.d, self.obj.data_manager.pos[self.global_indexes], r)
