@@ -600,6 +600,29 @@ class fof6d:
 
         memlog('Done fof6d, found %d %s'%(ngrp,group_types[target_type]))
 
+        # Optional per-halo tag report for first N halos: how many gas/stars eligible vs tagged
+        do_tag_report = _os.environ.get('CAESAR_FOF6D_GAS_REPORT', '0') == '1'
+        try:
+            report_n = int(_os.environ.get('CAESAR_FOF6D_CHECK_N', '50'))
+        except Exception:
+            report_n = 50
+        if do_tag_report:
+            from yt.funcs import mylog
+            for ih in range(min(len(self.obj.halo_list), report_n)):
+                elig = g_inds[ih]
+                if elig.size == 0:
+                    mylog.info('fof6d tag report: halo=%d elig_total=0', ih)
+                    continue
+                ptypes_e = self.obj.data_manager.ptype[elig]
+                gas_mask = (ptypes_e == ptype_ints['gas'])
+                star_mask = (ptypes_e == ptype_ints['star'])
+                tags = grp_tags[ih]
+                gas_elig = int(gas_mask.sum())
+                star_elig = int(star_mask.sum())
+                gas_tag = int(np.sum(tags[gas_mask] >= 0)) if gas_elig>0 else 0
+                star_tag = int(np.sum(tags[star_mask] >= 0)) if star_elig>0 else 0
+                mylog.info('fof6d tag report: halo=%d gas_elig=%d gas_tagged=%d star_elig=%d star_tagged=%d', ih, gas_elig, gas_tag, star_elig, star_tag)
+
         # Post-tag assert: if there was eligible gas in the sample halos but none got tagged
         if do_tag_assert and pre_tag_gas is not None:
             tagged_any = False
