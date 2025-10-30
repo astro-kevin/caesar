@@ -510,15 +510,13 @@ class fof6d:
         self.Tlim = Tlim  # only include gas below this temperature
         self.sfflag = sfflag  # if True, always include particles with nonzero SF regardless of other crit
         self.minstars = minstars
-        # set eligible galaxy gas: nH>nHlim, with T<Tlim OR star-forming
-        haloid_mode = str(self.obj._kwargs.get('haloid', '')).upper() if hasattr(self.obj, '_kwargs') else ''
-        if haloid_mode in ('AHF', 'AHF-FAST'):
-            self.dense_crit = lambda gnh, gtemp, gsfr: np.ones_like(gnh, dtype=np.bool_)
+        # set eligible galaxy gas (restore ISM gate for AHF as in upstream):
+        # nH > nHlim and (T < Tlim or SFR > 0) when sfflag is True; otherwise nH > nHlim and T < Tlim
+        # This applies to both standard and AHF modes for galaxy FOF.
+        if self.sfflag:
+            self.dense_crit = lambda gnh, gtemp, gsfr: (gnh > self.nHlim) & ((gtemp < self.Tlim) | (gsfr > 0))
         else:
-            if self.sfflag:
-                self.dense_crit = lambda gnh, gtemp, gsfr: (gnh > self.nHlim) & ((gtemp < self.Tlim) | (gsfr > 0))
-            else:
-                self.dense_crit = lambda gnh, gtemp, gsfr: (gnh > self.nHlim) & (gtemp < self.Tlim)
+            self.dense_crit = lambda gnh, gtemp, gsfr: (gnh > self.nHlim) & (gtemp < self.Tlim)
         memlog(f'fof6d run for target={target_type}, mode={haloid_mode}, nHlim={self.nHlim}, Tlim={self.Tlim}, sfflag={self.sfflag}')
 
         # collect indices for eligible particles
