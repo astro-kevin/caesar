@@ -1854,6 +1854,7 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     import os as _os
     from yt.funcs import mylog
     do_ahf_check = _os.environ.get('CAESAR_AHF_CHECK', '0') == '1'
+    do_ahf_assert = _os.environ.get('CAESAR_ASSERT_AHF', '0') == '1'
     pre_ngas = None
     if do_ahf_check:
         try:
@@ -2149,10 +2150,15 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
 
     _prune_halos_after_galaxies(sim)
 
-    if do_ahf_check:
+    if do_ahf_check or do_ahf_assert:
         try:
             post_ngas = [len(getattr(g, 'glist', [])) if getattr(g, 'glist', None) is not None else 0 for g in getattr(sim, 'galaxy_list', [])]
             mylog.info('AHF match: post-collapse galaxies with gas=%d (total=%d)', sum(1 for v in post_ngas if v>0), len(post_ngas))
+            if do_ahf_assert and pre_ngas is not None:
+                pre_with = sum(1 for v in pre_ngas if v>0)
+                post_with = sum(1 for v in post_ngas if v>0)
+                if pre_with > 0 and post_with == 0:
+                    raise AssertionError('Gas lost after AHF collapse: nonzero pre-collapse gas count dropped to zero')
         except Exception:
             pass
 

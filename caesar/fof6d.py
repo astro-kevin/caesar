@@ -599,6 +599,7 @@ class fof6d:
         zero_marker = 0
         keep_all = bool(getattr(self, 'keep_all_groups', False)) and self.obj_type == 'halo'
         _check = _os.environ.get('CAESAR_FOF6D_CHECK', '0') == '1'
+        _assert_map = _os.environ.get('CAESAR_ASSERT_FOF6D', '0') == '1'
         try:
             _check_n = int(_os.environ.get('CAESAR_FOF6D_CHECK_N', '50'))
         except Exception:
@@ -643,7 +644,7 @@ class fof6d:
                 offset += self.nparttype[p]
 
             # Optional lightweight correctness checks for mapping (first N groups only)
-            if _check and _checked < _check_n and self.obj_type == 'galaxy':
+            if ( _check or _assert_map ) and _checked < _check_n and self.obj_type == 'galaxy':
                 try:
                     gas_concat = my_indexes[my_ptype==ptype_ints['gas']]
                     exp_gas = int(gas_concat.size)
@@ -659,6 +660,8 @@ class fof6d:
                         mylog.warning('fof6d load_lists gas mismatch: group=%d exp=%d got=%d sample_sel=%s', igrp, exp_gas, got_gas, sel_map)
                     except Exception as _e:
                         mylog.warning('fof6d load_lists gas mismatch: group=%d exp=%d got=%d (map err: %s)', igrp, exp_gas, got_gas, _e)
+                    if _assert_map:
+                        raise AssertionError(f'FOF6D mapping mismatch: group={igrp} exp_gas={exp_gas} got_gas={got_gas}')
                 _checked += 1
             include_group = mygrp._valid or keep_all
             if include_group:
@@ -687,12 +690,14 @@ class fof6d:
             self.counts[self.obj_type] = len(self.obj.galaxy_list)
             self.obj.group_types.append(self.obj_type)
             # Summary diagnostics: how many galaxies have gas immediately after 6D-FOF list build?
-            if _os.environ.get('CAESAR_FOF6D_SUMMARY', '0') == '1':
+            if _os.environ.get('CAESAR_FOF6D_SUMMARY', '0') == '1' or _assert_map:
                 try:
                     ngals = len(self.obj.galaxy_list)
                     with_gas = sum(1 for g in self.obj.galaxy_list if getattr(g, 'glist', []) is not None and len(g.glist) > 0)
                     from yt.funcs import mylog
                     mylog.info('fof6d load_lists summary: galaxies=%d with_gas=%d without_gas=%d', ngals, with_gas, ngals - with_gas)
+                    if _assert_map and with_gas == 0 and ngals > 0:
+                        raise AssertionError('FOF6D produced galaxies but none have gas; failing fast for investigation')
                 except Exception:
                     pass
         if self.obj_type == 'cloud':
