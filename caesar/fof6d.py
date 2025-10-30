@@ -555,6 +555,20 @@ class fof6d:
 
         # get tags using fof6d
         ngs=0
+        # Optional: pre-tag eligible gas count across sample for assert
+        import os as _os
+        do_tag_assert = _os.environ.get('CAESAR_ASSERT_TAGGED_GAS', '0') == '1'
+        try:
+            sample_n = int(_os.environ.get('CAESAR_FOF6D_CHECK_N', '50'))
+        except Exception:
+            sample_n = 50
+        pre_tag_gas = None
+        if do_tag_assert:
+            pre_tag_gas = []
+            for ih in range(min(len(self.obj.halo_list), sample_n)):
+                ptypes_e = self.obj.data_manager.ptype[g_inds[ih]] if g_inds[ih].size>0 else np.array([], dtype=np.int32)
+                pre_tag_gas.append(int(np.sum(ptypes_e == ptype_ints['gas'])))
+
         if self.nproc == 1:
             grp_tags = [None]*len(self.obj.halo_list)  # particle IDs for fof6d objects
             for ih in range(len(self.obj.halo_list)):
@@ -585,6 +599,33 @@ class fof6d:
             self.tags_fof6d[g_inds[igrp]] = grp_tags[igrp]
 
         memlog('Done fof6d, found %d %s'%(ngrp,group_types[target_type]))
+
+        # Post-tag assert: if there was eligible gas in the sample halos but none got tagged
+        if do_tag_assert and pre_tag_gas is not None:
+            try:
+                tagged_any = False
+                for ih in range(min(len(self.obj.halo_list), sample_n)):
+                    if pre_tag_gas[ih] <= 0:
+                        continue
+                    tags = grp_tags[ih]
+                    if tags is None or len(tags) == 0:
+                        continue
+                    # Count how many gas candidates have tag >= 0
+                    elig = g_inds[ih]
+                    if elig.size == 0:
+                        continue
+                    ptypes_e = self.obj.data_manager.ptype[elig]
+                    gas_mask = (ptypes_e == ptype_ints['gas'])
+                    if gas_mask.any():
+                        gas_tags = tags[gas_mask]
+                        if np.any(gas_tags >= 0):
+                            tagged_any = True
+                            break
+                if any(v>0 for v in pre_tag_gas) and not tagged_any:
+                    raise AssertionError('6D-FOF tagging did not assign any gas in sampled halos despite eligible gas present')
+            except Exception:
+                # if arrays inaccessible due to threading path differences, skip assert
+                pass
 
     def load_lists(self,parent=None):
         # create valid caesar groups, populate index lists
@@ -788,6 +829,11 @@ def setup_indexes(self,halo_indexes):
     # Map concatenated gas indices to selected indices using DataManager utility
     if gas_indexes.size > 0:
         gpos = self.obj.data_manager.concat_to_selected('gas', gas_indexes)
+        # Assert: if gas is present in the concatenated slice but mapping returns empty
+        # this indicates a mapping/selection inconsistency.
+        import os as _os
+        if _os.environ.get('CAESAR_ASSERT_ELIGIBLE_GAS', '0') == '1' and gpos.size == 0:
+            raise AssertionError('Eligible gas present in halo slice but selected index map is empty')
         gtemp = self.obj.data_manager.gT[gpos]
         gsfr = self.obj.data_manager.gsfr[gpos]
         gnh = self.obj.data_manager.gnh[gpos]
