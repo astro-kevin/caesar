@@ -517,6 +517,13 @@ class fof6d:
             self.dense_crit = lambda gnh, gtemp, gsfr: (gnh > self.nHlim) & ((gtemp < self.Tlim) | (gsfr > 0))
         else:
             self.dense_crit = lambda gnh, gtemp, gsfr: (gnh > self.nHlim) & (gtemp < self.Tlim)
+
+        # Record mode string for diagnostics below
+        haloid_mode = ''
+        try:
+            haloid_mode = str(self.obj._kwargs.get('haloid', '')).upper()
+        except Exception:
+            haloid_mode = ''
         memlog(f'fof6d run for target={target_type}, mode={haloid_mode}, nHlim={self.nHlim}, Tlim={self.Tlim}, sfflag={self.sfflag}')
 
         # collect indices for eligible particles
