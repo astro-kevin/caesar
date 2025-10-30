@@ -686,6 +686,15 @@ class fof6d:
             self.obj.galaxy_list = grp_list
             self.counts[self.obj_type] = len(self.obj.galaxy_list)
             self.obj.group_types.append(self.obj_type)
+            # Summary diagnostics: how many galaxies have gas immediately after 6D-FOF list build?
+            if _os.environ.get('CAESAR_FOF6D_SUMMARY', '0') == '1':
+                try:
+                    ngals = len(self.obj.galaxy_list)
+                    with_gas = sum(1 for g in self.obj.galaxy_list if getattr(g, 'glist', []) is not None and len(g.glist) > 0)
+                    from yt.funcs import mylog
+                    mylog.info('fof6d load_lists summary: galaxies=%d with_gas=%d without_gas=%d', ngals, with_gas, ngals - with_gas)
+                except Exception:
+                    pass
         if self.obj_type == 'cloud':
             self.obj.cloud_list = grp_list
             self.counts[self.obj_type] = len(self.obj.cloud_list)

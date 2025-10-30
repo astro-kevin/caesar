@@ -1851,6 +1851,17 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     """
     from caesar.property_manager import get_property, has_ptype
 
+    import os as _os
+    from yt.funcs import mylog
+    do_ahf_check = _os.environ.get('CAESAR_AHF_CHECK', '0') == '1'
+    pre_ngas = None
+    if do_ahf_check:
+        try:
+            pre_ngas = [len(getattr(g, 'glist', [])) if getattr(g, 'glist', None) is not None else 0 for g in getattr(sim, 'galaxy_list', [])]
+            mylog.info('AHF match: pre-collapse galaxies with gas=%d (total=%d)', sum(1 for v in pre_ngas if v>0), len(pre_ngas))
+        except Exception:
+            pre_ngas = None
+
     # Must have a galaxy list already
     if not hasattr(sim, 'galaxy_list') or len(sim.galaxy_list) == 0:
         return
@@ -2137,6 +2148,13 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     _update_ahf_galaxy_maps(sim, normalized_ahf_ids)
 
     _prune_halos_after_galaxies(sim)
+
+    if do_ahf_check:
+        try:
+            post_ngas = [len(getattr(g, 'glist', [])) if getattr(g, 'glist', None) is not None else 0 for g in getattr(sim, 'galaxy_list', [])]
+            mylog.info('AHF match: post-collapse galaxies with gas=%d (total=%d)', sum(1 for v in post_ngas if v>0), len(post_ngas))
+        except Exception:
+            pass
 
     # Stash exclusive DM reverse map for global list construction (none in this path)
     if exclusive_gal_dm is not None:
