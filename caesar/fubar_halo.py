@@ -253,16 +253,18 @@ def reset_global_particle_IDs(obj):
 
     # Post-map diagnostics: compare gas counts before vs after mapping
     if (do_reset_check or do_reset_assert) and pre_gas_counts is not None and 'galaxy' in obj.group_types:
+        post_gas_counts = []
         try:
             post_gas_counts = [len(getattr(g, 'glist', [])) if getattr(g, 'glist', None) is not None else 0 for g in obj.galaxy_list]
-            from yt.funcs import mylog
-            pre_with = sum(1 for v in pre_gas_counts if v > 0)
-            post_with = sum(1 for v in post_gas_counts if v > 0)
-            mylog.info('reset_global_particle_IDs: galaxies with gas before=%d after=%d (total=%d)', pre_with, post_with, len(post_gas_counts))
-            if do_reset_assert and pre_with > 0 and post_with == 0:
-                raise AssertionError('Gas lost after reset_global_particle_IDs: nonzero pre-map gas count dropped to zero')
         except Exception:
-            pass
+            post_gas_counts = []
+        from yt.funcs import mylog
+        pre_with = sum(1 for v in pre_gas_counts if v > 0)
+        post_with = sum(1 for v in post_gas_counts if v > 0)
+        mylog.info('reset_global_particle_IDs: galaxies with gas before=%d after=%d (total=%d)', pre_with, post_with, len(post_gas_counts))
+        if do_reset_assert and pre_with > 0 and post_with == 0:
+            mylog.error('Assertion: Gas lost after reset mapping (pre_with=%d, post_with=%d)', pre_with, post_with)
+            raise AssertionError('Gas lost after reset_global_particle_IDs: nonzero pre-map gas count dropped to zero')
 
     return
 

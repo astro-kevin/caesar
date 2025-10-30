@@ -602,30 +602,28 @@ class fof6d:
 
         # Post-tag assert: if there was eligible gas in the sample halos but none got tagged
         if do_tag_assert and pre_tag_gas is not None:
-            try:
-                tagged_any = False
-                for ih in range(min(len(self.obj.halo_list), sample_n)):
-                    if pre_tag_gas[ih] <= 0:
-                        continue
-                    tags = grp_tags[ih]
-                    if tags is None or len(tags) == 0:
-                        continue
-                    # Count how many gas candidates have tag >= 0
-                    elig = g_inds[ih]
-                    if elig.size == 0:
-                        continue
-                    ptypes_e = self.obj.data_manager.ptype[elig]
-                    gas_mask = (ptypes_e == ptype_ints['gas'])
-                    if gas_mask.any():
-                        gas_tags = tags[gas_mask]
-                        if np.any(gas_tags >= 0):
-                            tagged_any = True
-                            break
-                if any(v>0 for v in pre_tag_gas) and not tagged_any:
-                    raise AssertionError('6D-FOF tagging did not assign any gas in sampled halos despite eligible gas present')
-            except Exception:
-                # if arrays inaccessible due to threading path differences, skip assert
-                pass
+            tagged_any = False
+            for ih in range(min(len(self.obj.halo_list), sample_n)):
+                if pre_tag_gas[ih] <= 0:
+                    continue
+                tags = grp_tags[ih]
+                if tags is None or len(tags) == 0:
+                    continue
+                # Count how many gas candidates have tag >= 0
+                elig = g_inds[ih]
+                if elig.size == 0:
+                    continue
+                ptypes_e = self.obj.data_manager.ptype[elig]
+                gas_mask = (ptypes_e == ptype_ints['gas'])
+                if gas_mask.any():
+                    gas_tags = tags[gas_mask]
+                    if np.any(gas_tags >= 0):
+                        tagged_any = True
+                        break
+            if any(v>0 for v in pre_tag_gas) and not tagged_any:
+                from yt.funcs import mylog
+                mylog.error('Assertion: 6D-FOF tagging did not assign any gas in sampled halos despite eligible gas present')
+                raise AssertionError('6D-FOF tagging did not assign any gas in sampled halos despite eligible gas present')
 
     def load_lists(self,parent=None):
         # create valid caesar groups, populate index lists
@@ -732,15 +730,13 @@ class fof6d:
             self.obj.group_types.append(self.obj_type)
             # Summary diagnostics: how many galaxies have gas immediately after 6D-FOF list build?
             if _os.environ.get('CAESAR_FOF6D_SUMMARY', '0') == '1' or _assert_map:
-                try:
-                    ngals = len(self.obj.galaxy_list)
-                    with_gas = sum(1 for g in self.obj.galaxy_list if getattr(g, 'glist', []) is not None and len(g.glist) > 0)
-                    from yt.funcs import mylog
-                    mylog.info('fof6d load_lists summary: galaxies=%d with_gas=%d without_gas=%d', ngals, with_gas, ngals - with_gas)
-                    if _assert_map and with_gas == 0 and ngals > 0:
-                        raise AssertionError('FOF6D produced galaxies but none have gas; failing fast for investigation')
-                except Exception:
-                    pass
+                ngals = len(self.obj.galaxy_list)
+                with_gas = sum(1 for g in self.obj.galaxy_list if getattr(g, 'glist', []) is not None and len(g.glist) > 0)
+                from yt.funcs import mylog
+                mylog.info('fof6d load_lists summary: galaxies=%d with_gas=%d without_gas=%d', ngals, with_gas, ngals - with_gas)
+                if _assert_map and with_gas == 0 and ngals > 0:
+                    mylog.error('Assertion: FOF6D produced %d galaxies but none have gas', ngals)
+                    raise AssertionError('FOF6D produced galaxies but none have gas; failing fast for investigation')
         if self.obj_type == 'cloud':
             self.obj.cloud_list = grp_list
             self.counts[self.obj_type] = len(self.obj.cloud_list)

@@ -2151,16 +2151,18 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     _prune_halos_after_galaxies(sim)
 
     if do_ahf_check or do_ahf_assert:
+        post_ngas = []
         try:
             post_ngas = [len(getattr(g, 'glist', [])) if getattr(g, 'glist', None) is not None else 0 for g in getattr(sim, 'galaxy_list', [])]
-            mylog.info('AHF match: post-collapse galaxies with gas=%d (total=%d)', sum(1 for v in post_ngas if v>0), len(post_ngas))
-            if do_ahf_assert and pre_ngas is not None:
-                pre_with = sum(1 for v in pre_ngas if v>0)
-                post_with = sum(1 for v in post_ngas if v>0)
-                if pre_with > 0 and post_with == 0:
-                    raise AssertionError('Gas lost after AHF collapse: nonzero pre-collapse gas count dropped to zero')
         except Exception:
-            pass
+            post_ngas = []
+        mylog.info('AHF match: post-collapse galaxies with gas=%d (total=%d)', sum(1 for v in post_ngas if v>0), len(post_ngas))
+        if do_ahf_assert and pre_ngas is not None and post_ngas:
+            pre_with = sum(1 for v in pre_ngas if v>0)
+            post_with = sum(1 for v in post_ngas if v>0)
+            if pre_with > 0 and post_with == 0:
+                mylog.error('Assertion: Gas lost after AHF collapse (pre_with=%d, post_with=%d)', pre_with, post_with)
+                raise AssertionError('Gas lost after AHF collapse: nonzero pre-collapse gas count dropped to zero')
 
     # Stash exclusive DM reverse map for global list construction (none in this path)
     if exclusive_gal_dm is not None:
