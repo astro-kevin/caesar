@@ -577,7 +577,7 @@ class Group(object):
 
     def _calculate_radial_quantities(self):
         """ Calculate various component radii and half radii """
-        from caesar.group_funcs.group_funcs import get_half_mass_radius, get_full_mass_radius
+        from caesar.group_funcs import get_half_mass_radius, get_full_mass_radius
 
         r = np.empty(len(self.global_indexes), dtype=np.float64)
         get_periodic_r(self.obj.simulation.boxsize.d, self.pos.d, self.obj.data_manager.pos[self.global_indexes], r)
@@ -820,15 +820,7 @@ def create_new_group(obj, group_type):
 
 def get_group_properties(self,grp_list):
 
-    # Import directly from the module within the package since caesar/group_funcs
-    # may be a namespace package without an __init__.py in some installations.
-    from caesar.group_funcs.group_funcs import (
-        get_group_overall_properties,
-        get_group_gas_properties,
-        get_group_star_properties,
-        get_group_bh_properties,
-        get_group_dust_properties,
-    )
+    from caesar.group_funcs import get_group_overall_properties,get_group_gas_properties,get_group_star_properties,get_group_bh_properties,get_group_dust_properties
 
     get_group_overall_properties(self,grp_list)
     if 'gas' in self.obj.data_manager.ptypes: get_group_gas_properties(self,grp_list)
