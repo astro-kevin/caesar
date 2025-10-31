@@ -970,6 +970,19 @@ def setup_indexes(self,halo_indexes):
     star_indexes = halo_indexes[my_ptype == ptype_ints['star']]
     if len(star_indexes) < self.minstars:
         return np.zeros(1,dtype=np.int32)
+    # Optional: validate STAR mapping consistency (concat -> selected -> concat round-trip)
+    try:
+        import os as _os
+        if _os.environ.get('CAESAR_VALIDATE_STAR_MAP', '0') == '1':
+            ssel = self.obj.data_manager.concat_to_selected('star', star_indexes) if star_indexes.size > 0 else np.array([], dtype=np.int64)
+            rt = self.obj.data_manager.selected_to_concat('star', ssel) if ssel.size > 0 else np.array([], dtype=np.int64)
+            ok = (rt.size == star_indexes.size) and np.array_equal(np.sort(rt), np.sort(star_indexes))
+            from yt.funcs import mylog
+            mylog.info('fof6d star-map check: concat=%d selected=%d roundtrip_ok=%s', int(star_indexes.size), int(ssel.size), str(ok))
+            if _os.environ.get('CAESAR_ASSERT_STAR_MAP', '0') == '1' and star_indexes.size > 0 and (ssel.size == 0 or not ok):
+                raise AssertionError('Star index mapping inconsistency: concat > 0 but selected empty or round-trip failed')
+    except Exception:
+        pass
     # collect particles for fof6d: first apply dense gas cut
     gas_indexes = halo_indexes[my_ptype == ptype_ints['gas']]
     # Map concatenated gas indices to selected indices using DataManager utility
@@ -1013,6 +1026,20 @@ def setup_indexes(self,halo_indexes):
     # add in other particle types
     bh_indexes = halo_indexes[my_ptype == ptype_ints['bh']]
     dust_indexes = halo_indexes[my_ptype == ptype_ints['dust']]
+    # Optional: validate DM mapping as well (it is not used for eligible set but useful to detect systemic issues)
+    try:
+        import os as _os
+        if _os.environ.get('CAESAR_VALIDATE_DM_MAP', '0') == '1' and 'dm' in self.obj.data_manager.ptypes:
+            dm_indexes = halo_indexes[my_ptype == ptype_ints['dm']]
+            dsel = self.obj.data_manager.concat_to_selected('dm', dm_indexes) if dm_indexes.size > 0 else np.array([], dtype=np.int64)
+            rt = self.obj.data_manager.selected_to_concat('dm', dsel) if dsel.size > 0 else np.array([], dtype=np.int64)
+            ok = (rt.size == dm_indexes.size) and np.array_equal(np.sort(rt), np.sort(dm_indexes))
+            from yt.funcs import mylog
+            mylog.info('fof6d dm-map check: concat=%d selected=%d roundtrip_ok=%s', int(dm_indexes.size), int(dsel.size), str(ok))
+            if _os.environ.get('CAESAR_ASSERT_DM_MAP', '0') == '1' and dm_indexes.size > 0 and (dsel.size == 0 or not ok):
+                raise AssertionError('DM index mapping inconsistency: concat > 0 but selected empty or round-trip failed')
+    except Exception:
+        pass
     all_indexes = np.concatenate((dense_indexes,star_indexes,bh_indexes,dust_indexes),axis=None).astype(np.int32)
     # concatenate everything in the proper order and return
     return all_indexes
