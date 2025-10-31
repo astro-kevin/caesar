@@ -623,29 +623,19 @@ class fof6d:
                 ptypes_e = self.obj.data_manager.ptype[g_inds[ih]] if g_inds[ih].size>0 else np.array([], dtype=np.int32)
                 pre_tag_gas.append(int(np.sum(ptypes_e == ptype_ints['gas'])))
 
-        # Optional sigma mode for velocity gate: restrict gas sigma to gas neighbors only
-        _sigma_gas_only = False
-        try:
-            _sigma_gas_only = os.environ.get('CAESAR_FOF6D_SIGMA_GAS_ONLY', '0') == '1'
-        except Exception:
-            _sigma_gas_only = False
-
         if self.nproc == 1:
             grp_tags = [None]*len(self.obj.halo_list)  # particle IDs for fof6d objects
             for ih in range(len(self.obj.halo_list)):
-                ptype_slice = self.obj.data_manager.ptype[g_inds[ih]] if g_inds[ih].size>0 else np.empty(0, dtype=np.int32)
                 grp_tags[ih],tmg = fof6d_halo(
                     len(self.obj.halo_list[ih].global_indexes),
                     len(g_inds[ih]),
                     self.obj.data_manager.pos[g_inds[ih]],
                     self.obj.data_manager.vel[g_inds[ih]],
-                    ptype_slice,
                     self.minstars,
                     self.obj.simulation.boxsize.d,
                     self.fof_LL,
                     self.vel_LL,
                     self.kerneltab,
-                    sigma_gas_only=_sigma_gas_only,
                 )
                 ngs+=tmg
         else:
@@ -655,13 +645,11 @@ class fof6d:
                     len(g_inds[ih]),
                     self.obj.data_manager.pos[g_inds[ih]],
                     self.obj.data_manager.vel[g_inds[ih]],
-                    self.obj.data_manager.ptype[g_inds[ih]] if g_inds[ih].size>0 else np.empty(0, dtype=np.int32),
                     self.minstars,
                     self.obj.simulation.boxsize.d,
                     self.fof_LL,
                     self.vel_LL,
                     self.kerneltab,
-                    sigma_gas_only=_sigma_gas_only,
                 ) for ih in range(len(self.obj.halo_list))
             )
             grp_tags,ngs = zip(*tmg)
@@ -970,7 +958,7 @@ def setup_indexes(self,halo_indexes):
     # concatenate everything in the proper order and return
     return all_indexes
 
-def fof6d_halo(nparthalo,npart,pos,vel,ptype,minstars,Lbox,fof_LL,vel_LL,kerneltab,*,sigma_gas_only=False):
+def fof6d_halo(nparthalo,npart,pos,vel,minstars,Lbox,fof_LL,vel_LL,kerneltab):
     ''' Routine to find galaxies within a given halo using fof6d '''
 
     #initialize fof6d
@@ -993,24 +981,7 @@ def fof6d_halo(nparthalo,npart,pos,vel,ptype,minstars,Lbox,fof_LL,vel_LL,kernelt
     fof6d_results = [None]*len(groups)
     for igrp in range(len(groups)):
         if groups[igrp][1]-groups[igrp][0] < minstars: continue
-        # pass ptype slice for this subgroup if available
-        ptypes_sub = None
-        if ptype is not None and len(ptype) == npart:
-            ptypes_sub = ptype[groups[igrp][0]:groups[igrp][1]]
-        fof6d_results[igrp] = fof6d_main(
-            igrp,
-            groups,
-            mypos.T[groups[igrp][0]:groups[igrp][1]],
-            myvel.T[groups[igrp][0]:groups[igrp][1]],
-            kerneltab,
-            0.,
-            Lbox,
-            minstars,
-            fof_LL,
-            vel_LL,
-            ptype_list=ptypes_sub,
-            sigma_gas_only=sigma_gas_only,
-        )
+        fof6d_results[igrp] = fof6d_main(igrp,groups,mypos.T[groups[igrp][0]:groups[igrp][1]],myvel.T[groups[igrp][0]:groups[igrp][1]],kerneltab,0.,Lbox,minstars,fof_LL,vel_LL)
 
     # insert galaxy IDs into particle lists
     nfof = 0
@@ -1028,7 +999,7 @@ def fof6d_halo(nparthalo,npart,pos,vel,ptype,minstars,Lbox,fof_LL,vel_LL,kernelt
     # returns the group to which each particle belongs (-1 if not in group)
     return fof6d_tags,nfof
 
-def fof6d_main(igrp,groups,poslist,vellist,kerneltab,t0,Lbox,mingrp,fof_LL,vel_LL=None,nfof=0,*,ptype_list=None,sigma_gas_only=False):
+def fof6d_main(igrp,groups,poslist,vellist,kerneltab,t0,Lbox,mingrp,fof_LL,vel_LL=None,nfof=0):
     # find neighbors of all particles within fof_LL
     istart = groups[igrp][0]  # starting particle index for group igrp
     iend = groups[igrp][1]
@@ -1045,64 +1016,13 @@ def fof6d_main(igrp,groups,poslist,vellist,kerneltab,t0,Lbox,mingrp,fof_LL,vel_L
         siglist = []  # list of boolean arrays storing whether crit is satisfied for each neighbor pair
         # compute local velocity dispersion from neighbors
         for i in range(nactive):
-            ngblist = nlist[1][i]  # indices of neighbors
-            rlist = nlist[0][i]    # radii of neighbors
-            # Optionally restrict sigma for gas particles to gas-only neighbors
-            if sigma_gas_only and ptype_list is not None:
-                try:
-                    gas_code = ptype_ints['gas']
-                    if ptype_list[i] == gas_code:
-                        same_mask = (ptype_list[ngblist] == gas_code)
-                        if np.any(same_mask):
-                            ngb_sel = ngblist[same_mask]
-                            r_sel = rlist[same_mask]
-                        else:
-                            ngb_sel = ngblist
-                            r_sel = rlist
-                    else:
-                        ngb_sel = ngblist
-                        r_sel = rlist
-                except Exception:
-                    ngb_sel = ngblist
-                    r_sel = rlist
-            else:
-                ngb_sel = ngblist
-                r_sel = rlist
-
-            wt = kernel(r_sel*LLinv, kerneltab)
-            dv = np.linalg.norm(vellist[ngb_sel]-vellist[i], axis=1)
-            # Guard against zero weight sum
-            denom = np.sum(wt)
-            if denom <= 0:
-                sigma[i] = 0.0
-                sig_ok = np.zeros_like(dv, dtype=bool)
-            else:
-                sigma[i] = np.sqrt(np.sum(wt*dv*dv)/denom)
-                sig_ok = (dv <= vel_LL*sigma[i])
-            # Expand mask back to full neighbor list length if we narrowed neighbors
-            if ngb_sel is not ngblist:
-                sig_full = np.zeros(len(ngblist), dtype=bool)
-                # map selection positions
-                # find positions of ngb_sel inside ngblist
-                # build a boolean mask by matching indices
-                # note: both arrays are small; linear match ok here
-                selset = set(ngb_sel.tolist())
-                for j, idx in enumerate(ngblist):
-                    if idx in selset:
-                        # position in dv corresponds to order within ngb_sel; approximate by True where selected
-                        # we'll reuse sig_ok in order of selected; conservative: mark True only for selected
-                        # This minor mismatch only affects pruning; acceptable for gating
-                        sig_full[j] = True
-                # mask down using sig_ok count
-                # overwrite True positions with sig_ok in sequence
-                k = 0
-                for j in range(len(sig_full)):
-                    if sig_full[j]:
-                        sig_full[j] = sig_ok[k]
-                        k += 1
-                siglist.append(sig_full)
-            else:
-                siglist.append(sig_ok)
+            ngblist = nlist[1][i]  # list of indices of neighbors
+            rlist = nlist[0][i]  # list of radii of neighbors
+            # compute kernel-weighted velocity dispersion
+            wt = kernel(rlist*LLinv,kerneltab)
+            dv = np.linalg.norm(vellist[ngblist]-vellist[i],axis=1)
+            sigma[i] = np.sqrt(np.sum(wt*dv*dv)/np.sum(wt))
+            siglist.append((dv <= vel_LL*sigma[i]))
     else:
         # if velocity criterion not used, then all particles satisfy it by default
         siglist = []  # list of boolean arrays storing whether vel disp crit is satisfied
