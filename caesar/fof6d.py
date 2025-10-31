@@ -526,6 +526,37 @@ class fof6d:
             haloid_mode = ''
         memlog(f'fof6d run for target={target_type}, mode={haloid_mode}, nHlim={self.nHlim}, Tlim={self.Tlim}, sfflag={self.sfflag}')
 
+        # Optional: verify halos we process have gas present (before eligibility mapping)
+        import os as _os
+        do_halo_gas_report = _os.environ.get('CAESAR_FOF6D_HALO_GAS_REPORT', '0') == '1'
+        do_halo_gas_assert = _os.environ.get('CAESAR_ASSERT_HALO_HAS_GAS', '0') == '1'
+        try:
+            _report_n = int(_os.environ.get('CAESAR_FOF6D_CHECK_N', '50'))
+        except Exception:
+            _report_n = 50
+        if do_halo_gas_report or do_halo_gas_assert:
+            from yt.funcs import mylog
+            halos_missing_gas = 0
+            total_eligible = 0
+            for ih in range(len(self.obj.halo_list)):
+                hi = self.obj.halo_list[ih].global_indexes
+                if hi.size == 0:
+                    continue
+                ptypes_h = self.obj.data_manager.ptype[hi]
+                gas_cnt = int(np.sum(ptypes_h == ptype_ints['gas']))
+                star_cnt = int(np.sum(ptypes_h == ptype_ints['star']))
+                will_process = (star_cnt >= self.minstars)
+                if will_process:
+                    total_eligible += 1
+                    if gas_cnt == 0:
+                        halos_missing_gas += 1
+                if do_halo_gas_report and ih < _report_n:
+                    mylog.info('fof6d halo gas report: halo=%d stars=%d gas=%d will_process=%s', ih, star_cnt, gas_cnt, str(will_process))
+            mylog.info('fof6d halo gas summary: eligible_halos=%d with_no_gas=%d', total_eligible, halos_missing_gas)
+            if do_halo_gas_assert and total_eligible > 0 and halos_missing_gas == total_eligible:
+                mylog.error('Assertion: All eligible halos (with >= %d stars) have zero gas at halo stage', self.minstars)
+                raise AssertionError('No gas present in any eligible halo before FOF; investigate selection/mapping')
+
         # collect indices for eligible particles
         memlog('Running fof6d on %d halos w/%d proc(s), LL=%g'%(len(self.obj.halo_list),self.nproc,self.fof_LL))
         g_inds = []  # indexes of (gas star BH dust) particle eligible for being in a group
@@ -613,6 +644,9 @@ class fof6d:
             report_n = 50
         if do_tag_report:
             from yt.funcs import mylog
+            tot_gas_elig = tot_gas_tag = 0
+            tot_star_elig = tot_star_tag = 0
+            sampled = 0
             for ih in range(min(len(self.obj.halo_list), report_n)):
                 elig = g_inds[ih]
                 if elig.size == 0:
@@ -627,6 +661,16 @@ class fof6d:
                 gas_tag = int(np.sum(tags[gas_mask] >= 0)) if gas_elig>0 else 0
                 star_tag = int(np.sum(tags[star_mask] >= 0)) if star_elig>0 else 0
                 mylog.info('fof6d tag report: halo=%d gas_elig=%d gas_tagged=%d star_elig=%d star_tagged=%d', ih, gas_elig, gas_tag, star_elig, star_tag)
+                tot_gas_elig += gas_elig
+                tot_gas_tag += gas_tag
+                tot_star_elig += star_elig
+                tot_star_tag += star_tag
+                sampled += 1
+            # Aggregate summary over sampled halos
+            gas_rate = (tot_gas_tag / tot_gas_elig) if tot_gas_elig > 0 else 0.0
+            star_rate = (tot_star_tag / tot_star_elig) if tot_star_elig > 0 else 0.0
+            mylog.info('fof6d tag summary: halos_sampled=%d gas_elig=%d gas_tagged=%d (rate=%.3f) star_elig=%d star_tagged=%d (rate=%.3f)'
+                       , sampled, tot_gas_elig, tot_gas_tag, gas_rate, tot_star_elig, tot_star_tag, star_rate)
 
         # Post-tag assert: if there was eligible gas in the sample halos but none got tagged
         if do_tag_assert and pre_tag_gas is not None:
