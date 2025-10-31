@@ -504,6 +504,7 @@ class fof6d:
 
         # initialize fof6d parameter
         self.fof_LL = self.MIS * get_b(self.obj, target_type)
+        # default velocity-space linking factor (relative to local sigma)
         self.vel_LL = 1.0
         self.kerneltab = kernel_table(self.fof_LL)
         self.nHlim = nHlim  # only include gas above this nH limit (atoms/cm^3)
@@ -524,6 +525,23 @@ class fof6d:
             haloid_mode = str(self.obj._kwargs.get('haloid', '')).upper()
         except Exception:
             haloid_mode = ''
+        # Allow environment overrides for velocity gating
+        try:
+            _vel_env = os.environ.get('CAESAR_FOF6D_VEL_LL')
+            if _vel_env is not None and _vel_env != '':
+                self.vel_LL = float(_vel_env)
+        except Exception:
+            pass
+
+        # Optional: in AHF modes, permit disabling the velocity gate entirely for debugging
+        try:
+            if haloid_mode in ('AHF', 'AHF-FAST') and target_type == 'galaxy':
+                if os.environ.get('CAESAR_FOF6D_DISABLE_VEL', '0') == '1':
+                    self.vel_LL = None
+                    mylog.info('fof6d: AHF mode with spatial-only linking (velocity gate disabled)')
+        except Exception:
+            pass
+
         memlog(f'fof6d run for target={target_type}, mode={haloid_mode}, nHlim={self.nHlim}, Tlim={self.Tlim}, sfflag={self.sfflag}')
 
         # Optional: verify halos we process have gas present (before eligibility mapping)
