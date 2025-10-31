@@ -119,11 +119,28 @@ class DataManager(object):
     # Index-space mapping utilities
     # ------------------------------
     def _ptype_list(self, ptype: str):
-        """Return the concatenated index list array for a per-type (e.g., glist, slist)."""
-        key = f"{ptype}list"
-        if not hasattr(self, key):
-            return None
-        return getattr(self, key)
+        """Return the concatenated index list array for a per-type.
+
+        Maps canonical names to DataManager attribute names:
+        - gas  -> glist
+        - star -> slist
+        - dm   -> dmlist
+        - dm2  -> dm2list
+        - dm3  -> dm3list
+        - bh   -> bhlist
+        - dust -> dlist
+        """
+        name_map = {
+            'gas': 'glist',
+            'star': 'slist',
+            'dm': 'dmlist',
+            'dm2': 'dm2list',
+            'dm3': 'dm3list',
+            'bh': 'bhlist',
+            'dust': 'dlist',
+        }
+        key = name_map.get(ptype, f"{ptype}list")
+        return getattr(self, key, None)
 
     def selected_to_concat(self, ptype: str, sel_idx: np.ndarray) -> np.ndarray:
         """Map selected per-type indices -> concatenated indices via the per-type list array.
