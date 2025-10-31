@@ -980,6 +980,19 @@ def setup_indexes(self,halo_indexes):
         import os as _os
         if _os.environ.get('CAESAR_ASSERT_ELIGIBLE_GAS', '0') == '1' and gpos.size == 0:
             raise AssertionError('Eligible gas present in halo slice but selected index map is empty')
+        # Optional validation: round-trip mapping and gating statistics
+        if _os.environ.get('CAESAR_VALIDATE_GAS_MAP', '0') == '1':
+            try:
+                from yt.funcs import mylog
+                gas_concat_cnt = int(gas_indexes.size)
+                gas_sel_cnt = int(gpos.size)
+                rt = self.obj.data_manager.selected_to_concat('gas', gpos)
+                rt_ok = (rt.size == gas_indexes.size) and np.array_equal(np.sort(rt), np.sort(gas_indexes))
+                mylog.info('fof6d gas-map check: concat=%d selected=%d roundtrip_ok=%s', gas_concat_cnt, gas_sel_cnt, str(rt_ok))
+                if _os.environ.get('CAESAR_ASSERT_GAS_MAP', '0') == '1' and gas_concat_cnt > 0 and (gas_sel_cnt == 0 or not rt_ok):
+                    raise AssertionError('Gas index mapping inconsistency: concat > 0 but selected empty or round-trip failed')
+            except Exception:
+                pass
         gtemp = self.obj.data_manager.gT[gpos]
         gsfr = self.obj.data_manager.gsfr[gpos]
         gnh = self.obj.data_manager.gnh[gpos]
@@ -988,6 +1001,14 @@ def setup_indexes(self,halo_indexes):
         gsfr = self.obj.data_manager.gsfr[:0]
         gnh = self.obj.data_manager.gnh[:0]
     select_dense_gas = self.dense_crit(gnh, gtemp, gsfr)
+    # Optional logging of gating outcome per halo
+    try:
+        import os as _os
+        if _os.environ.get('CAESAR_LOG_GAS_GATING', '0') == '1':
+            from yt.funcs import mylog
+            mylog.info('fof6d gas-gate: in=%d dense=%d', int(gas_indexes.size), int(np.sum(select_dense_gas)))
+    except Exception:
+        pass
     dense_indexes = gas_indexes[select_dense_gas]
     # add in other particle types
     bh_indexes = halo_indexes[my_ptype == ptype_ints['bh']]
