@@ -129,7 +129,7 @@ def assign_clouds_to_galaxies(obj):
             obj.galaxies[cloud.parent_galaxy_index].cloud_index_list.append(i)
 
             
-def assign_central_galaxies(obj,central_mass_definition='total'):
+def assign_central_galaxies(obj,central_mass_definition='stellar'):
     """Assign central galaxies.
 
     Iterate through halos and consider the most massive galaxy within
@@ -146,7 +146,14 @@ def assign_central_galaxies(obj,central_mass_definition='total'):
         return
 
     mylog.info('Assigning central galaxies')
-    
+
+    # Clear any previous central flags to avoid stale centrals after remapping
+    try:
+        for g in obj.galaxies:
+            g.central = False
+    except Exception:
+        pass
+
     obj.central_galaxies   = []
     obj.satellite_galaxies = []
 

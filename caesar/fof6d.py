@@ -548,6 +548,8 @@ class fof6d:
         import os as _os
         do_halo_gas_report = _os.environ.get('CAESAR_FOF6D_HALO_GAS_REPORT', '0') == '1'
         do_halo_gas_assert = _os.environ.get('CAESAR_ASSERT_HALO_HAS_GAS', '0') == '1'
+        do_progress = (_os.environ.get('CAESAR_FOF6D_PROGRESS', '0') == '1' or _os.environ.get('CAESAR_PROGRESS', '0') == '1')
+        verbose_gas = _os.environ.get('CAESAR_FOF6D_HALO_GAS_VERBOSE', '0') == '1'
         try:
             _report_n = int(_os.environ.get('CAESAR_FOF6D_CHECK_N', '50'))
         except Exception:
@@ -556,7 +558,14 @@ class fof6d:
             from yt.funcs import mylog
             halos_missing_gas = 0
             total_eligible = 0
-            for ih in range(len(self.obj.halo_list)):
+            it = range(len(self.obj.halo_list))
+            if do_progress:
+                try:
+                    from yt.extern.tqdm import tqdm
+                    it = tqdm(it, desc='fof6d: scan halos for gas', leave=False)
+                except Exception:
+                    pass
+            for ih in it:
                 hi = self.obj.halo_list[ih].global_indexes
                 if hi.size == 0:
                     continue
@@ -568,8 +577,8 @@ class fof6d:
                     total_eligible += 1
                     if gas_cnt == 0:
                         halos_missing_gas += 1
-                if do_halo_gas_report and ih < _report_n:
-                    mylog.info('fof6d halo gas report: halo=%d stars=%d gas=%d will_process=%s', ih, star_cnt, gas_cnt, str(will_process))
+                if verbose_gas and ih < _report_n:
+                    mylog.debug('fof6d halo gas report: halo=%d stars=%d gas=%d will_process=%s', ih, star_cnt, gas_cnt, str(will_process))
             mylog.info('fof6d halo gas summary: eligible_halos=%d with_no_gas=%d', total_eligible, halos_missing_gas)
             if do_halo_gas_assert and total_eligible > 0 and halos_missing_gas == total_eligible:
                 mylog.error('Assertion: All eligible halos (with >= %d stars) have zero gas at halo stage', self.minstars)
@@ -583,7 +592,14 @@ class fof6d:
         total_gas_candidates = 0
         total_star_candidates = 0
         len_hi = len_gi = 0
-        for ih in range(len(self.obj.halo_list)):
+        it2 = range(len(self.obj.halo_list))
+        if do_progress:
+            try:
+                from yt.extern.tqdm import tqdm
+                it2 = tqdm(it2, desc='fof6d: select eligible', leave=False)
+            except Exception:
+                pass
+        for ih in it2:
             eligible = setup_indexes(self,self.obj.halo_list[ih].global_indexes)
             g_inds.append(eligible)
             # diagnostics: count components
@@ -690,7 +706,7 @@ class fof6d:
             for ih in range(min(len(self.obj.halo_list), report_n)):
                 elig = g_inds[ih]
                 if elig.size == 0:
-                    mylog.info('fof6d tag report: halo=%d elig_total=0', ih)
+                    mylog.debug('fof6d tag report: halo=%d elig_total=0', ih)
                     continue
                 ptypes_e = self.obj.data_manager.ptype[elig]
                 gas_mask = (ptypes_e == ptype_ints['gas'])
@@ -700,7 +716,7 @@ class fof6d:
                 star_elig = int(star_mask.sum())
                 gas_tag = int(np.sum(tags[gas_mask] >= 0)) if gas_elig>0 else 0
                 star_tag = int(np.sum(tags[star_mask] >= 0)) if star_elig>0 else 0
-                mylog.info('fof6d tag report: halo=%d gas_elig=%d gas_tagged=%d star_elig=%d star_tagged=%d', ih, gas_elig, gas_tag, star_elig, star_tag)
+                mylog.debug('fof6d tag report: halo=%d gas_elig=%d gas_tagged=%d star_elig=%d star_tagged=%d', ih, gas_elig, gas_tag, star_elig, star_tag)
                 tot_gas_elig += gas_elig
                 tot_gas_tag += gas_tag
                 tot_star_elig += star_elig
@@ -978,7 +994,7 @@ def setup_indexes(self,halo_indexes):
             rt = self.obj.data_manager.selected_to_concat('star', ssel) if ssel.size > 0 else np.array([], dtype=np.int64)
             ok = (rt.size == star_indexes.size) and np.array_equal(np.sort(rt), np.sort(star_indexes))
             from yt.funcs import mylog
-            mylog.info('fof6d star-map check: concat=%d selected=%d roundtrip_ok=%s', int(star_indexes.size), int(ssel.size), str(ok))
+            mylog.debug('fof6d star-map check: concat=%d selected=%d roundtrip_ok=%s', int(star_indexes.size), int(ssel.size), str(ok))
             if _os.environ.get('CAESAR_ASSERT_STAR_MAP', '0') == '1' and star_indexes.size > 0 and (ssel.size == 0 or not ok):
                 raise AssertionError('Star index mapping inconsistency: concat > 0 but selected empty or round-trip failed')
     except Exception:
@@ -1001,7 +1017,7 @@ def setup_indexes(self,halo_indexes):
                 gas_sel_cnt = int(gpos.size)
                 rt = self.obj.data_manager.selected_to_concat('gas', gpos)
                 rt_ok = (rt.size == gas_indexes.size) and np.array_equal(np.sort(rt), np.sort(gas_indexes))
-                mylog.info('fof6d gas-map check: concat=%d selected=%d roundtrip_ok=%s', gas_concat_cnt, gas_sel_cnt, str(rt_ok))
+                mylog.debug('fof6d gas-map check: concat=%d selected=%d roundtrip_ok=%s', gas_concat_cnt, gas_sel_cnt, str(rt_ok))
                 if _os.environ.get('CAESAR_ASSERT_GAS_MAP', '0') == '1' and gas_concat_cnt > 0 and (gas_sel_cnt == 0 or not rt_ok):
                     raise AssertionError('Gas index mapping inconsistency: concat > 0 but selected empty or round-trip failed')
             except Exception:
@@ -1035,7 +1051,7 @@ def setup_indexes(self,halo_indexes):
             rt = self.obj.data_manager.selected_to_concat('dm', dsel) if dsel.size > 0 else np.array([], dtype=np.int64)
             ok = (rt.size == dm_indexes.size) and np.array_equal(np.sort(rt), np.sort(dm_indexes))
             from yt.funcs import mylog
-            mylog.info('fof6d dm-map check: concat=%d selected=%d roundtrip_ok=%s', int(dm_indexes.size), int(dsel.size), str(ok))
+            mylog.debug('fof6d dm-map check: concat=%d selected=%d roundtrip_ok=%s', int(dm_indexes.size), int(dsel.size), str(ok))
             if _os.environ.get('CAESAR_ASSERT_DM_MAP', '0') == '1' and dm_indexes.size > 0 and (dsel.size == 0 or not ok):
                 raise AssertionError('DM index mapping inconsistency: concat > 0 but selected empty or round-trip failed')
     except Exception:

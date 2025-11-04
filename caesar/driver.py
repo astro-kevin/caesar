@@ -89,6 +89,7 @@ class Snapshot(object):
 
             try:
                 from caesar.halo_matching import match_subhalos_to_galaxies
+                from caesar import assignment as _assign, linking as _link
                 # Prefer in-memory star IDs to avoid snapshot I/O
                 star_ids = None
                 try:
@@ -104,6 +105,14 @@ class Snapshot(object):
                     star_particle_ids=star_ids,
                 )
                 setattr(obj, "_ahf_matched", True)
+
+                # Rebuild membership and centrals by stellar after matching
+                _assign.assign_galaxies_to_halos(obj)
+                _assign.assign_clouds_to_galaxies(obj)
+                _link.link_galaxies_and_halos(obj)
+                _link.link_clouds_and_galaxies(obj)
+                _assign.assign_central_galaxies(obj)
+                _link.create_sublists(obj)
             except Exception as exc:
                 mylog.warning('Subhalo matching failed: %s' % exc)
         obj.save(self.outfile)

@@ -338,22 +338,8 @@ class CAESAR(object):
         else:
             from caesar.fubar_halo import fubar_halo
             fubar_halo(self)
-            if not getattr(self, "_ahf_matched", False):
-                assign.assign_galaxies_to_halos(self)
-                assign.assign_clouds_to_galaxies(self)
 
-        link.link_galaxies_and_halos(self)
-        link.link_clouds_and_galaxies(self)
-        assign.assign_central_galaxies(self)
-        link.create_sublists(self)
-
-        #import caesar.hydrogen_mass_calc as mass_calc
-        #mass_calc.hydrogen_mass_calc(self)
-
-        if (len(self.halos) !=0) and ('lowres' in self._kwargs and self._kwargs['lowres'] is not None): # no need this when there is no halos
-            from caesar.zoom_funcs import all_object_contam_check
-            all_object_contam_check(self)
-
+        # If requested, reconcile with AHF before building links and centrals
         if (
             'haloid' in self._kwargs
             and isinstance(self._kwargs['haloid'], str)
@@ -384,6 +370,24 @@ class CAESAR(object):
                 setattr(self, "_ahf_matched", True)
             except Exception as exc:  # pragma: no cover - optional heavy deps
                 mylog.warning('Subhalo matching failed: %s' % exc)
+
+        # Build final membership lists and links
+        if not getattr(self, "_ahf_matched", False):
+            assign.assign_galaxies_to_halos(self)
+            assign.assign_clouds_to_galaxies(self)
+
+        link.link_galaxies_and_halos(self)
+        link.link_clouds_and_galaxies(self)
+        # Choose centrals (defaults to stellar mass)
+        assign.assign_central_galaxies(self)
+        link.create_sublists(self)
+
+        #import caesar.hydrogen_mass_calc as mass_calc
+        #mass_calc.hydrogen_mass_calc(self)
+
+        if (len(self.halos) !=0) and ('lowres' in self._kwargs and self._kwargs['lowres'] is not None): # no need this when there is no halos
+            from caesar.zoom_funcs import all_object_contam_check
+            all_object_contam_check(self)
 
 
 
