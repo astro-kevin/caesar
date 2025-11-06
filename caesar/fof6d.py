@@ -810,43 +810,7 @@ class fof6d:
                     mygrp.ndm3 = len(mygrp.dm3list)
                 offset += self.nparttype[p]
 
-            # Demonstration: compare offset-based mapping vs DataManager mapping for first N galaxies
-            # Enabled by env CAESAR_FOF6D_DEMO=1
-            if self.obj_type == 'galaxy':
-                import os as _os
-                _demo = _os.environ.get('CAESAR_FOF6D_DEMO', '0') == '1'
-                if _demo:
-                    try:
-                        _demo_n = int(_os.environ.get('CAESAR_FOF6D_CHECK_N', '50'))
-                    except Exception:
-                        _demo_n = 50
-                    if igrp < _demo_n:
-                        from yt.funcs import mylog
-                        # GAS
-                        try:
-                            gas_concat_idx = my_indexes[my_ptype == ptype_ints['gas']]
-                            gas_mapped = self.obj.data_manager.concat_to_selected('gas', gas_concat_idx)
-                            mylog.info('fof6d demo[g=%d]: gas concat=%d mapped=%d offset_count=%d',
-                                       igrp, int(gas_concat_idx.size), int(gas_mapped.size), int(getattr(mygrp, 'ngas', 0)))
-                        except Exception as _e:
-                            mylog.warning('fof6d demo gas mapping failed for group %d: %s', igrp, _e)
-                        # STAR
-                        try:
-                            star_concat_idx = my_indexes[my_ptype == ptype_ints['star']]
-                            star_mapped = self.obj.data_manager.concat_to_selected('star', star_concat_idx)
-                            mylog.info('fof6d demo[g=%d]: star concat=%d mapped=%d offset_count=%d',
-                                       igrp, int(star_concat_idx.size), int(star_mapped.size), int(getattr(mygrp, 'nstar', 0)))
-                        except Exception as _e:
-                            mylog.warning('fof6d demo star mapping failed for group %d: %s', igrp, _e)
-                        # DM (if present)
-                        try:
-                            if 'dm' in self.obj.data_manager.ptypes:
-                                dm_concat_idx = my_indexes[my_ptype == ptype_ints['dm']]
-                                dm_mapped = self.obj.data_manager.concat_to_selected('dm', dm_concat_idx)
-                                mylog.info('fof6d demo[g=%d]: dm concat=%d mapped=%d offset_count=%d',
-                                           igrp, int(dm_concat_idx.size), int(dm_mapped.size), int(getattr(mygrp, 'ndm', 0)))
-                        except Exception as _e:
-                            mylog.warning('fof6d demo dm mapping failed for group %d: %s', igrp, _e)
+            # (demo logging disabled)
 
             # Optional lightweight correctness checks for mapping (first N groups only)
             if ( _check or _assert_map ) and _checked < _check_n and self.obj_type == 'galaxy':
@@ -1030,14 +994,7 @@ def setup_indexes(self,halo_indexes):
         gsfr = self.obj.data_manager.gsfr[:0]
         gnh = self.obj.data_manager.gnh[:0]
     select_dense_gas = self.dense_crit(gnh, gtemp, gsfr)
-    # Optional logging of gating outcome per halo
-    try:
-        import os as _os
-        if _os.environ.get('CAESAR_LOG_GAS_GATING', '0') == '1':
-            from yt.funcs import mylog
-            mylog.info('fof6d gas-gate: in=%d dense=%d', int(gas_indexes.size), int(np.sum(select_dense_gas)))
-    except Exception:
-        pass
+    # (gas-gate per-halo logging disabled)
     dense_indexes = gas_indexes[select_dense_gas]
     # add in other particle types
     bh_indexes = halo_indexes[my_ptype == ptype_ints['bh']]
