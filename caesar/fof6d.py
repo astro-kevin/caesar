@@ -561,8 +561,14 @@ class fof6d:
             it = range(len(self.obj.halo_list))
             if do_progress:
                 try:
-                    from yt.extern.tqdm import tqdm
-                    it = tqdm(it, desc='fof6d: scan halos for gas', leave=False)
+                    try:
+                        from yt.extern.tqdm import tqdm as _tqdm
+                    except Exception:
+                        try:
+                            from tqdm.auto import tqdm as _tqdm
+                        except Exception:
+                            from tqdm import tqdm as _tqdm  # type: ignore
+                    it = _tqdm(it, desc='fof6d: scan halos for gas', leave=False)
                 except Exception:
                     pass
             for ih in it:
@@ -595,8 +601,14 @@ class fof6d:
         it2 = range(len(self.obj.halo_list))
         if do_progress:
             try:
-                from yt.extern.tqdm import tqdm
-                it2 = tqdm(it2, desc='fof6d: select eligible', leave=False)
+                try:
+                    from yt.extern.tqdm import tqdm as _tqdm
+                except Exception:
+                    try:
+                        from tqdm.auto import tqdm as _tqdm
+                    except Exception:
+                        from tqdm import tqdm as _tqdm  # type: ignore
+                it2 = _tqdm(it2, desc='fof6d: select eligible', leave=False)
             except Exception:
                 pass
         for ih in it2:
