@@ -90,11 +90,21 @@ def create_sublists(obj):
     obj.satellite_galaxies = []
     
     # assign halo sub lists
-    for halo in obj.halos:
+    for hid, halo in enumerate(obj.halos):
         halo.central_galaxy = -1
+        found = False
+        # Prefer galaxies already linked to this halo
         for galaxy in halo.galaxies:
             if galaxy.central:
                 halo.central_galaxy = galaxy.GroupID
+                found = True
+                break
+        # Fallback: scan all galaxies by parent_halo_index
+        if not found:
+            for gal in obj.galaxies:
+                if getattr(gal, 'parent_halo_index', -1) == hid and getattr(gal, 'central', False):
+                    halo.central_galaxy = gal.GroupID
+                    break
 #             else:
 #                 halo.satellite_galaxies.append(galaxy)
 
