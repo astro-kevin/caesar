@@ -4,9 +4,29 @@ import numpy as np
 from caesar.property_manager import ptype_ints, has_property
 #from caesar.group_funcs import get_periodic_r,get_virial_mr
 
-MINIMUM_STARS_PER_GALAXY = 16  # set a bit below 32 so we capture all galaxies above a given Mstar, rather than a given Nstar.
+MINIMUM_STARS_PER_GALAXY = 1   # allow galaxies with a single star particle
 MINIMUM_DM_PER_HALO      = 24
 MINIMUM_GAS_PER_CLOUD = 16
+
+def get_min_stars(sim=None, override=None):
+    """Unified resolver for the minimum number of stars per galaxy.
+
+    Priority:
+    1) explicit override parameter if provided
+    2) sim._kwargs['min_stars'] if available
+    3) default MINIMUM_STARS_PER_GALAXY
+    """
+    if override is not None:
+        try:
+            return int(override)
+        except Exception:
+            return MINIMUM_STARS_PER_GALAXY
+    try:
+        if sim is not None and hasattr(sim, '_kwargs') and 'min_stars' in sim._kwargs:
+            return int(sim._kwargs['min_stars'])
+    except Exception:
+        pass
+    return MINIMUM_STARS_PER_GALAXY
 
 group_types = dict(
     halo='halos',
@@ -102,8 +122,10 @@ class Group(object):
             if total_particles < MINIMUM_DM_PER_HALO and self.nstar == 0:
                 return False
             return True
-        elif self.obj_type == 'galaxy' and self.nstar < MINIMUM_STARS_PER_GALAXY:
-            return False
+        elif self.obj_type == 'galaxy':
+            if self.nstar < get_min_stars(self.obj):
+                return False
+            return True
         elif self.obj_type == 'cloud' and self.ngas < MINIMUM_GAS_PER_CLOUD:
             return False
         else:

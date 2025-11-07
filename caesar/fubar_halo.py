@@ -99,7 +99,9 @@ def fubar_halo(obj):
     if 'haloid' in obj._kwargs and isinstance(obj._kwargs['haloid'], str) and obj._kwargs['haloid'].upper() == 'AHF-FAST' and 'haloid_file' in obj._kwargs:
         try:
             from caesar.halo_matching import build_galaxies_from_ahf_fast
-            build_galaxies_from_ahf_fast(obj, obj._kwargs['haloid_file'], min_stars=16)
+            from caesar.group import get_min_stars
+            ms = get_min_stars(obj)
+            build_galaxies_from_ahf_fast(obj, obj._kwargs['haloid_file'], min_stars=ms)
             setattr(obj, "_ahf_matched", True)
             setattr(obj, "_include_dm_in_galaxies", True)
             # proceed to finalize at end of function
@@ -118,7 +120,10 @@ def fubar_halo(obj):
             fof6d_flag = halos.load_fof6dfile()  # load galaxy ID's from fof6d_file
         # Skip running 6D-FOF if AHF-FAST succeeded
         if fof6d_flag and not getattr(obj, '_ahf_matched', False):
-            halos.run_fof6d('galaxy')  # run fof6d on halos to find galaxies
+            # Honor unified min_stars policy
+            from caesar.group import get_min_stars
+            ms = get_min_stars(obj)
+            halos.run_fof6d('galaxy', minstars=ms)  # run fof6d on halos to find galaxies
             halos.save_fof6dfile()  # save fof6d info
 
     # Process galaxies

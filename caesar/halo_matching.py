@@ -270,25 +270,56 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
 
 
 def _prune_halos_after_galaxies(sim) -> None:
-    """Remove halos that end up with no galaxies after the AHF reconciliation."""
+    """Prune halos with insufficient dark matter membership.
+
+    New policy: remove only halos that contain fewer than 8 primary dark
+    matter particles (``ndm < 8``). All other halos are retained,
+    regardless of whether they currently host any galaxies.
+
+    This preserves a complete halo catalogue while filtering obvious
+    noise/singletons from AHF or selection artifacts.
+    """
 
     if not hasattr(sim, 'halo_list') or not sim.halo_list:
+        # Nothing to prune
+        try:
+            _update_ahf_halo_maps(sim)
+        except Exception:
+            pass
         return
 
     keep: List = []
     keep_indices: List[int] = []
 
+    def _dm_count(halo) -> int:
+        # Prefer explicit ndm if present
+        dm = getattr(halo, 'ndm', None)
+        if isinstance(dm, (int, np.integer)) and dm >= 0:
+            return int(dm)
+        # Fall back to length of dmlist
+        lst = getattr(halo, 'dmlist', None)
+        try:
+            if lst is None:
+                return 0
+            # numpy arrays have .size; lists have len()
+            return int(getattr(lst, 'size', len(lst)))
+        except Exception:
+            return 0
+
     for idx, halo in enumerate(sim.halo_list):
-        galaxy_indices = list(getattr(halo, 'galaxy_index_list', []))
-        if len(galaxy_indices) == 0:
-            continue
-        keep.append(halo)
-        keep_indices.append(idx)
+        if _dm_count(halo) >= 8:
+            keep.append(halo)
+            keep_indices.append(idx)
 
     if len(keep) == len(sim.halo_list):
         # nothing pruned
+        try:
+            _update_ahf_halo_maps(sim)
+        except Exception:
+            pass
         return
 
+    # Remap galaxy parent indices onto compacted halo indices
     old_to_new = {old: new for new, old in enumerate(keep_indices)}
 
     for gal in getattr(sim, 'galaxy_list', []):
@@ -297,16 +328,32 @@ def _prune_halos_after_galaxies(sim) -> None:
 
     for new_idx, halo in enumerate(keep):
         halo.GroupID = new_idx
-        halo.galaxy_index_list = [gi for gi in getattr(halo, 'galaxy_index_list', []) if getattr(sim.galaxy_list[gi], 'parent_halo_index', -1) == new_idx]
+        try:
+            halo.galaxy_index_list = [
+                gi for gi in getattr(halo, 'galaxy_index_list', [])
+                if getattr(sim.galaxy_list[gi], 'parent_halo_index', -1) == new_idx
+            ]
+        except Exception:
+            pass
 
     if hasattr(sim, '_ahf_galaxy_hosts'):
-        sim._ahf_galaxy_hosts = [old_to_new.get(h, -1) if h is not None and h >= 0 else -1 for h in sim._ahf_galaxy_hosts]
+        try:
+            sim._ahf_galaxy_hosts = [
+                old_to_new.get(h, -1) if h is not None and h >= 0 else -1
+                for h in sim._ahf_galaxy_hosts
+            ]
+        except Exception:
+            pass
 
     sim.halo_list = keep
     sim.halos = keep
     sim.nhalos = len(keep)
 
-    _update_ahf_halo_maps(sim)
+    # Refresh AHF ID maps for the new index layout
+    try:
+        _update_ahf_halo_maps(sim)
+    except Exception:
+        pass
 
 @dataclass
 class ParticleMembership:
@@ -1040,7 +1087,7 @@ def build_galaxies_from_ahf_fast(
     sim,
     ahf_particles_file: str,
     *,
-    min_stars: int = 16,
+    min_stars: Optional[int] = None,
     n_jobs: Optional[int] = None,
 ) -> None:
     """Build galaxies directly from AHF nodes using a star-count gate.
@@ -1052,6 +1099,10 @@ def build_galaxies_from_ahf_fast(
     from caesar.group import create_new_group
     from caesar.group import get_group_properties as _get_group_properties
     from caesar.property_manager import get_property, has_ptype
+
+    # Resolve minimum-star threshold from a single source (kwarg -> default)
+    from caesar.group import get_min_stars as _get_min_stars
+    min_stars = _get_min_stars(sim, override=min_stars)
 
     pid_maps_sel = _build_selected_pid_maps(sim)
     dm_pid_lookup = pid_maps_sel.get('dm')

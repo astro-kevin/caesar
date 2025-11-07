@@ -17,7 +17,7 @@ import h5py
 from yt.funcs import mylog
 from caesar.utils import memlog
 from caesar.property_manager import MY_DTYPE, get_property,has_ptype,ptype_ints
-from caesar.group import MINIMUM_STARS_PER_GALAXY, MINIMUM_DM_PER_HALO
+from caesar.group import MINIMUM_STARS_PER_GALAXY, MINIMUM_DM_PER_HALO, get_min_stars
 
 
 class _PidLookup(object):
@@ -339,7 +339,9 @@ class fof6d:
                                 continue
                             dm_count = np.sum(pdata[:, 1] == 1)
                             star_count = np.sum(pdata[:, 1] == 4)
-                            if dm_count < MINIMUM_DM_PER_HALO and star_count < MINIMUM_STARS_PER_GALAXY:
+                            # Use unified min_stars threshold
+                            ms = get_min_stars(self.obj)
+                            if dm_count < MINIMUM_DM_PER_HALO and star_count < ms:
                                 local_children = [child for child in children_of.get(hid_val, []) if child in members]
                                 if not local_children:
                                     continue
@@ -479,7 +481,9 @@ class fof6d:
                 return False
         else:
             grpid = parent.tags_fof6d
-            if len(grpid[grpid>=0]) < MINIMUM_STARS_PER_GALAXY:
+            # Use unified min_stars threshold
+            ms = get_min_stars(self.obj)
+            if len(grpid[grpid>=0]) < ms:
                 self.nparttot = 0
                 return False
 
