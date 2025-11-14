@@ -270,14 +270,16 @@ def build_halos_from_ahf(sim, ahf_particles_file: str, *, full_particle_load: bo
 
 
 def _prune_halos_after_galaxies(sim) -> None:
-    """Prune halos with insufficient dark matter membership.
+    """Prune halos with insufficient dark matter membership without
+    breaking galaxy→halo ownership.
 
-    New policy: remove only halos that contain fewer than 8 primary dark
-    matter particles (``ndm < 8``). All other halos are retained,
-    regardless of whether they currently host any galaxies.
+    Policy:
+    - Always retain halos that host one or more galaxies
+      (len(galaxy_index_list) > 0).
+    - Among truly empty halos, prune those with ndm < 8.
 
-    This preserves a complete halo catalogue while filtering obvious
-    noise/singletons from AHF or selection artifacts.
+    This preserves the invariant that every galaxy lives in a halo while
+    still filtering obvious low-mass noise halos.
     """
 
     if not hasattr(sim, 'halo_list') or not sim.halo_list:
@@ -287,9 +289,6 @@ def _prune_halos_after_galaxies(sim) -> None:
         except Exception:
             pass
         return
-
-    keep: List = []
-    keep_indices: List[int] = []
 
     def _dm_count(halo) -> int:
         # Prefer explicit ndm if present
@@ -306,8 +305,17 @@ def _prune_halos_after_galaxies(sim) -> None:
         except Exception:
             return 0
 
+    keep: List = []
+    keep_indices: List[int] = []
+
     for idx, halo in enumerate(sim.halo_list):
-        if _dm_count(halo) >= 8:
+        # Never drop a halo that currently hosts galaxies
+        try:
+            has_gals = len(getattr(halo, 'galaxy_index_list', [])) > 0
+        except Exception:
+            has_gals = False
+
+        if has_gals or _dm_count(halo) >= 8:
             keep.append(halo)
             keep_indices.append(idx)
 
@@ -2180,17 +2188,30 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
             len(orphan_set),
         )
 
+    # Preserve pre-AHF host assignments as a fallback so that galaxies
+    # which cannot be matched to an AHF node keep their original halo.
+    original_hosts = [
+        getattr(g, 'parent_halo_index', -1) for g in getattr(sim, 'galaxy_list', [])
+    ]
+
     sim._ahf_galaxy_hosts = host_indices
 
-    # Rebuild halo->galaxy links based on the new mapping to avoid stale indices
+    # Rebuild halo->galaxy links based on the new mapping, falling back
+    # to the original host if the AHF mapping was unable to resolve one.
     for halo in sim.halo_list:
         halo.galaxy_index_list = []
 
     for gi, host_idx in enumerate(host_indices):
-        idx = int(host_idx) if host_idx is not None else -1
-        sim.galaxy_list[gi].parent_halo_index = idx
-        if idx >= 0 and idx < len(sim.halo_list):
-            sim.halo_list[idx].galaxy_index_list.append(gi)
+        new_idx = int(host_idx) if host_idx is not None else -1
+        old_idx = original_hosts[gi] if gi < len(original_hosts) else -1
+
+        if (new_idx is None or int(new_idx) < 0) and old_idx is not None and int(old_idx) >= 0:
+            new_idx = int(old_idx)
+
+        new_idx = int(new_idx)
+        sim.galaxy_list[gi].parent_halo_index = new_idx
+        if 0 <= new_idx < len(sim.halo_list):
+            sim.halo_list[new_idx].galaxy_index_list.append(gi)
 
     sim._ahf_galaxy_ahf_ids = normalized_ahf_ids
     for gi, ahf_id in enumerate(normalized_ahf_ids):
