@@ -7,8 +7,6 @@ located in SNAPDIR.  You can also set the number of cores used.
 Romeel Davé, 23 Apr 2020
 '''
 
-USE_VERSION = 'v0.2b' 
-
 import os
 import sys
 import yt
@@ -39,17 +37,7 @@ def reduce(SNAPLIST, SIM, SNAPDIR, CAESARLOC='Groups', FOF6DLOC='Groups', NPROC=
         ds  = yt.load(SNAP)
         obj = caesar.CAESAR(ds)
         redshift = obj.simulation.redshift
-        if USE_VERSION == 'v0.2b':
-            obj.member_search(haloid=HALOID,fof6d_file=FOF6DFILE,nproc=NPROC)
-        elif USE_VERSION == 'v0.1':
-            if not os.path.exists(FOF6DFILE):  # if no fof6d file, run fof6d and create file
-                print('Using caesar v0.1, running fof6d')
-                obj.member_search(blackholes=bhflag,fof_from_snap=1,fof6d=True,fof6d_outfile=FOF6DFILE,nproc=NPROC,compute_selfshielding=SELFSHIELD,v01_member_search=True)
-            else:  # use existing fof6d file
-                print('Using caesar_v0.1, inputting fof6d file')
-                obj.member_search(blackholes=bhflag,fof_from_snap=1,fof6d=True,fof6d_file=FOF6DFILE,nproc=NPROC,compute_selfshielding=SELFSHIELD,v01_member_search=True)
-        else:
-            obj.member_search()  # just try it and see what happens!
+        # Always use the modern FOF/SNAP member_search path (FOF_SNAP module).
+        obj.member_search(haloid=HALOID, fof6d_file=FOF6DFILE, nproc=NPROC)
 
         obj.save(CAESARFILE)
-

@@ -325,19 +325,26 @@ class CAESAR(object):
         """
         import caesar.assignment as assign
         import caesar.linking as link
+        from caesar.modes import Mode, resolve_mode
 
         self._args   = args
         self._kwargs = kwargs
 
-        if 'v01_member_search' in self._kwargs and self._kwargs['v01_member_search']:
-            from caesar.fubar import fubar
-            self.data_manager._member_search_init()
-            fubar(self, 'halo')
-            fubar(self, 'galaxy')
-            fubar(self,'cloud')
-        else:
-            from caesar.fubar_halo import fubar_halo
-            fubar_halo(self)
+        mode = resolve_mode(self._kwargs)
+
+        match mode:
+            case Mode.AHF_FAST:
+                from caesar import AHF_FAST
+
+                AHF_FAST.run(self)
+            case Mode.AHF:
+                from caesar import AHF
+
+                AHF.run(self)
+            case _:
+                from caesar import FOF_SNAP
+
+                FOF_SNAP.run(self)
 
         # If requested, reconcile with AHF before building links and centrals
         if (
