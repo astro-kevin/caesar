@@ -138,14 +138,32 @@ class fof6d:
                         for _ in range(count):
                             fh.readline()
 
-                    def _read_block(count):
-                        if count <= 0:
-                            return np.empty((0, 2), dtype=np.int64)
-                        block = np.loadtxt(fh, max_rows=count, dtype=np.int64)
-                        if block.size == 0:
-                            return np.empty((0, 2), dtype=np.int64)
-                        block = np.atleast_2d(block)
-                        return block.reshape(-1, 2)
+                def _read_block(count):
+                    if count <= 0:
+                        return np.empty((0, 2), dtype=np.int64)
+                    data = np.empty((count, 2), dtype=np.int64)
+                    filled = 0
+                    while filled < count:
+                        raw = fh.readline()
+                        if not raw:
+                            break
+                        stripped = raw.strip()
+                        if not stripped:
+                            continue
+                        parts = stripped.split()
+                        if len(parts) != 2:
+                            continue
+                        try:
+                            data[filled, 0] = int(parts[0])
+                            data[filled, 1] = int(parts[1])
+                        except Exception:
+                            continue
+                        filled += 1
+                    if filled == 0:
+                        return np.empty((0, 2), dtype=np.int64)
+                    if filled < count:
+                        return data[:filled].copy()
+                    return data
 
                     first_line = _read_nonempty_line()
                     if first_line is None:
@@ -232,7 +250,12 @@ class fof6d:
                         pid_vals = block[:, 0]
                         type_vals = block[:, 1]
                         hid_val = int(hid)
-                        for code, (lookup, tmpp) in lookup_map.items():
+                        present_codes = np.unique(type_vals)
+                        for code in present_codes:
+                            entry = lookup_map.get(int(code))
+                            if entry is None:
+                                continue
+                            lookup, tmpp = entry
                             mask = type_vals == code
                             if not np.any(mask):
                                 continue
@@ -314,35 +337,55 @@ class fof6d:
                                 arr = np.atleast_2d(arr).reshape(-1, 2)
                             members[int(hid_val)] = arr
 
-                        for hid_val in sorted(members.keys(), key=lambda h: _depth(h), reverse=True):
-                            parent = parent_of.get(hid_val, 0)
-                            if parent <= 0 or parent not in members:
-                                continue
-                            child_arr = members[hid_val]
-                            parent_arr = members[parent]
-                            if child_arr.size == 0 or parent_arr.size == 0:
-                                continue
-                            bary_mask = child_arr[:, 1] != 1
-                            if not np.any(bary_mask):
-                                continue
-                            baryons = child_arr[bary_mask]
-                            if baryons.size == 0:
-                                continue
-                            _, parent_idx, _ = np.intersect1d(parent_arr[:, 0], baryons[:, 0], return_indices=True)
-                            if parent_idx.size == 0:
-                                continue
-                            parent_arr = np.delete(parent_arr, parent_idx, axis=0)
-                            members[parent] = parent_arr
+                        if not members:
+                            return
 
+                        stacked = []
                         for hid_val, pdata in members.items():
                             if pdata.size == 0:
                                 continue
-                            dm_count = np.sum(pdata[:, 1] == 1)
-                            star_count = np.sum(pdata[:, 1] == 4)
-                            # Use unified min_stars threshold
-                            ms = get_min_stars(self.obj)
+                            depth_val = _depth(hid_val)
+                            depth_col = np.full(pdata.shape[0], depth_val, dtype=np.int16)
+                            hid_col = np.full(pdata.shape[0], np.int64(hid_val), dtype=np.int64)
+                            stacked.append(np.column_stack((pdata, depth_col, hid_col)))
+
+                        if not stacked:
+                            return
+
+                        combined = np.vstack(stacked)
+                        bary_mask = combined[:, 1] != 1
+                        baryons = combined[bary_mask]
+                        if baryons.size:
+                            order = np.lexsort((-baryons[:, 2], baryons[:, 0]))
+                            baryons = baryons[order]
+                            keep = np.ones(len(baryons), dtype=bool)
+                            keep[1:] = baryons[1:, 0] != baryons[:-1, 0]
+                            baryons = baryons[keep]
+                        dm_rows = combined[~bary_mask]
+
+                        reduced = []
+                        if dm_rows.size:
+                            reduced.append(dm_rows[:, [0, 1, 3]])
+                        if baryons.size:
+                            reduced.append(baryons[:, [0, 1, 3]])
+                        if not reduced:
+                            return
+                        final_rows = np.vstack(reduced)
+
+                        order = np.argsort(final_rows[:, 2], kind='mergesort')
+                        final_rows = final_rows[order]
+                        unique_hids, start_idx = np.unique(final_rows[:, 2], return_index=True)
+                        bounds = np.append(start_idx, len(final_rows))
+                        ms = get_min_stars(self.obj)
+
+                        for i, hid_val in enumerate(unique_hids):
+                            pdata = final_rows[bounds[i]:bounds[i + 1], :2]
+                            if pdata.size == 0:
+                                continue
+                            dm_count = int(np.sum(pdata[:, 1] == 1))
+                            star_count = int(np.sum(pdata[:, 1] == 4))
                             if dm_count < MINIMUM_DM_PER_HALO and star_count < ms:
-                                local_children = [child for child in children_of.get(hid_val, []) if child in members]
+                                local_children = [child for child in children_of.get(int(hid_val), []) if child in members]
                                 if not local_children:
                                     continue
                             tmppd = np.zeros((pdata.shape[0], 3), dtype=np.int64)
