@@ -138,32 +138,32 @@ class fof6d:
                         for _ in range(count):
                             fh.readline()
 
-                def _read_block(count):
-                    if count <= 0:
-                        return np.empty((0, 2), dtype=np.int64)
-                    data = np.empty((count, 2), dtype=np.int64)
-                    filled = 0
-                    while filled < count:
-                        raw = fh.readline()
-                        if not raw:
-                            break
-                        stripped = raw.strip()
-                        if not stripped:
-                            continue
-                        parts = stripped.split()
-                        if len(parts) != 2:
-                            continue
-                        try:
-                            data[filled, 0] = int(parts[0])
-                            data[filled, 1] = int(parts[1])
-                        except Exception:
-                            continue
-                        filled += 1
-                    if filled == 0:
-                        return np.empty((0, 2), dtype=np.int64)
-                    if filled < count:
-                        return data[:filled].copy()
-                    return data
+                    def _read_block(count):
+                        if count <= 0:
+                            return np.empty((0, 2), dtype=np.int64)
+                        data = np.empty((count, 2), dtype=np.int64)
+                        filled = 0
+                        while filled < count:
+                            raw = fh.readline()
+                            if not raw:
+                                break
+                            stripped = raw.strip()
+                            if not stripped:
+                                continue
+                            parts = stripped.split()
+                            if len(parts) != 2:
+                                continue
+                            try:
+                                data[filled, 0] = int(parts[0])
+                                data[filled, 1] = int(parts[1])
+                            except Exception:
+                                continue
+                            filled += 1
+                        if filled == 0:
+                            return np.empty((0, 2), dtype=np.int64)
+                        if filled < count:
+                            return data[:filled].copy()
+                        return data
 
                     first_line = _read_nonempty_line()
                     if first_line is None:
