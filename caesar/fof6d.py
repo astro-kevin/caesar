@@ -138,28 +138,28 @@ class fof6d:
                         for _ in range(count):
                             fh.readline()
 
-                def _read_block(count):
-                    if count <= 0:
-                        return np.empty((0, 2), dtype=np.int64)
-                    lines = []
-                    filled = 0
-                    while filled < count:
-                        raw = fh.readline()
-                        if not raw:
-                            break
-                        stripped = raw.strip()
-                        if not stripped:
-                            continue
-                        lines.append(stripped)
-                        filled += 1
-                    if not lines:
-                        return np.empty((0, 2), dtype=np.int64)
-                    buf = "\n".join(lines)
-                    arr = np.fromstring(buf, sep=' ', dtype=np.int64, count=2*len(lines))
-                    if arr.size == 0:
-                        return np.empty((0, 2), dtype=np.int64)
-                    arr = arr.reshape(-1, 2)
-                    return arr
+                    def _read_block(count):
+                        if count <= 0:
+                            return np.empty((0, 2), dtype=np.int64)
+                        lines = []
+                        filled = 0
+                        while filled < count:
+                            raw = fh.readline()
+                            if not raw:
+                                break
+                            stripped = raw.strip()
+                            if not stripped:
+                                continue
+                            lines.append(stripped)
+                            filled += 1
+                        if not lines:
+                            return np.empty((0, 2), dtype=np.int64)
+                        buf = "\n".join(lines)
+                        arr = np.fromstring(buf, sep=' ', dtype=np.int64, count=2*len(lines))
+                        if arr.size == 0:
+                            return np.empty((0, 2), dtype=np.int64)
+                        arr = arr.reshape(-1, 2)
+                        return arr
 
                     first_line = _read_nonempty_line()
                     if first_line is None:
