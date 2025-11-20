@@ -138,32 +138,28 @@ class fof6d:
                         for _ in range(count):
                             fh.readline()
 
-                    def _read_block(count):
-                        if count <= 0:
-                            return np.empty((0, 2), dtype=np.int64)
-                        data = np.empty((count, 2), dtype=np.int64)
-                        filled = 0
-                        while filled < count:
-                            raw = fh.readline()
-                            if not raw:
-                                break
-                            stripped = raw.strip()
-                            if not stripped:
-                                continue
-                            parts = stripped.split()
-                            if len(parts) != 2:
-                                continue
-                            try:
-                                data[filled, 0] = int(parts[0])
-                                data[filled, 1] = int(parts[1])
-                            except Exception:
-                                continue
-                            filled += 1
-                        if filled == 0:
-                            return np.empty((0, 2), dtype=np.int64)
-                        if filled < count:
-                            return data[:filled].copy()
-                        return data
+                def _read_block(count):
+                    if count <= 0:
+                        return np.empty((0, 2), dtype=np.int64)
+                    lines = []
+                    filled = 0
+                    while filled < count:
+                        raw = fh.readline()
+                        if not raw:
+                            break
+                        stripped = raw.strip()
+                        if not stripped:
+                            continue
+                        lines.append(stripped)
+                        filled += 1
+                    if not lines:
+                        return np.empty((0, 2), dtype=np.int64)
+                    buf = "\n".join(lines)
+                    arr = np.fromstring(buf, sep=' ', dtype=np.int64, count=2*len(lines))
+                    if arr.size == 0:
+                        return np.empty((0, 2), dtype=np.int64)
+                    arr = arr.reshape(-1, 2)
+                    return arr
 
                     first_line = _read_nonempty_line()
                     if first_line is None:
@@ -249,14 +245,14 @@ class fof6d:
                         block = np.asarray(block, dtype=np.int64)
                         pid_vals = block[:, 0]
                         type_vals = block[:, 1]
+                        ptypes_present, inv = np.unique(type_vals, return_inverse=True)
                         hid_val = int(hid)
-                        present_codes = np.unique(type_vals)
-                        for code in present_codes:
+                        for code in ptypes_present:
                             entry = lookup_map.get(int(code))
                             if entry is None:
                                 continue
                             lookup, tmpp = entry
-                            mask = type_vals == code
+                            mask = inv == np.where(ptypes_present == code)[0][0]
                             if not np.any(mask):
                                 continue
                             indices, matched_mask = lookup.search(pid_vals[mask])
@@ -352,17 +348,18 @@ class fof6d:
                         if not stacked:
                             return
 
-                        combined = np.vstack(stacked)
+                        combined = np.vstack(stacked)  # cols: pid, ptype, depth, hid
+                        order = np.lexsort((-combined[:, 2], combined[:, 0]))
+                        combined = combined[order]
+
                         bary_mask = combined[:, 1] != 1
                         baryons = combined[bary_mask]
                         if baryons.size:
-                            order = np.lexsort((-baryons[:, 2], baryons[:, 0]))
-                            baryons = baryons[order]
                             keep = np.ones(len(baryons), dtype=bool)
                             keep[1:] = baryons[1:, 0] != baryons[:-1, 0]
                             baryons = baryons[keep]
-                        dm_rows = combined[~bary_mask]
 
+                        dm_rows = combined[~bary_mask]
                         reduced = []
                         if dm_rows.size:
                             reduced.append(dm_rows[:, [0, 1, 3]])
