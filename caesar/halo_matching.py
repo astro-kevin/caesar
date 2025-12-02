@@ -1941,15 +1941,23 @@ def _galaxies_to_namedata_from_group_list(galaxy_list, star_particle_ids) -> Lis
         membership.append(ParticleMembership(id=gid, parttype4=ids))
     return membership
 
+
+def _pid_to_index_map(arr: np.ndarray) -> Dict[int, int]:
+    """Build a simple PID -> index mapping for 1D arrays."""
+    # NOTE: This is intentionally simple and stable; it is used only for
+    # AHF star-overlap counting and does not change halo assignments.
+    return {int(pid): int(i) for i, pid in enumerate(np.asarray(arr, dtype=np.int64).reshape(-1).tolist())}
+
 def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=None) -> None:
-    """Integrate AHF matching per your spec, then prune and reassign.
+    """Integrate AHF matching per your spec, then prune and annotate.
 
     Matching policy:
     - For each CAESAR galaxy, record all AHF nodes whose star overlap > 50%.
     - After collecting candidates, choose the lowest-level (deepest) node.
-    - Then compute exclusives and reassign particle lists from that node.
+    - Then compute exclusives and annotate galaxies/halos with AHF IDs.
 
-    Honors ``sim.nproc`` for parallel selection across galaxies.
+    NOTE: This routine must **not** change which CAESAR halo a galaxy belongs
+    to; halo membership is defined by the 6D-FOF / build_halos_from_ahf path.
     """
     from caesar.property_manager import get_property, has_ptype
 
@@ -1968,13 +1976,6 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     # Must have a galaxy list already
     if not hasattr(sim, 'galaxy_list') or len(sim.galaxy_list) == 0:
         return
-
-    # Resolve n_jobs
-    n_jobs = getattr(sim, 'nproc', None)
-    try:
-        n_jobs = int(n_jobs) if n_jobs is not None else 1
-    except Exception:
-        n_jobs = 1
 
     # Star PID array and PID->index map
     star_ids = get_property(sim, 'pid', 'star').d.astype(np.int64)
@@ -2101,20 +2102,8 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
 
         return primary, best_hid
 
-    selection_info: List[Tuple[int, int]]
-    if n_jobs is not None and n_jobs > 1:
-        from joblib import Parallel, delayed
-
-        try:
-            selection_info = Parallel(
-                n_jobs=n_jobs,
-                backend='threading',
-                prefer='threads',
-            )(delayed(_select_for_gal)(gi) for gi in indices)
-        except Exception:
-            selection_info = [_select_for_gal(gi) for gi in indices]
-    else:
-        selection_info = [_select_for_gal(gi) for gi in indices]
+    # Selection over galaxies is cheap; keep this serial to keep logic simple.
+    selection_info: List[Tuple[int, int]] = [_select_for_gal(gi) for gi in indices]
 
     selected: List[int] = []
     for primary, best in selection_info:
@@ -2128,55 +2117,10 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     del indices
     del gal_to_counts
 
+    # Galaxy-level AHF node assignment (per-galaxy subhalo ID)
     galaxy_to_ahf_nodes = [int(h) if h is not None else -1 for h in selected]
 
-    final_galaxy_ahf_ids = list(galaxy_to_ahf_nodes)
-
     # Determine halo ownership using the AHF hierarchy
-    def _build_ahf_index_map() -> Dict[int, int]:
-        mapping: Dict[int, int] = {}
-        for halo_index, halo in enumerate(sim.halo_list):
-            ahf_hid = getattr(halo, 'AHF_haloID', None)
-            if ahf_hid is None:
-                continue
-            try:
-                mapping[int(ahf_hid)] = halo_index
-            except Exception:
-                continue
-        return mapping
-
-    def _resolve_halo_index(node_id: int, index_map: Dict[int, int]) -> int:
-        cur = int(node_id)
-        candidate = index_map.get(cur)
-        visited: Set[int] = set()
-        while True:
-            parent = parent_of.get(cur, 0)
-            if parent in (0, None):
-                return candidate if candidate is not None else -1
-            cur = int(parent)
-            if cur in visited:
-                break
-            visited.add(cur)
-            idx = index_map.get(cur)
-            if idx is not None:
-                candidate = idx
-        return candidate if candidate is not None else -1
-
-    def _assign_host_indices(index_map: Dict[int, int]) -> Tuple[List[int], List[int], Set[int]]:
-        host_list: List[int] = []
-        normalized_ids: List[int] = []
-        for node_id in final_galaxy_ahf_ids:
-            if node_id is None or node_id == -1:
-                normalized_ids.append(-1)
-                host_list.append(-1)
-                continue
-            top_id = int(node_id)
-            normalized_ids.append(top_id)
-            host_idx = _resolve_halo_index(top_id, index_map)
-            host_list.append(int(host_idx) if host_idx is not None else -1)
-        orphan_indices = {i for i, host_idx in enumerate(host_list) if host_idx is None or int(host_idx) < 0}
-        return host_list, normalized_ids, orphan_indices
-
     # Build mapping from selected AHF ID -> list of galaxy indices
     from collections import defaultdict as _dd
     mapping: Dict[int, List[int]] = _dd(list)
@@ -2196,8 +2140,18 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
 
     matched_ids = set(mapping.keys())
     if not matched_ids:
+        # No successful matches; just stash IDs and return without touching halos
+        sim._ahf_galaxy_hosts = [-1] * len(sim.galaxy_list)
+        sim._ahf_galaxy_ahf_ids = galaxy_to_ahf_nodes
+        for gi, node_id in enumerate(galaxy_to_ahf_nodes):
+            ahf_val = int(node_id) if node_id is not None and node_id >= 0 else -1
+            if gi < len(sim.galaxy_list):
+                setattr(sim.galaxy_list[gi], 'AHF_haloID', ahf_val)
+        _update_ahf_galaxy_maps(sim, galaxy_to_ahf_nodes)
         return
 
+    # We still compute exclusive memberships and AHF bookkeeping, but we
+    # deliberately do **not** remap CAESAR halo membership.
     pid_maps_sel: Dict[str, _PidLookup] = _build_selected_pid_maps(sim)
 
     def map_set(pidset: Set[int], key: str) -> np.ndarray:
@@ -2210,60 +2164,6 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
         return np.unique(mapped)
 
     exclusive_gal_dm = None
-
-    ahf_to_halo_index = _build_ahf_index_map()
-    host_indices, normalized_ahf_ids, orphan_set = _assign_host_indices(ahf_to_halo_index)
-
-    if orphan_set:
-        missing_halo_ids: Set[int] = {
-            normalized_ahf_ids[i]
-            for i in orphan_set
-            if i < len(normalized_ahf_ids) and normalized_ahf_ids[i] is not None and normalized_ahf_ids[i] >= 0
-        }
-        created_map = _ensure_missing_ahf_halos(sim, missing_halo_ids, ahf_particles_file, pid_maps_sel)
-        if created_map:
-            ahf_to_halo_index = _build_ahf_index_map()
-            host_indices, normalized_ahf_ids, orphan_set = _assign_host_indices(ahf_to_halo_index)
-
-    if orphan_set:
-        mylog.warning(
-            'AHF: %d galaxy(ies) reference host halos that were not loaded; keeping parent index = -1',
-            len(orphan_set),
-        )
-
-    # Preserve pre-AHF host assignments as a fallback so that galaxies
-    # which cannot be matched to an AHF node keep their original halo.
-    original_hosts = [
-        getattr(g, 'parent_halo_index', -1) for g in getattr(sim, 'galaxy_list', [])
-    ]
-
-    sim._ahf_galaxy_hosts = host_indices
-
-    # Rebuild halo->galaxy links based on the new mapping, falling back
-    # to the original host if the AHF mapping was unable to resolve one.
-    for halo in sim.halo_list:
-        halo.galaxy_index_list = []
-
-    for gi, host_idx in enumerate(host_indices):
-        new_idx = int(host_idx) if host_idx is not None else -1
-        old_idx = original_hosts[gi] if gi < len(original_hosts) else -1
-
-        if (new_idx is None or int(new_idx) < 0) and old_idx is not None and int(old_idx) >= 0:
-            new_idx = int(old_idx)
-
-        new_idx = int(new_idx)
-        sim.galaxy_list[gi].parent_halo_index = new_idx
-        if 0 <= new_idx < len(sim.halo_list):
-            sim.halo_list[new_idx].galaxy_index_list.append(gi)
-
-    sim._ahf_galaxy_ahf_ids = normalized_ahf_ids
-    for gi, ahf_id in enumerate(normalized_ahf_ids):
-        ahf_val = int(ahf_id) if ahf_id is not None and ahf_id >= 0 else -1
-        if gi < len(sim.galaxy_list):
-            setattr(sim.galaxy_list[gi], 'AHF_haloID', ahf_val)
-    _update_ahf_galaxy_maps(sim, normalized_ahf_ids)
-
-    _prune_halos_after_galaxies(sim)
 
     if do_ahf_check or do_ahf_assert:
         post_ngas = []
