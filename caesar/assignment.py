@@ -157,16 +157,41 @@ def assign_central_galaxies(obj,central_mass_definition='stellar'):
     obj.central_galaxies   = []
     obj.satellite_galaxies = []
 
-    # For each halo, choose the most massive galaxy among those already
-    # assigned to the halo via galaxy_index_list.
-    for halo in obj.halos:
-        if not hasattr(halo, 'galaxy_index_list') or len(halo.galaxy_index_list) == 0:
+    # Robust central selection: use both halo.galaxy_index_list and
+    # parent_halo_index so a central is found even if one of the lists
+    # is out-of-sync (e.g. after AHF bookkeeping).
+    for hid, halo in enumerate(obj.halos):
+        # Collect candidate galaxy indices for this halo
+        candidates = []
+        try:
+            if hasattr(halo, 'galaxy_index_list') and len(halo.galaxy_index_list) > 0:
+                candidates.extend(list(halo.galaxy_index_list))
+        except Exception:
+            pass
+        try:
+            # Union via parent_halo_index
+            for gi, gal in enumerate(obj.galaxies):
+                if getattr(gal, 'parent_halo_index', -1) == hid:
+                    candidates.append(gi)
+        except Exception:
+            pass
+
+        if not candidates:
             continue
 
+        # Deduplicate while preserving order
+        seen = set()
+        dedup = []
+        for gi in candidates:
+            if gi not in seen:
+                seen.add(gi)
+                dedup.append(gi)
+        candidates = dedup
+
+        # Choose the most massive by the requested mass definition
         masses = []
-        for gi in halo.galaxy_index_list:
+        for gi in candidates:
             m = obj.galaxies[gi].masses[central_mass_definition]
-            # Convert YTQuantity or numpy scalar to float robustly
             try:
                 val = float(getattr(m, 'd', m))
             except Exception:
@@ -176,18 +201,13 @@ def assign_central_galaxies(obj,central_mass_definition='stellar'):
                     val = 0.0
             masses.append(val)
 
-        if not masses:
+        if len(masses) == 0:
             continue
 
-        central_local = int(np.argmax(np.asarray(masses)))
-        central_gi = int(halo.galaxy_index_list[central_local])
+        central_index = int(np.argmax(np.asarray(masses)))
+        central_gi = int(candidates[central_index])
         central_gal = obj.galaxies[central_gi]
         central_gal.central = True
         obj.central_galaxies.append(central_gal)
 
-        # All other galaxies in this halo are satellites
-        for gi in halo.galaxy_index_list:
-            if gi == central_gi:
-                continue
-            sat_gal = obj.galaxies[gi]
-            obj.satellite_galaxies.append(sat_gal)
+    # Satellite lists are derived later in linking.create_sublists
