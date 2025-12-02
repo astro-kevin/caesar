@@ -39,25 +39,42 @@ def assign_galaxies_to_halos(obj):
                 galaxy.parent_halo_index = -1
                 pending.append(gi)
 
-        if not pending:
-            return
+        if pending:
+            # Fallback to particle-based assignment only for the unresolved galaxies.
+            h_glist = obj.global_particle_lists.halo_glist
+            h_slist = obj.global_particle_lists.halo_slist
+            for gi in pending:
+                galaxy = obj.galaxies[gi]
+                glist = h_glist[galaxy.glist]
+                slist = h_slist[galaxy.slist]
 
-        # Fallback to particle-based assignment only for the unresolved galaxies.
-        h_glist = obj.global_particle_lists.halo_glist
-        h_slist = obj.global_particle_lists.halo_slist
-        for gi in pending:
-            galaxy = obj.galaxies[gi]
-            glist = h_glist[galaxy.glist]
-            slist = h_slist[galaxy.slist]
+                combined = np.hstack((glist, slist))
+                valid = np.where(combined > -1)[0]
+                combined = combined[valid]
 
-            combined = np.hstack((glist, slist))
-            valid = np.where(combined > -1)[0]
-            combined = combined[valid]
+                if len(combined) > 0:
+                    parent_index = np.bincount(combined).argmax()
+                    galaxy.parent_halo_index = parent_index
+                    obj.halos[parent_index].galaxy_index_list.append(gi)
 
-            if len(combined) > 0:
-                parent_index = np.bincount(combined).argmax()
-                galaxy.parent_halo_index = parent_index
-                obj.halos[parent_index].galaxy_index_list.append(gi)
+        # Optional consistency assert: ensure that per-halo galaxy_index_list
+        # matches parent_halo_index for all galaxies. Enable via
+        # CAESAR_ASSERT_GALAXY_HOSTS=1.
+        import os
+        if os.environ.get('CAESAR_ASSERT_GALAXY_HOSTS', '0') == '1':
+            expected = {hid: [] for hid in range(len(obj.halos))}
+            for gi, gal in enumerate(obj.galaxies):
+                hid = getattr(gal, 'parent_halo_index', -1)
+                if isinstance(hid, (int, np.integer)) and hid >= 0 and hid < len(obj.halos):
+                    expected[hid].append(gi)
+            for hid, halo in enumerate(obj.halos):
+                got = list(getattr(halo, 'galaxy_index_list', []))
+                exp = expected.get(hid, [])
+                if sorted(got) != sorted(exp):
+                    raise AssertionError(
+                        f'Galaxy/halo host mismatch for halo {hid}: '
+                        f'from parent_halo_index={sorted(exp)} vs galaxy_index_list={sorted(got)}'
+                    )
         return
 
     h_glist = obj.global_particle_lists.halo_glist
@@ -81,6 +98,23 @@ def assign_galaxies_to_halos(obj):
         galaxy = obj.galaxies[i]
         if galaxy.parent_halo_index > -1:
             obj.halos[galaxy.parent_halo_index].galaxy_index_list.append(i)
+
+    # Optional consistency assert for the non-override path as well.
+    import os
+    if os.environ.get('CAESAR_ASSERT_GALAXY_HOSTS', '0') == '1':
+        expected = {hid: [] for hid in range(len(obj.halos))}
+        for gi, gal in enumerate(obj.galaxies):
+            hid = getattr(gal, 'parent_halo_index', -1)
+            if isinstance(hid, (int, np.integer)) and hid >= 0 and hid < len(obj.halos):
+                expected[hid].append(gi)
+        for hid, halo in enumerate(obj.halos):
+            got = list(getattr(halo, 'galaxy_index_list', []))
+            exp = expected.get(hid, [])
+            if sorted(got) != sorted(exp):
+                raise AssertionError(
+                    f'Galaxy/halo host mismatch for halo {hid}: '
+                    f'from parent_halo_index={sorted(exp)} vs galaxy_index_list={sorted(got)}'
+                )
 
 
 
@@ -157,41 +191,18 @@ def assign_central_galaxies(obj,central_mass_definition='stellar'):
     obj.central_galaxies   = []
     obj.satellite_galaxies = []
 
-    # Robust central selection: use both halo.galaxy_index_list and
-    # parent_halo_index so a central is found even if one of the lists
-    # is out-of-sync (e.g. after AHF bookkeeping).
-    for hid, halo in enumerate(obj.halos):
-        # Collect candidate galaxy indices for this halo
-        candidates = []
-        try:
-            if hasattr(halo, 'galaxy_index_list') and len(halo.galaxy_index_list) > 0:
-                candidates.extend(list(halo.galaxy_index_list))
-        except Exception:
-            pass
-        try:
-            # Union via parent_halo_index
-            for gi, gal in enumerate(obj.galaxies):
-                if getattr(gal, 'parent_halo_index', -1) == hid:
-                    candidates.append(gi)
-        except Exception:
-            pass
-
-        if not candidates:
+    # For each halo, choose the most massive galaxy among those already
+    # assigned to the halo via galaxy_index_list. We rely on
+    # assign_galaxies_to_halos (with optional assertions) to keep
+    # galaxy_index_list and parent_halo_index consistent.
+    for halo in obj.halos:
+        if not hasattr(halo, 'galaxy_index_list') or len(halo.galaxy_index_list) == 0:
             continue
 
-        # Deduplicate while preserving order
-        seen = set()
-        dedup = []
-        for gi in candidates:
-            if gi not in seen:
-                seen.add(gi)
-                dedup.append(gi)
-        candidates = dedup
-
-        # Choose the most massive by the requested mass definition
         masses = []
-        for gi in candidates:
+        for gi in halo.galaxy_index_list:
             m = obj.galaxies[gi].masses[central_mass_definition]
+            # Convert YTQuantity or numpy scalar to float robustly
             try:
                 val = float(getattr(m, 'd', m))
             except Exception:
@@ -201,13 +212,18 @@ def assign_central_galaxies(obj,central_mass_definition='stellar'):
                     val = 0.0
             masses.append(val)
 
-        if len(masses) == 0:
+        if not masses:
             continue
 
-        central_index = int(np.argmax(np.asarray(masses)))
-        central_gi = int(candidates[central_index])
+        central_local = int(np.argmax(np.asarray(masses)))
+        central_gi = int(halo.galaxy_index_list[central_local])
         central_gal = obj.galaxies[central_gi]
         central_gal.central = True
         obj.central_galaxies.append(central_gal)
 
-    # Satellite lists are derived later in linking.create_sublists
+        # All other galaxies in this halo are satellites
+        for gi in halo.galaxy_index_list:
+            if gi == central_gi:
+                continue
+            sat_gal = obj.galaxies[gi]
+            obj.satellite_galaxies.append(sat_gal)
