@@ -4,6 +4,33 @@ from typing import List
 
 from yt.funcs import mylog
 
+
+def _assert_galaxy_host_consistency(obj):
+    """Ensure parent_halo_index and halo.galaxy_index_list agree for all halos.
+
+    This is a sanity check that each top-level halo's membership is
+    internally consistent before assigning centrals.
+    """
+    if not getattr(obj, '_has_galaxies', False):
+        return
+
+    # Build expected membership from parent_halo_index
+    expected = {hid: [] for hid in range(len(obj.halos))}
+    for gi, gal in enumerate(obj.galaxies):
+        hid = getattr(gal, 'parent_halo_index', -1)
+        if isinstance(hid, (int, np.integer)) and 0 <= hid < len(obj.halos):
+            expected[hid].append(gi)
+
+    # Compare per-halo lists
+    for hid, halo in enumerate(obj.halos):
+        got = list(getattr(halo, 'galaxy_index_list', []))
+        exp = expected.get(hid, [])
+        if sorted(got) != sorted(exp):
+            raise AssertionError(
+                f"Galaxy/halo host mismatch for halo {hid}: "
+                f"from parent_halo_index={sorted(exp)} vs galaxy_index_list={sorted(got)}"
+            )
+
 def assign_galaxies_to_halos(obj):
     """Assign galaxies to halos.
 
@@ -22,7 +49,7 @@ def assign_galaxies_to_halos(obj):
         return
 
     mylog.info('Assigning galaxies to halos')
-    
+
     override_hosts = getattr(obj, '_ahf_galaxy_hosts', None)
 
     if override_hosts is not None and len(override_hosts) == obj.ngalaxies:
@@ -57,24 +84,6 @@ def assign_galaxies_to_halos(obj):
                     galaxy.parent_halo_index = parent_index
                     obj.halos[parent_index].galaxy_index_list.append(gi)
 
-        # Optional consistency assert: ensure that per-halo galaxy_index_list
-        # matches parent_halo_index for all galaxies. Enable via
-        # CAESAR_ASSERT_GALAXY_HOSTS=1.
-        import os
-        if os.environ.get('CAESAR_ASSERT_GALAXY_HOSTS', '0') == '1':
-            expected = {hid: [] for hid in range(len(obj.halos))}
-            for gi, gal in enumerate(obj.galaxies):
-                hid = getattr(gal, 'parent_halo_index', -1)
-                if isinstance(hid, (int, np.integer)) and hid >= 0 and hid < len(obj.halos):
-                    expected[hid].append(gi)
-            for hid, halo in enumerate(obj.halos):
-                got = list(getattr(halo, 'galaxy_index_list', []))
-                exp = expected.get(hid, [])
-                if sorted(got) != sorted(exp):
-                    raise AssertionError(
-                        f'Galaxy/halo host mismatch for halo {hid}: '
-                        f'from parent_halo_index={sorted(exp)} vs galaxy_index_list={sorted(got)}'
-                    )
         return
 
     h_glist = obj.global_particle_lists.halo_glist
@@ -99,22 +108,10 @@ def assign_galaxies_to_halos(obj):
         if galaxy.parent_halo_index > -1:
             obj.halos[galaxy.parent_halo_index].galaxy_index_list.append(i)
 
-    # Optional consistency assert for the non-override path as well.
-    import os
-    if os.environ.get('CAESAR_ASSERT_GALAXY_HOSTS', '0') == '1':
-        expected = {hid: [] for hid in range(len(obj.halos))}
-        for gi, gal in enumerate(obj.galaxies):
-            hid = getattr(gal, 'parent_halo_index', -1)
-            if isinstance(hid, (int, np.integer)) and hid >= 0 and hid < len(obj.halos):
-                expected[hid].append(gi)
-        for hid, halo in enumerate(obj.halos):
-            got = list(getattr(halo, 'galaxy_index_list', []))
-            exp = expected.get(hid, [])
-            if sorted(got) != sorted(exp):
-                raise AssertionError(
-                    f'Galaxy/halo host mismatch for halo {hid}: '
-                    f'from parent_halo_index={sorted(exp)} vs galaxy_index_list={sorted(got)}'
-                )
+    # assign_galaxies_to_halos is responsible for keeping
+    # parent_halo_index and galaxy_index_list in sync; consistency is
+    # enforced later by _assert_galaxy_host_consistency before
+    # centrals are chosen.
 
 
 
@@ -180,6 +177,11 @@ def assign_central_galaxies(obj,central_mass_definition='stellar'):
         return
 
     mylog.info('Assigning central galaxies')
+
+    # Before assigning centrals, enforce that per-halo galaxy_index_list
+    # matches parent_halo_index. Any mismatch here indicates a real
+    # bug in host bookkeeping that we should not paper over.
+    _assert_galaxy_host_consistency(obj)
 
     # Clear any previous central flags to avoid stale centrals after remapping
     try:
