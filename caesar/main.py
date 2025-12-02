@@ -378,10 +378,13 @@ class CAESAR(object):
             except Exception as exc:  # pragma: no cover - optional heavy deps
                 mylog.warning('Subhalo matching failed: %s' % exc)
 
-        # Build final membership lists and links
-        if not getattr(self, "_ahf_matched", False):
-            assign.assign_galaxies_to_halos(self)
-            assign.assign_clouds_to_galaxies(self)
+        # Build final membership lists and links.
+        # Always (re)assign galaxies and clouds to halos here so that
+        # parent_halo_index and halo.galaxy_index_list stay in sync.
+        # For AHF/AHF-FAST runs, assign_galaxies_to_halos respects any
+        # AHF-provided host overrides via obj._ahf_galaxy_hosts.
+        assign.assign_galaxies_to_halos(self)
+        assign.assign_clouds_to_galaxies(self)
 
         link.link_galaxies_and_halos(self)
         link.link_clouds_and_galaxies(self)
