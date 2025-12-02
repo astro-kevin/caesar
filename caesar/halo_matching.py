@@ -2107,12 +2107,14 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
         total = int(galaxy_star_counts[gi])
         thresh = 0.5 * total if total > 0 else 0
 
-        # Determine the best candidate above the threshold (if any)
-        cands = []
+        # Determine the best candidate above the threshold (if any).
+        # Prefer the AHF node with the *largest* overlap; among ties,
+        # choose the deepest node in the hierarchy.
+        cands: List[int] = []
         if total > 0:
             cands = [hid for hid, c in counts.items() if c > thresh]
         if cands:
-            cands.sort(key=lambda h: (depth(int(h)), counts[h], h))
+            cands.sort(key=lambda h: (counts[h], depth(int(h)), h))
             primary = int(cands[-1])
         else:
             primary = -1
