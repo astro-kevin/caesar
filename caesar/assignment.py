@@ -14,21 +14,32 @@ def _assert_galaxy_host_consistency(obj):
     if not getattr(obj, '_has_galaxies', False):
         return
 
-    # Build expected membership from parent_halo_index
-    expected = {hid: [] for hid in range(len(obj.halos))}
+    nhalo = len(obj.halos)
+    if nhalo == 0:
+        return
+
+    # 1) Collect parent_halo_index for all galaxies as a NumPy array
+    parent = np.empty(len(obj.galaxies), dtype=np.int64)
     for gi, gal in enumerate(obj.galaxies):
         hid = getattr(gal, 'parent_halo_index', -1)
-        if isinstance(hid, (int, np.integer)) and 0 <= hid < len(obj.halos):
-            expected[hid].append(gi)
+        try:
+            parent[gi] = int(hid)
+        except Exception:
+            parent[gi] = -1
 
-    # Compare per-halo lists
-    for hid, halo in enumerate(obj.halos):
-        got = list(getattr(halo, 'galaxy_index_list', []))
-        exp = expected.get(hid, [])
-        if sorted(got) != sorted(exp):
+    # 2) For each halo, compare expected membership from parent_halo_index
+    #    against the explicit galaxy_index_list
+    for hid in range(nhalo):
+        expected = np.where(parent == hid)[0]
+        got = np.asarray(getattr(obj.halos[hid], 'galaxy_index_list', []), dtype=np.int64)
+
+        expected_sorted = expected  # np.where returns sorted indices
+        got_sorted = np.sort(got)
+
+        if expected_sorted.shape != got_sorted.shape or not np.array_equal(expected_sorted, got_sorted):
             raise AssertionError(
                 f"Galaxy/halo host mismatch for halo {hid}: "
-                f"from parent_halo_index={sorted(exp)} vs galaxy_index_list={sorted(got)}"
+                f"from parent_halo_index={expected_sorted.tolist()} vs galaxy_index_list={got_sorted.tolist()}"
             )
 
 def assign_galaxies_to_halos(obj):
