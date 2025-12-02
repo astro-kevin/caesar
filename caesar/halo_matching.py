@@ -1976,13 +1976,9 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     except Exception:
         n_jobs = 1
 
-    # Star PID array and lookup helpers
+    # Star PID array and PID->index map
     star_ids = get_property(sim, 'pid', 'star').d.astype(np.int64)
-    star_ids = np.asarray(star_ids, dtype=np.int64)
-    if star_ids.ndim != 1:
-        star_ids = star_ids.reshape(-1)
-    star_order = np.argsort(star_ids, kind='mergesort')
-    star_ids_sorted = star_ids[star_order]
+    pid_to_star_index: Dict[int, int] = _pid_to_index_map(star_ids)
 
     # Build star_index (full per-type) -> galaxy_index map and per-galaxy star counts.
     # Convert CAESAR-selected star indices (gal.slist) to full per-type star indices via
@@ -2014,70 +2010,49 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     from collections import defaultdict
     gal_to_counts: List[Dict[int, int]] = [defaultdict(int) for _ in range(len(sim.galaxy_list))]
 
-    try:
-        chunk_env = int(_os.environ.get('CAESAR_AHF_STAR_BATCH', '256'))
-        star_batch_size = chunk_env if chunk_env > 0 else 256
-    except Exception:
-        star_batch_size = 256
+    def _open_particles(path: str):
+        if path.endswith('.gz'):
+            import gzip
+            return gzip.open(path, 'rt')
+        return open(path, 'r')
 
-    def _count_chunk(chunk):
-        rows = []
-        for hid_val, star_arr in chunk:
-            if star_arr is None:
+    with _open_particles(ahf_particles_file) as f:
+        current_hid = None
+        remaining = 0
+        for raw in f:
+            line = raw.strip()
+            if not line:
                 continue
-            star_arr = np.asarray(star_arr, dtype=np.int64)
-            if star_arr.ndim != 1:
-                star_arr = star_arr.reshape(-1)
-            if star_arr.size == 0:
+            parts = line.split()
+            if remaining == 0 and len(parts) == 2:
+                # Header line: "npart hid"
+                try:
+                    remaining = int(parts[0])
+                    current_hid = int(parts[1])
+                except Exception:
+                    current_hid = None
+                    remaining = 0
                 continue
-            idx = np.searchsorted(star_ids_sorted, star_arr)
-            valid = (idx < star_ids_sorted.size)
-            if not np.any(valid):
-                continue
-            idx = idx[valid]
-            star_hits = star_arr[valid]
-            match = star_ids_sorted[idx] == star_hits
-            if not np.any(match):
-                continue
-            idx = idx[match]
-            gal_idx = staridx_to_galidx[star_order][idx]
-            valid_gals = gal_idx >= 0
-            if not np.any(valid_gals):
-                continue
-            gal_idx = gal_idx[valid_gals]
-            unique_gals, counts = np.unique(gal_idx, return_counts=True)
-            chunk_rows = np.empty((unique_gals.size, 3), dtype=np.int64)
-            chunk_rows[:, 0] = unique_gals
-            chunk_rows[:, 1] = int(hid_val)
-            chunk_rows[:, 2] = counts.astype(np.int64, copy=False)
-            rows.append(chunk_rows)
-        if rows:
-            return np.vstack(rows)
-        return np.empty((0, 3), dtype=np.int64)
-
-    def _merge_counts(arr: np.ndarray) -> None:
-        if arr.size == 0:
-            return
-        for gi, hid_val, count in arr:
-            gal_to_counts[int(gi)][int(hid_val)] += int(count)
-
-    def _star_chunk_iter():
-        return _batched_iter(_iter_ahf_star_memberships(ahf_particles_file), star_batch_size)
-
-    if n_jobs is not None and n_jobs > 1:
-        from joblib import Parallel, delayed
-
-        try:
-            chunk_results = Parallel(n_jobs=n_jobs, backend='loky', batch_size='auto')(
-                delayed(_count_chunk)(chunk) for chunk in _star_chunk_iter()
-            )
-        except Exception:
-            chunk_results = [_count_chunk(chunk) for chunk in _star_chunk_iter()]
-        for arr in chunk_results:
-            _merge_counts(arr)
-    else:
-        for chunk in _star_chunk_iter():
-            _merge_counts(_count_chunk(chunk))
+            if remaining > 0:
+                remaining -= 1
+                pparts = line.split()
+                if len(pparts) != 2:
+                    continue
+                try:
+                    pid = int(pparts[0])
+                    ptype = int(pparts[1])
+                except Exception:
+                    continue
+                # Only consider stars for galaxy matching
+                if ptype != 4 or current_hid is None:
+                    continue
+                si = pid_to_star_index.get(pid)
+                if si is None:
+                    continue
+                gi = int(staridx_to_galidx[si])
+                if gi < 0:
+                    continue
+                gal_to_counts[gi][current_hid] += 1
 
     # Load AHF hierarchy to support lowest-level selection and exclusives
     parent_of, children_of = _read_ahf_hierarchy(ahf_particles_file)
@@ -2107,14 +2082,12 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
         total = int(galaxy_star_counts[gi])
         thresh = 0.5 * total if total > 0 else 0
 
-        # Determine the best candidate above the threshold (if any).
-        # Prefer the AHF node with the *largest* overlap; among ties,
-        # choose the deepest node in the hierarchy.
-        cands: List[int] = []
+        # Determine the best candidate above the threshold (if any)
+        cands = []
         if total > 0:
             cands = [hid for hid, c in counts.items() if c > thresh]
         if cands:
-            cands.sort(key=lambda h: (counts[h], depth(int(h)), h))
+            cands.sort(key=lambda h: (depth(int(h)), counts[h], h))
             primary = int(cands[-1])
         else:
             primary = -1
