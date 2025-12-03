@@ -447,6 +447,107 @@ def _build_numba_star_sets(memberships: List["ParticleMembership"]):
 if _NUMBA_AVAILABLE:
 
     @njit(parallel=True)
+    def _numba_select_ahf_for_gals(
+        gal_pid_lists,
+        node_pid_lists,
+        node_depth,
+        node_ids,
+        cand_node_lists,
+        galaxy_star_counts,
+    ):
+        """Numba-parallel selection of AHF nodes per galaxy using typed lists.
+
+        Parameters
+        ----------
+        gal_pid_lists : typed.List[np.ndarray]
+            Per-galaxy sorted, unique star PID arrays.
+        node_pid_lists : typed.List[np.ndarray]
+            Per-node sorted, unique star PID arrays, indexed in the same
+            order as ``node_ids`` and ``node_depth``.
+        node_depth : np.ndarray[int64]
+            Depth of each node in the AHF hierarchy.
+        node_ids : np.ndarray[int64]
+            AHF node ID for each node index.
+        cand_node_lists : typed.List[np.ndarray]
+            Per-galaxy arrays of candidate node indices (into node_pid_lists).
+        galaxy_star_counts : np.ndarray[int64]
+            Number of unique star particles per galaxy.
+
+        Returns
+        -------
+        primaries : np.ndarray[int64]
+            Selected AHF node ID per galaxy (or -1).
+        """
+        ngal = len(gal_pid_lists)
+        primaries = np.empty(ngal, dtype=np.int64)
+
+        # Parallelization is over galaxies.
+        for gi in prange(ngal):
+            gal_pids = gal_pid_lists[gi]
+            if gal_pids.size == 0:
+                primaries[gi] = -1
+                continue
+
+            total = int(galaxy_star_counts[gi])
+            if total <= 0:
+                primaries[gi] = -1
+                continue
+            thresh = 0.5 * total
+
+            cand_idx = cand_node_lists[gi]
+            if cand_idx.size == 0:
+                primaries[gi] = -1
+                continue
+
+            best_count = -1
+            best_hid = -1
+            best_major_depth = -1
+            best_major_count = -1
+            best_major_hid = -1
+
+            for ci in range(cand_idx.size):
+                node_index = int(cand_idx[ci])
+                node_pids = node_pid_lists[node_index]
+                if node_pids.size == 0:
+                    continue
+                # Both gal_pids and node_pids are sorted/unique.
+                c = np.intersect1d(gal_pids, node_pids, assume_unique=True).size
+                if c <= 0:
+                    continue
+
+                hid_val = int(node_ids[node_index])
+                # Fallback best-overlap node
+                if c > best_count or (c == best_count and hid_val > best_hid):
+                    best_count = c
+                    best_hid = hid_val
+
+                # Majority candidate: c > thresh
+                if c > thresh:
+                    d = int(node_depth[node_index])
+                    if (
+                        d > best_major_depth
+                        or (
+                            d == best_major_depth
+                            and (
+                                c > best_major_count
+                                or (c == best_major_count and hid_val > best_major_hid)
+                            )
+                        )
+                    ):
+                        best_major_depth = d
+                        best_major_count = c
+                        best_major_hid = hid_val
+
+            primary = -1
+            if best_major_hid != -1:
+                primary = best_major_hid
+            elif best_count > 0:
+                primary = best_hid
+            primaries[gi] = primary
+
+        return primaries
+
+    @njit(parallel=True)
     def _numba_match_galaxies_to_halos(gal_sets, gal_sizes, halo_sets, progress_proxy=None):
         ng = len(gal_sets)
         nh = len(halo_sets)
@@ -1981,12 +2082,15 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     star_ids = get_property(sim, 'pid', 'star').d.astype(np.int64)
     pid_to_star_index: Dict[int, int] = _pid_to_index_map(star_ids)
 
-    # Build star_index (full per-type) -> galaxy_index map and per-galaxy star counts.
+    # Build star_index (full per-type) -> galaxy_index map and per-galaxy star PID arrays.
     # Convert CAESAR-selected star indices (gal.slist) to full per-type star indices via
     # the concatenated-index mapping in DataManager (slist -> concatenated -> indexes -> full).
     nstar = len(star_ids)
     staridx_to_galidx = np.full(nstar, -1, dtype=np.int32)
     galaxy_star_counts = np.zeros(len(sim.galaxy_list), dtype=np.int64)
+    # Per-galaxy sorted, unique star PID arrays used for overlap calculations.
+    gal_star_pids: List[np.ndarray] = [np.empty(0, dtype=np.int64) for _ in range(len(sim.galaxy_list))]
+
     dm_slist = getattr(sim.data_manager, 'slist', None)
     if dm_slist is None:
         dm_slist = np.array([], dtype=np.int64)
@@ -2001,15 +2105,30 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
         try:
             concat_idx = dm_slist[sl]
             full_idx = sim.data_manager.indexes[concat_idx]
+            # Map full star indices to galaxy index for later PID-based overlap tracking
             staridx_to_galidx[full_idx] = gi
-            galaxy_star_counts[gi] = sl.size
+            # Build this galaxy's star PID array once; ensure sorted/unique so that
+            # later intersections can assume_unique=True.
+            gal_pids = star_ids[full_idx]
+            if gal_pids.size > 0:
+                gal_pids = np.unique(np.asarray(gal_pids, dtype=np.int64))
+            else:
+                gal_pids = np.empty(0, dtype=np.int64)
+            gal_star_pids[gi] = gal_pids
+            galaxy_star_counts[gi] = gal_pids.size
         except Exception:
             # If mapping fails for any reason, skip this galaxy for matching
             continue
 
-    # Read AHF particles file once and tally per-galaxy AHF star overlaps
-    from collections import defaultdict
-    gal_to_counts: List[Dict[int, int]] = [defaultdict(int) for _ in range(len(sim.galaxy_list))]
+    # Read AHF particles file once and, for each AHF node, build a 2D NumPy array
+    # with columns [pid, ptype] of length equal to the number of particles in that
+    # node (as given by the header "npart hid"). At the same time, record which
+    # AHF nodes each CAESAR galaxy touches so that we can restrict overlap checks
+    # to physically relevant candidates.
+    node_members: Dict[int, np.ndarray] = {}
+    node_write_pos: Dict[int, int] = {}
+    star_node_pids: Dict[int, np.ndarray] = {}
+    gal_candidate_nodes: List[Set[int]] = [set() for _ in range(len(sim.galaxy_list))]
 
     def _open_particles(path: str):
         if path.endswith('.gz'):
@@ -2033,6 +2152,10 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
                 except Exception:
                     current_hid = None
                     remaining = 0
+                # Preallocate per-node membership array sized by npart on first encounter.
+                if current_hid is not None and current_hid not in node_members and remaining > 0:
+                    node_members[current_hid] = np.empty((int(remaining), 2), dtype=np.int64)
+                    node_write_pos[current_hid] = 0
                 continue
             if remaining > 0:
                 remaining -= 1
@@ -2044,21 +2167,55 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
                     ptype = int(pparts[1])
                 except Exception:
                     continue
-                # Only consider stars for galaxy matching
-                if ptype != 4 or current_hid is None:
+                if current_hid is None:
                     continue
-                si = pid_to_star_index.get(pid)
-                if si is None:
-                    continue
-                gi = int(staridx_to_galidx[si])
-                if gi < 0:
-                    continue
-                gal_to_counts[gi][current_hid] += 1
+                # Fill per-node [pid, ptype] membership array
+                arr = node_members.get(current_hid)
+                if arr is not None and arr.size > 0:
+                    pos = node_write_pos.get(current_hid, 0)
+                    if pos < arr.shape[0]:
+                        arr[pos, 0] = pid
+                        arr[pos, 1] = ptype
+                        node_write_pos[current_hid] = pos + 1
+
+                # For galaxy matching we only care about stars that are in CAESAR
+                # galaxies; use these to build candidate node sets per galaxy.
+                if ptype == 4:
+                    si = pid_to_star_index.get(pid)
+                    if si is not None:
+                        gi = int(staridx_to_galidx[si])
+                        if gi >= 0:
+                            gal_candidate_nodes[gi].add(current_hid)
+
+                # If this was the last particle for this node, immediately
+                # finalize its star PID list as a sorted, unique array and
+                # discard the full membership array to save memory.
+                if remaining == 0 and current_hid is not None:
+                    arr = node_members.get(current_hid)
+                    if arr is not None and arr.size > 0:
+                        used = node_write_pos.get(current_hid, arr.shape[0])
+                        if used > 0:
+                            sub = arr[:used]
+                            star_mask = (sub[:, 1] == 4)
+                            if np.any(star_mask):
+                                star_pids = np.unique(sub[star_mask, 0].astype(np.int64))
+                            else:
+                                star_pids = np.empty(0, dtype=np.int64)
+                        else:
+                            star_pids = np.empty(0, dtype=np.int64)
+                        star_node_pids[current_hid] = star_pids
+                    if current_hid in node_members:
+                        del node_members[current_hid]
+                    if current_hid in node_write_pos:
+                        del node_write_pos[current_hid]
+
+    del node_members
+    del node_write_pos
 
     # Load AHF hierarchy to support lowest-level selection and exclusives
     parent_of, children_of = _read_ahf_hierarchy(ahf_particles_file)
 
-    # Cache depths for speed
+    # Cache depths and build dense node arrays for the Numba selector.
     depth_cache: Dict[int, int] = {}
     def depth(h: int) -> int:
         if h in depth_cache:
@@ -2074,48 +2231,163 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
         depth_cache[h] = d
         return d
 
-    # Choose selected AHF node per galaxy
-    indices = list(range(len(sim.galaxy_list)))
-    def _select_for_gal(gi: int) -> Tuple[int, int]:
-        counts = gal_to_counts[gi]
-        if not counts:
-            return -1, -1
-        total = int(galaxy_star_counts[gi])
-        thresh = 0.5 * total if total > 0 else 0
+    ngal = len(sim.galaxy_list)
 
-        # Determine the best candidate above the threshold (if any)
-        cands = []
-        if total > 0:
-            cands = [hid for hid, c in counts.items() if c > thresh]
-        if cands:
-            cands.sort(key=lambda h: (depth(int(h)), counts[h], h))
-            primary = int(cands[-1])
+    # Build dense node lists and depth arrays for Numba.
+    node_ids_list = sorted(star_node_pids.keys())
+    nnode = len(node_ids_list)
+    node_ids_arr = np.asarray(node_ids_list, dtype=np.int64)
+    node_depth = np.zeros(nnode, dtype=np.int64)
+    for idx, hid in enumerate(node_ids_list):
+        node_depth[idx] = depth(int(hid))
+
+    # Build mapping from AHF node ID to its dense index.
+    id_to_node_index: Dict[int, int] = {hid: i for i, hid in enumerate(node_ids_list)}
+
+    # Build typed lists for galaxies, nodes, and per-galaxy candidate node indices.
+    gal_pid_lists_nb = NumbaList()
+    for gi in range(ngal):
+        gal_pid_lists_nb.append(gal_star_pids[gi])
+
+    node_pid_lists_nb = NumbaList()
+    for hid in node_ids_list:
+        arr = star_node_pids.get(hid)
+        if arr is None:
+            arr = np.empty(0, dtype=np.int64)
+        node_pid_lists_nb.append(arr)
+
+    cand_node_lists_nb = NumbaList()
+    for gi in range(ngal):
+        cands = gal_candidate_nodes[gi]
+        if not cands:
+            cand_node_lists_nb.append(np.empty(0, dtype=np.int64))
+            continue
+        indices: List[int] = []
+        for hid in cands:
+            idx = id_to_node_index.get(hid, -1)
+            if idx >= 0:
+                indices.append(idx)
+        if indices:
+            cand_node_lists_nb.append(np.asarray(indices, dtype=np.int64))
         else:
-            primary = -1
+            cand_node_lists_nb.append(np.empty(0, dtype=np.int64))
 
-        # Always keep track of the best-overlap node for fallback purposes
-        best_hid, _ = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
-        best_hid = int(best_hid)
-
-        if primary == -1 and counts.get(best_hid, 0) > 0:
-            primary = best_hid
-
-        return primary, best_hid
-
-    # Selection over galaxies is cheap; keep this serial to keep logic simple.
-    selection_info: List[Tuple[int, int]] = [_select_for_gal(gi) for gi in indices]
-
+    # Choose selected AHF node per galaxy using Numba-parallel array-based
+    # intersections when available; fall back to the previous serial Python
+    # implementation otherwise.
     selected: List[int] = []
-    for primary, best in selection_info:
-        if primary is not None and primary != -1:
-            selected.append(int(primary))
-        else:
-            chosen = best if best is not None else -1
-            selected.append(int(chosen) if chosen != -1 else -1)
+    if _NUMBA_AVAILABLE:
+        try:
+            # Respect the CAESAR nproc setting if possible.
+            try:
+                set_num_threads(max(1, int(getattr(sim, 'nproc', 1))))
+            except Exception:
+                pass
+            primaries = _numba_select_ahf_for_gals(
+                gal_pid_lists_nb,
+                node_pid_lists_nb,
+                node_depth,
+                node_ids_arr,
+                cand_node_lists_nb,
+                galaxy_star_counts.astype(np.int64),
+            )
+            for gi in range(ngal):
+                val = int(primaries[gi])
+                selected.append(val if val != -1 else -1)
+        except Exception:
+            indices = list(range(len(sim.galaxy_list)))
+            def _select_for_gal(gi: int) -> Tuple[int, int]:
+                gal_pids = gal_star_pids[gi]
+                if gal_pids.size == 0:
+                    return -1, -1
+                candidates = gal_candidate_nodes[gi]
+                if not candidates:
+                    return -1, -1
+                counts: Dict[int, int] = {}
+                best_hid = -1
+                best_count = -1
+                for hid in candidates:
+                    node_pids = star_node_pids.get(hid)
+                    if node_pids is None or node_pids.size == 0:
+                        continue
+                    overlap = np.intersect1d(gal_pids, node_pids, assume_unique=True)
+                    c = int(overlap.size)
+                    if c <= 0:
+                        continue
+                    counts[hid] = c
+                    if c > best_count or (c == best_count and hid > best_hid):
+                        best_count = c
+                        best_hid = hid
+                if not counts:
+                    return -1, -1
+                total = int(galaxy_star_counts[gi])
+                thresh = 0.5 * total if total > 0 else 0
+                cands = []
+                if total > 0:
+                    cands = [hid for hid, c in counts.items() if c > thresh]
+                if cands:
+                    cands.sort(key=lambda h: (depth(int(h)), counts[h], h))
+                    primary = int(cands[-1])
+                else:
+                    primary = -1
+                if primary == -1 and best_count > 0:
+                    primary = int(best_hid)
+                return primary, best_hid
 
-    # Free large selection helpers once the mapping is built
-    del indices
-    del gal_to_counts
+            selection_info: List[Tuple[int, int]] = [_select_for_gal(gi) for gi in indices]
+            for primary, best in selection_info:
+                if primary is not None and primary != -1:
+                    selected.append(int(primary))
+                else:
+                    chosen = best if best is not None else -1
+                    selected.append(int(chosen) if chosen != -1 else -1)
+    else:
+        indices = list(range(len(sim.galaxy_list)))
+        def _select_for_gal(gi: int) -> Tuple[int, int]:
+            gal_pids = gal_star_pids[gi]
+            if gal_pids.size == 0:
+                return -1, -1
+            candidates = gal_candidate_nodes[gi]
+            if not candidates:
+                return -1, -1
+            counts: Dict[int, int] = {}
+            best_hid = -1
+            best_count = -1
+            for hid in candidates:
+                node_pids = star_node_pids.get(hid)
+                if node_pids is None or node_pids.size == 0:
+                    continue
+                overlap = np.intersect1d(gal_pids, node_pids, assume_unique=True)
+                c = int(overlap.size)
+                if c <= 0:
+                    continue
+                counts[hid] = c
+                if c > best_count or (c == best_count and hid > best_hid):
+                    best_count = c
+                    best_hid = hid
+            if not counts:
+                return -1, -1
+            total = int(galaxy_star_counts[gi])
+            thresh = 0.5 * total if total > 0 else 0
+            cands = []
+            if total > 0:
+                cands = [hid for hid, c in counts.items() if c > thresh]
+            if cands:
+                cands.sort(key=lambda h: (depth(int(h)), counts[h], h))
+                primary = int(cands[-1])
+            else:
+                primary = -1
+            if primary == -1 and best_count > 0:
+                primary = int(best_hid)
+            return primary, best_hid
+
+        selection_info: List[Tuple[int, int]] = [_select_for_gal(gi) for gi in indices]
+        for primary, best in selection_info:
+            if primary is not None and primary != -1:
+                selected.append(int(primary))
+            else:
+                chosen = best if best is not None else -1
+                selected.append(int(chosen) if chosen != -1 else -1)
 
     # Galaxy-level AHF node assignment (per-galaxy subhalo ID)
     galaxy_to_ahf_nodes = [int(h) if h is not None else -1 for h in selected]
