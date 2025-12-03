@@ -359,14 +359,14 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
         return
 
     # Star PID array and PID->index map
-    star_ids = get_property(sim, 'pid', 'star').d.astype(np.int64)
+    star_ids = get_property(sim, 'pid', 'star').d.astype(np.uint64)
     pid_to_star_index: Dict[int, int] = _pid_to_index_map(star_ids)
 
     # Build star_index -> galaxy_index map and per-galaxy star PID arrays.
     nstar = len(star_ids)
     staridx_to_galidx = np.full(nstar, -1, dtype=np.int32)
     galaxy_star_counts = np.zeros(len(sim.galaxy_list), dtype=np.int64)
-    gal_star_pids: List[np.ndarray] = [np.empty(0, dtype=np.int64) for _ in range(len(sim.galaxy_list))]
+    gal_star_pids: List[np.ndarray] = [np.empty(0, dtype=np.uint64) for _ in range(len(sim.galaxy_list))]
 
     dm_slist = getattr(sim.data_manager, 'slist', None)
     if dm_slist is None:
@@ -385,9 +385,9 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
             staridx_to_galidx[full_idx] = gi
             gal_pids = star_ids[full_idx]
             if gal_pids.size > 0:
-                gal_pids = np.unique(np.asarray(gal_pids, dtype=np.int64))
+                gal_pids = np.unique(np.asarray(gal_pids, dtype=np.uint64))
             else:
-                gal_pids = np.empty(0, dtype=np.int64)
+                gal_pids = np.empty(0, dtype=np.uint64)
             gal_star_pids[gi] = gal_pids
             galaxy_star_counts[gi] = gal_pids.size
         except Exception:
@@ -454,11 +454,11 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
                             sub = arr[:used]
                             star_mask = (sub[:, 1] == 4)
                             if np.any(star_mask):
-                                star_pids = np.unique(sub[star_mask, 0].astype(np.int64))
+                                star_pids = np.unique(sub[star_mask, 0].astype(np.uint64))
                             else:
-                                star_pids = np.empty(0, dtype=np.int64)
+                                star_pids = np.empty(0, dtype=np.uint64)
                         else:
-                            star_pids = np.empty(0, dtype=np.int64)
+                            star_pids = np.empty(0, dtype=np.uint64)
                         star_node_pids[current_hid] = star_pids
                     if current_hid in node_members:
                         del node_members[current_hid]
@@ -692,4 +692,3 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
 
 
 __all__ = ["integrate_ahf_match_prune_inplace"]
-
