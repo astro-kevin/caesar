@@ -261,6 +261,28 @@ def _update_ahf_halo_maps(sim) -> None:
     sim._ahf_halo_index_to_id = halo_map.inv
 
 
+@njit
+def _count_intersection_u64(a, b):
+    """Return the size of the intersection of two sorted, unique uint64 arrays."""
+    i = 0
+    j = 0
+    na = a.size
+    nb = b.size
+    count = 0
+    while i < na and j < nb:
+        av = a[i]
+        bv = b[j]
+        if av == bv:
+            count += 1
+            i += 1
+            j += 1
+        elif av < bv:
+            i += 1
+        else:
+            j += 1
+    return count
+
+
 @njit(parallel=True)
 def _numba_select_ahf_for_gals(
     gal_pid_lists,
@@ -302,7 +324,8 @@ def _numba_select_ahf_for_gals(
             node_pids = node_pid_lists[node_index]
             if node_pids.size == 0:
                 continue
-            c = np.intersect1d(gal_pids, node_pids, assume_unique=True).size
+            # Both gal_pids and node_pids are sorted/unique uint64 arrays.
+            c = _count_intersection_u64(gal_pids, node_pids)
             if c <= 0:
                 continue
 
