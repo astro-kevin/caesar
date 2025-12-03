@@ -153,7 +153,7 @@ def _ahf_fubar_halo(obj):
             and obj._kwargs['haloid'].upper() != 'AHF-FAST'
         ):
             try:
-                from caesar.halo_matching import integrate_ahf_match_prune_inplace
+                from caesar.ahf_match import integrate_ahf_match_prune_inplace
 
                 integrate_ahf_match_prune_inplace(obj, obj._kwargs['haloid_file'], fof_helper=galaxies)
                 setattr(obj, "_ahf_matched", True)
