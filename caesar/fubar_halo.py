@@ -108,7 +108,7 @@ def _ahf_fubar_halo(obj):
     # AHF-fast: build galaxies directly from AHF without 6D-FOF
     if 'haloid' in obj._kwargs and isinstance(obj._kwargs['haloid'], str) and obj._kwargs['haloid'].upper() == 'AHF-FAST' and 'haloid_file' in obj._kwargs:
         try:
-            from caesar.halo_matching import build_galaxies_from_ahf_fast
+            from caesar.ahf_fast_match import build_galaxies_from_ahf_fast
             from caesar.group import get_min_stars
             ms = get_min_stars(obj)
             build_galaxies_from_ahf_fast(obj, obj._kwargs['haloid_file'], min_stars=ms)

@@ -261,19 +261,18 @@ class fof6d:
                             tmpp[indices] = hid_val
                             nhid += indices.size
 
-                    if haloid_flag != 'ahf-fast':
-                        assigned = []
-                        for tmpp in tmpp_by_ptype.values():
-                            if tmpp.size:
-                                mapped = tmpp[tmpp >= 0]
-                                if mapped.size:
-                                    assigned.append(mapped)
-                        all_halo_ids = (
-                            np.concatenate(assigned).astype(np.int64, copy=False)
-                            if assigned
-                            else np.empty(0, dtype=np.int64)
-                        )
-                        self.obj.data_manager.haloid = all_halo_ids
+                    assigned = []
+                    for tmpp in tmpp_by_ptype.values():
+                        if tmpp.size:
+                            mapped = tmpp[tmpp >= 0]
+                            if mapped.size:
+                                assigned.append(mapped)
+                    all_halo_ids = (
+                        np.concatenate(assigned).astype(np.int64, copy=False)
+                        if assigned
+                        else np.empty(0, dtype=np.int64)
+                    )
+                    self.obj.data_manager.haloid = all_halo_ids
                     memlog('Total halo particle IDs = %d' % (nhid))
                     return
                 else: # use subhalo information as well, but very pain to remove these duplicated particles!!!!
@@ -319,8 +318,6 @@ class fof6d:
                             root = _resolve_root(hid_val)
                         host_to_nodes.setdefault(root, set()).add(int(hid_val))
 
-                    nodes_remaining = {root: len(nodes) for root, nodes in host_to_nodes.items()}
-                    pending_members = {}
                     records = []
 
                     def _process_host(root_id, bucket):
@@ -389,6 +386,9 @@ class fof6d:
                             tmppd[:, :2] = pdata
                             tmppd[:, 2] = np.int64(hid_val)
                             records.append(tmppd)
+
+                    nodes_remaining = {root: len(nodes) for root, nodes in host_to_nodes.items()}
+                    pending_members = {}
 
                     for _, hid_val, block in _stream_particle_blocks(host_only=False):
                         hid_int = int(hid_val)

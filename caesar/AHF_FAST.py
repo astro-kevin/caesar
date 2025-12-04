@@ -32,18 +32,18 @@ def run(obj):
     )
 
     if use_ahf_halos:
-        from caesar.halo_matching import build_halos_from_ahf
+        if obj._kwargs['haloid'].upper() == 'AHF-FAST':
+            from caesar.AHF_FAST_halos import build_halos_from_ahf_fast
 
-        full_particle_load = (
-            isinstance(obj._kwargs.get('haloid'), str)
-            and obj._kwargs['haloid'].upper() == 'AHF-FAST'
-        )
+            halos = build_halos_from_ahf_fast(obj, obj._kwargs['haloid_file'])
+        else:
+            from caesar.halo_matching import build_halos_from_ahf
 
-        halos = build_halos_from_ahf(
-            obj,
-            obj._kwargs['haloid_file'],
-            full_particle_load=full_particle_load,
-        )
+            halos = build_halos_from_ahf(
+                obj,
+                obj._kwargs['haloid_file'],
+                full_particle_load=False,
+            )
         if halos is None:
             return
     else:
@@ -73,7 +73,7 @@ def run(obj):
         and 'haloid_file' in obj._kwargs
     ):
         try:
-            from caesar.halo_matching import build_galaxies_from_ahf_fast
+            from caesar.ahf_fast_match import build_galaxies_from_ahf_fast
             from caesar.group import get_min_stars
 
             ms = get_min_stars(obj)
