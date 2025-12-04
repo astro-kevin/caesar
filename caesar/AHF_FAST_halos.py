@@ -26,11 +26,10 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
 
     from yt.funcs import mylog
 
-    from caesar.fof6d import fof6d
+    from caesar.fof6d import fof6d, _PidLookup
     from caesar.fubar import get_mean_interparticle_separation
     from caesar.group import get_group_properties
     from caesar.property_manager import get_property, has_ptype, ptype_ints
-    from caesar.ahf_match import _PidLookup
     from caesar.AHF_FAST_loader import load_ahf_hierarchy, load_ahf_particle_blocks
     from caesar.halo_matching import _update_ahf_halo_maps, _populate_hydrogen_masses
 
