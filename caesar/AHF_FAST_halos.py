@@ -88,6 +88,10 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
     # Instantiate fof6d helper for halos.
     halos = fof6d(sim, "halo")
     halos.MIS = get_mean_interparticle_separation(sim).d
+    # For AHF-FAST we want to retain even low-mass halos; pruning of
+    # DM-poor halos happens later (after galaxies are attached), so that
+    # every galaxy host AHF ID can resolve to a CAESAR halo.
+    halos.keep_all_groups = True
 
     # Build per-type PID lookups and haloID arrays.
     halos.haloid = {}
