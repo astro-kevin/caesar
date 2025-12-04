@@ -176,17 +176,6 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
         mylog.warning("AHF-FAST: no valid halos found; aborting member search")
         return None
 
-    # Annotate halos with their AHF IDs: fof6d.grouplist contains haloid-1.
-    try:
-        for idx, halo in enumerate(sim.halo_list):
-            try:
-                hid_minus1 = int(halos.grouplist[idx])
-            except Exception:
-                continue
-            halo.AHF_haloID = int(hid_minus1 + 1)
-    except Exception:
-        pass
-
     get_group_properties(halos, sim.halo_list)
 
     computed_hydrogen, halo_masses = _populate_hydrogen_masses(sim, sim.halo_list)
