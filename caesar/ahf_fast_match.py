@@ -28,6 +28,7 @@ def build_galaxies_from_ahf_fast(
     """
 
     from yt.funcs import mylog
+    import os as _os
     from tqdm import tqdm
     from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, ALL_COMPLETED
 
@@ -51,6 +52,15 @@ def build_galaxies_from_ahf_fast(
     from caesar.group import get_min_stars as _get_min_stars
 
     min_stars = _get_min_stars(sim, override=min_stars)
+
+    # Optional debug controls for the FAST path
+    debug_fast = _os.environ.get("CAESAR_AHF_FAST_DEBUG", "0") == "1"
+    debug_host: Optional[int]
+    try:
+        _h = _os.environ.get("CAESAR_AHF_FAST_DEBUG_HOST")
+        debug_host = int(_h) if _h not in (None, "") else None
+    except Exception:
+        debug_host = None
 
     pid_maps_sel = _build_selected_pid_maps(sim)
     dm_pid_lookup = pid_maps_sel.get("dm")
@@ -408,6 +418,23 @@ def build_galaxies_from_ahf_fast(
             except Exception:
                 continue
 
+        if debug_fast:
+            mylog.info(
+                "AHF-FAST debug: nhalos=%d, ngalaxies=%d",
+                len(sim.halo_list),
+                sim.ngalaxies,
+            )
+            if debug_host is not None:
+                present = any(
+                    int(getattr(h, "AHF_haloID", -1)) == debug_host
+                    for h in sim.halo_list
+                )
+                mylog.info(
+                    "AHF-FAST debug: host %d present in halo_list? %s",
+                    debug_host,
+                    present,
+                )
+
         def _resolve_halo_index(node_id: int) -> int:
             cur = int(node_id)
             visited: Set[int] = set()
@@ -436,6 +463,12 @@ def build_galaxies_from_ahf_fast(
             preliminary_indices.append(resolved)
         if missing_hosts:
             sample = list(sorted(missing_hosts))[:5]
+            if debug_fast:
+                mylog.info(
+                    "AHF-FAST debug: missing_hosts=%d example=%s",
+                    len(missing_hosts),
+                    sample,
+                )
             # Invariants for the AHF-FAST path: every galaxy host AHF ID
             # must correspond to an existing CAESAR halo built from the
             # top-level hosts.  If we ever violate this, we want an

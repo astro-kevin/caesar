@@ -25,6 +25,8 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
     """
 
     from yt.funcs import mylog
+    import os as _os
+    from collections import Counter as _Counter
 
     from caesar.fof6d import fof6d, _PidLookup
     from caesar.fubar import get_mean_interparticle_separation
@@ -35,6 +37,15 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
 
     if not ahf_particles_file:
         raise ValueError("AHF-FAST requires an AHF_particles file.")
+
+    # Optional debug controls
+    debug_fast = _os.environ.get("CAESAR_AHF_FAST_DEBUG", "0") == "1"
+    debug_host: Optional[int]
+    try:
+        _h = _os.environ.get("CAESAR_AHF_FAST_DEBUG_HOST")
+        debug_host = int(_h) if _h not in (None, "") else None
+    except Exception:
+        debug_host = None
 
     # Load hierarchy and cache it on the simulation for reuse by the
     # galaxy builder.
@@ -85,6 +96,14 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
             arr = arr.reshape(-1, 2)
         host_blocks.setdefault(int(root), []).append(arr)
 
+    if debug_fast:
+        example_hosts = sorted(host_blocks.keys())[:5]
+        mylog.info(
+            "AHF-FAST halos: n_hosts=%d example_host_ids=%s",
+            len(host_blocks),
+            example_hosts,
+        )
+
     # Instantiate fof6d helper for halos.
     halos = fof6d(sim, "halo")
     halos.MIS = get_mean_interparticle_separation(sim).d
@@ -125,6 +144,15 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
         type_vals = block[:, 1]
         ptypes_present, inv = np.unique(type_vals, return_inverse=True)
         hid_val = int(root_id)
+
+        if debug_fast and (debug_host is None or hid_val == debug_host):
+            counts = _Counter(type_vals.tolist())
+            mylog.info(
+                "AHF-FAST halos: host=%d AHF members per ptype_code=%s",
+                hid_val,
+                dict(counts),
+            )
+
         for code in ptypes_present:
             entry = lookup_map.get(int(code))
             if entry is None:
@@ -134,7 +162,16 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
             mask = inv == code_idx
             if not np.any(mask):
                 continue
-            indices, matched_mask = lookup.search(pid_vals[mask])
+            subset = pid_vals[mask]
+            indices, matched_mask = lookup.search(subset)
+            if debug_fast and (debug_host is None or hid_val == debug_host):
+                mylog.info(
+                    "AHF-FAST halos: host=%d ptype_code=%d subset=%d matched=%d",
+                    hid_val,
+                    int(code),
+                    subset.size,
+                    indices.size,
+                )
             if indices.size == 0:
                 continue
             tmpp[indices] = hid_val
