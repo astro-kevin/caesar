@@ -903,8 +903,20 @@ class fof6d:
                     parent.obj.halo_list[ihalo].galaxy_index_list.append(ngrp)
                     ngrp += 1
                 grp_list.append(mygrp)
-            #else:
-            #    print('Not selected halo -- ', self.grouplist[igrp] + 1, 'with ngas: ',len(mygrp.glist), 'nstar:', len(mygrp.slist),'ndm:',len(mygrp.dmlist))
+            else:
+                # Debug: log excluded halos
+                from yt.funcs import mylog
+                ahf_id = self.grouplist[igrp] + 1
+                mylog.warning(
+                    'fof6d load_lists: EXCLUDED %s id=%d (AHF_id=%d) '
+                    '_valid=%s keep_all=%s keep_all_groups=%s '
+                    'ngas=%d nstar=%d ndm=%d total=%d',
+                    self.obj_type, igrp, ahf_id,
+                    mygrp._valid, keep_all, getattr(self, 'keep_all_groups', 'NOT_SET'),
+                    getattr(mygrp, 'ngas', 0), getattr(mygrp, 'nstar', 0),
+                    getattr(mygrp, 'ndm', 0),
+                    getattr(mygrp, 'ngas', 0) + getattr(mygrp, 'nstar', 0) + getattr(mygrp, 'ndm', 0)
+                )
 
         if self.obj_type == 'halo':
             self.obj.halo_list = grp_list
