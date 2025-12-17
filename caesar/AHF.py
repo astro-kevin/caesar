@@ -3,6 +3,7 @@ from yt.funcs import mylog
 from caesar.fof6d import fof6d
 from caesar.fubar import get_mean_interparticle_separation
 from caesar.pipeline_utils import reset_global_particle_IDs, load_global_lists
+from caesar.utils import profile_section, print_profile_summary
 
 
 def run(obj):
@@ -39,11 +40,12 @@ def run(obj):
             and obj._kwargs['haloid'].upper() == 'AHF-FAST'
         )
 
-        halos = build_halos_from_ahf(
-            obj,
-            obj._kwargs['haloid_file'],
-            full_particle_load=full_particle_load,
-        )
+        with profile_section('AHF:build_halos_from_ahf'):
+            halos = build_halos_from_ahf(
+                obj,
+                obj._kwargs['haloid_file'],
+                full_particle_load=full_particle_load,
+            )
         if halos is None:
             return
     else:
@@ -77,7 +79,8 @@ def run(obj):
             from caesar.group import get_min_stars
 
             ms = get_min_stars(obj)
-            halos.run_fof6d('galaxy', minstars=ms)  # run fof6d on halos to find galaxies
+            with profile_section('AHF:run_fof6d_galaxies'):
+                halos.run_fof6d('galaxy', minstars=ms)  # run fof6d on halos to find galaxies
             halos.save_fof6dfile()  # save fof6d info
 
     # Process galaxies
@@ -99,7 +102,8 @@ def run(obj):
             try:
                 from caesar.ahf_match import integrate_ahf_match_prune_inplace
 
-                integrate_ahf_match_prune_inplace(obj, obj._kwargs['haloid_file'], fof_helper=galaxies)
+                with profile_section('AHF:integrate_ahf_match'):
+                    integrate_ahf_match_prune_inplace(obj, obj._kwargs['haloid_file'], fof_helper=galaxies)
                 setattr(obj, "_ahf_matched", True)
                 setattr(obj, "_include_dm_in_galaxies", True)
             except Exception as exc:  # pragma: no cover - optional heavy deps
@@ -108,7 +112,8 @@ def run(obj):
         from caesar.group import get_group_properties
 
         try:
-            get_group_properties(galaxies, galaxies.obj.galaxy_list)  # compute galaxy properties
+            with profile_section('AHF:get_galaxy_properties'):
+                get_group_properties(galaxies, galaxies.obj.galaxy_list)  # compute galaxy properties
         except Exception as exc:
             import traceback
 
@@ -136,5 +141,8 @@ def run(obj):
     reset_global_particle_IDs(obj)
     # load global lists
     load_global_lists(obj)
+
+    # Print profiling summary if enabled
+    print_profile_summary()
 
     return

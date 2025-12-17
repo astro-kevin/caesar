@@ -2,10 +2,116 @@ import numpy as np
 from yt.funcs import mylog
 import os
 import psutil
+import time
+from contextlib import contextmanager
+from functools import wraps
+
+# Global profiling data storage
+_profile_data = {}
+_profile_enabled = os.environ.get('CAESAR_PROFILE', '0') == '1'
+
 
 def memlog(msg):
     process = psutil.Process(os.getpid())
     mylog.info('%s, RAM=%.4g GB'%(msg,process.memory_info()[0]/2.**30))
+
+
+@contextmanager
+def profile_section(name: str, enabled: bool = None):
+    """Context manager for profiling code sections.
+
+    Parameters
+    ----------
+    name : str
+        Name of the code section being profiled
+    enabled : bool, optional
+        Override global profiling enable. If None, uses CAESAR_PROFILE env var.
+
+    Usage
+    -----
+    >>> with profile_section('load_ahf_file'):
+    ...     # code to profile
+    ...     pass
+
+    Output is logged as:
+        [PROFILE] load_ahf_file: 12.34s, mem_delta=0.123GB
+    """
+    should_profile = enabled if enabled is not None else _profile_enabled
+
+    if not should_profile:
+        yield
+        return
+
+    process = psutil.Process(os.getpid())
+    start_time = time.perf_counter()
+    start_mem = process.memory_info().rss
+
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start_time
+        end_mem = process.memory_info().rss
+        delta_mem = (end_mem - start_mem) / 2**30
+
+        _profile_data[name] = {
+            'time': elapsed,
+            'mem_delta_gb': delta_mem,
+            'peak_mem_gb': end_mem / 2**30
+        }
+        mylog.info('[PROFILE] %s: %.2fs, mem_delta=%.3fGB', name, elapsed, delta_mem)
+
+
+def profile_function(func):
+    """Decorator for function-level profiling.
+
+    Usage
+    -----
+    >>> @profile_function
+    ... def my_expensive_function():
+    ...     pass
+    """
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with profile_section(func.__name__):
+            return func(*args, **kwargs)
+    return wrapper
+
+
+def get_profile_summary():
+    """Return profiling summary sorted by time (descending).
+
+    Returns
+    -------
+    dict
+        Dictionary of profile data sorted by time, with keys as section names
+        and values as dicts with 'time', 'mem_delta_gb', 'peak_mem_gb'.
+    """
+    return dict(sorted(_profile_data.items(), key=lambda x: -x[1]['time']))
+
+
+def print_profile_summary():
+    """Print a formatted profiling summary to the log."""
+    if not _profile_data:
+        mylog.info('[PROFILE] No profiling data collected')
+        return
+
+    summary = get_profile_summary()
+    total_time = sum(v['time'] for v in summary.values())
+
+    mylog.info('[PROFILE] ======== Summary ========')
+    mylog.info('[PROFILE] Total profiled time: %.2fs', total_time)
+    mylog.info('[PROFILE] Section breakdown:')
+    for name, data in summary.items():
+        pct = (data['time'] / total_time * 100) if total_time > 0 else 0
+        mylog.info('[PROFILE]   %s: %.2fs (%.1f%%), mem_delta=%.3fGB',
+                   name, data['time'], pct, data['mem_delta_gb'])
+    mylog.info('[PROFILE] ============================')
+
+
+def clear_profile_data():
+    """Clear all collected profiling data."""
+    global _profile_data
+    _profile_data = {}
 
 def rotator(vals, ALPHA=0, BETA=0):
     """Rotate particle set around given angles.

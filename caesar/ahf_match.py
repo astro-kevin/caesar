@@ -23,6 +23,7 @@ from numba import njit, prange, set_num_threads
 from numba.typed import List as NumbaList
 
 from caesar.property_manager import get_property, has_ptype
+from caesar.utils import profile_section
 
 
 def _compute_mass_quantity(sim, value: float):
@@ -381,40 +382,41 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     if not hasattr(sim, 'galaxy_list') or len(sim.galaxy_list) == 0:
         return
 
-    # Star PID array and PID->index map
-    star_ids = get_property(sim, 'pid', 'star').d.astype(np.uint64)
-    pid_to_star_index: Dict[int, int] = _pid_to_index_map(star_ids)
+    with profile_section('ahf_match:setup_star_pid_maps'):
+        # Star PID array and PID->index map
+        star_ids = get_property(sim, 'pid', 'star').d.astype(np.uint64)
+        pid_to_star_index: Dict[int, int] = _pid_to_index_map(star_ids)
 
-    # Build star_index -> galaxy_index map and per-galaxy star PID arrays.
-    nstar = len(star_ids)
-    staridx_to_galidx = np.full(nstar, -1, dtype=np.int32)
-    galaxy_star_counts = np.zeros(len(sim.galaxy_list), dtype=np.int64)
-    gal_star_pids: List[np.ndarray] = [np.empty(0, dtype=np.uint64) for _ in range(len(sim.galaxy_list))]
+        # Build star_index -> galaxy_index map and per-galaxy star PID arrays.
+        nstar = len(star_ids)
+        staridx_to_galidx = np.full(nstar, -1, dtype=np.int32)
+        galaxy_star_counts = np.zeros(len(sim.galaxy_list), dtype=np.int64)
+        gal_star_pids: List[np.ndarray] = [np.empty(0, dtype=np.uint64) for _ in range(len(sim.galaxy_list))]
 
-    dm_slist = getattr(sim.data_manager, 'slist', None)
-    if dm_slist is None:
-        dm_slist = np.array([], dtype=np.int64)
-    for gi, gal in enumerate(sim.galaxy_list):
-        sl = getattr(gal, 'slist', [])
-        if sl is None:
-            continue
-        if not isinstance(sl, np.ndarray):
-            sl = np.array(list(sl), dtype=np.int64)
-        if sl.size == 0:
-            continue
-        try:
-            concat_idx = dm_slist[sl]
-            full_idx = sim.data_manager.indexes[concat_idx]
-            staridx_to_galidx[full_idx] = gi
-            gal_pids = star_ids[full_idx]
-            if gal_pids.size > 0:
-                gal_pids = np.unique(np.asarray(gal_pids, dtype=np.uint64))
-            else:
-                gal_pids = np.empty(0, dtype=np.uint64)
-            gal_star_pids[gi] = gal_pids
-            galaxy_star_counts[gi] = gal_pids.size
-        except Exception:
-            continue
+        dm_slist = getattr(sim.data_manager, 'slist', None)
+        if dm_slist is None:
+            dm_slist = np.array([], dtype=np.int64)
+        for gi, gal in enumerate(sim.galaxy_list):
+            sl = getattr(gal, 'slist', [])
+            if sl is None:
+                continue
+            if not isinstance(sl, np.ndarray):
+                sl = np.array(list(sl), dtype=np.int64)
+            if sl.size == 0:
+                continue
+            try:
+                concat_idx = dm_slist[sl]
+                full_idx = sim.data_manager.indexes[concat_idx]
+                staridx_to_galidx[full_idx] = gi
+                gal_pids = star_ids[full_idx]
+                if gal_pids.size > 0:
+                    gal_pids = np.unique(np.asarray(gal_pids, dtype=np.uint64))
+                else:
+                    gal_pids = np.empty(0, dtype=np.uint64)
+                gal_star_pids[gi] = gal_pids
+                galaxy_star_counts[gi] = gal_pids.size
+            except Exception:
+                continue
 
     # Read AHF particles file once and collate per-node memberships.
     node_members: Dict[int, np.ndarray] = {}
@@ -422,7 +424,7 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
     star_node_pids: Dict[int, np.ndarray] = {}
     gal_candidate_nodes: List[Set[int]] = [set() for _ in range(len(sim.galaxy_list))]
 
-    with _open_ahf_particles(ahf_particles_file) as f:
+    with profile_section('ahf_match:read_ahf_particles_file'), _open_ahf_particles(ahf_particles_file) as f:
         current_hid = None
         remaining = 0
         for raw in f:
@@ -489,60 +491,62 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
                         del node_write_pos[current_hid]
 
     # Build hierarchy and depth cache.
-    parent_of, children_of = _read_ahf_hierarchy(ahf_particles_file)
-    depth_cache: Dict[int, int] = {}
+    with profile_section('ahf_match:read_hierarchy_and_depth'):
+        parent_of, children_of = _read_ahf_hierarchy(ahf_particles_file)
+        depth_cache: Dict[int, int] = {}
 
-    def depth(h: int) -> int:
-        if h in depth_cache:
-            return depth_cache[h]
-        d = 0
-        cur = h
-        while True:
-            p = parent_of.get(cur, 0)
-            if p is None or p == 0:
-                break
-            d += 1
-            cur = p
-        depth_cache[h] = d
-        return d
+        def depth(h: int) -> int:
+            if h in depth_cache:
+                return depth_cache[h]
+            d = 0
+            cur = h
+            while True:
+                p = parent_of.get(cur, 0)
+                if p is None or p == 0:
+                    break
+                d += 1
+                cur = p
+            depth_cache[h] = d
+            return d
 
     # Prepare typed lists for Numba selector.
-    ngal = len(sim.galaxy_list)
-    node_ids_list = sorted(star_node_pids.keys())
-    nnode = len(node_ids_list)
-    node_ids_arr = np.asarray(node_ids_list, dtype=np.int64)
-    node_depth = np.zeros(nnode, dtype=np.int64)
-    for idx, hid in enumerate(node_ids_list):
-        node_depth[idx] = depth(int(hid))
+    with profile_section('ahf_match:prepare_numba_typed_lists'):
+        ngal = len(sim.galaxy_list)
+        node_ids_list = sorted(star_node_pids.keys())
+        nnode = len(node_ids_list)
+        node_ids_arr = np.asarray(node_ids_list, dtype=np.int64)
+        node_depth = np.zeros(nnode, dtype=np.int64)
+        for idx, hid in enumerate(node_ids_list):
+            node_depth[idx] = depth(int(hid))
 
-    id_to_node_index: Dict[int, int] = {hid: i for i, hid in enumerate(node_ids_list)}
+        id_to_node_index: Dict[int, int] = {hid: i for i, hid in enumerate(node_ids_list)}
 
-    gal_pid_lists_nb = NumbaList()
-    for gi in range(ngal):
-        gal_pid_lists_nb.append(gal_star_pids[gi])
+        gal_pid_lists_nb = NumbaList()
+        for gi in range(ngal):
+            gal_pid_lists_nb.append(gal_star_pids[gi])
 
-    node_pid_lists_nb = NumbaList()
-    for hid in node_ids_list:
-        arr = star_node_pids.get(hid)
-        if arr is None:
-            arr = np.empty(0, dtype=np.int64)
-        node_pid_lists_nb.append(arr)
+        node_pid_lists_nb = NumbaList()
+        for hid in node_ids_list:
+            arr = star_node_pids.get(hid)
+            if arr is None:
+                arr = np.empty(0, dtype=np.int64)
+            node_pid_lists_nb.append(arr)
 
-    cand_node_lists_nb = NumbaList()
-    for gi in range(ngal):
-        cands = gal_candidate_nodes[gi]
-        if not cands:
-            cand_node_lists_nb.append(np.empty(0, dtype=np.int64))
-            continue
-        indices: List[int] = []
-        for hid in cands:
-            idx = id_to_node_index.get(hid, -1)
-            if idx >= 0:
-                indices.append(idx)
-        if indices:
-            cand_node_lists_nb.append(np.asarray(indices, dtype=np.int64))
-        else:
-            cand_node_lists_nb.append(np.empty(0, dtype=np.int64))
+        cand_node_lists_nb = NumbaList()
+        for gi in range(ngal):
+            cands = gal_candidate_nodes[gi]
+            if not cands:
+                cand_node_lists_nb.append(np.empty(0, dtype=np.int64))
+                continue
+            indices: List[int] = []
+            for hid in cands:
+                idx = id_to_node_index.get(hid, -1)
+                if idx >= 0:
+                    indices.append(idx)
+            if indices:
+                cand_node_lists_nb.append(np.asarray(indices, dtype=np.int64))
+            else:
+                cand_node_lists_nb.append(np.empty(0, dtype=np.int64))
 
     # Run Numba selector (parallel) with fallback to Python if needed.
     selected: List[int] = []
@@ -551,14 +555,15 @@ def integrate_ahf_match_prune_inplace(sim, ahf_particles_file: str, fof_helper=N
             set_num_threads(max(1, int(getattr(sim, 'nproc', 1))))
         except Exception:
             pass
-        primaries = _numba_select_ahf_for_gals(
-            gal_pid_lists_nb,
-            node_pid_lists_nb,
-            node_depth,
-            node_ids_arr,
-            cand_node_lists_nb,
-            galaxy_star_counts.astype(np.int64),
-        )
+        with profile_section('ahf_match:numba_select_kernel'):
+            primaries = _numba_select_ahf_for_gals(
+                gal_pid_lists_nb,
+                node_pid_lists_nb,
+                node_depth,
+                node_ids_arr,
+                cand_node_lists_nb,
+                galaxy_star_counts.astype(np.int64),
+            )
         for gi in range(ngal):
             val = int(primaries[gi])
             selected.append(val if val != -1 else -1)
