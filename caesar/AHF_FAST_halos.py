@@ -177,6 +177,14 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
             tmpp[indices] = hid_val
             nhid += indices.size
 
+    # Diagnostic: check halos.haloid after mapping
+    if debug_fast and debug_host:
+        for ptype, arr in halos.haloid.items():
+            count = np.sum(arr == debug_host)
+            if count > 0:
+                mylog.info("AHF-FAST halos: after mapping, halos.haloid['%s'] has %d particles with id=%d",
+                          ptype, count, debug_host)
+
     memlog("AHF-FAST: total halo particle IDs = %d" % nhid)
 
     # Initialise member search using the host-only haloid mapping.
@@ -202,8 +210,21 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
     else:
         sim.data_manager.haloid = np.empty(0, dtype=np.int64)
 
+    # Diagnostic: check sim.data_manager.haloid after flattening
+    if debug_fast and debug_host:
+        count = np.sum(sim.data_manager.haloid == debug_host)
+        mylog.info("AHF-FAST halos: after flatten, sim.data_manager.haloid has %d instances of id=%d (total len=%d)",
+                  count, debug_host, len(sim.data_manager.haloid))
+
     if not halos.plist_init():
         return None
+
+    # Diagnostic: check grouplist after plist_init
+    if debug_fast and debug_host:
+        grpid_target = debug_host - 1  # grouplist stores haloid-1
+        present = grpid_target in halos.grouplist
+        mylog.info("AHF-FAST halos: after plist_init, grouplist has %d entries, target %d present? %s",
+                  len(halos.grouplist), grpid_target, present)
 
     halos.keep_all_groups = getattr(halos, "keep_all_groups", False)
     halos.load_lists()
