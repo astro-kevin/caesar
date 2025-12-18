@@ -1,12 +1,7 @@
-# Delay importing heavy modules that require ``yt``
-try:
-    from caesar.loader import load
-    from caesar.main import CAESAR
-    from caesar.driver import drive
-except Exception:  # pragma: no cover - optional dependency
-    load = None
-    CAESAR = None
-    drive = None
+# Import core modules
+from caesar.loader import load
+from caesar.main import CAESAR
+from caesar.driver import drive
 #from caesar.group_funcs import get_periodic_r
 
 from caesar.old_loader import load as old_load
