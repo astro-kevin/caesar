@@ -174,6 +174,14 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
                 )
             if indices.size == 0:
                 continue
+            # Diagnostic: detect when debug_host's particles are being overwritten
+            if debug_fast and debug_host and hid_val != debug_host:
+                overwritten = np.sum(tmpp[indices] == debug_host)
+                if overwritten > 0:
+                    mylog.warning(
+                        "AHF-FAST: host=%d is overwriting %d particles from debug_host=%d (ptype_code=%d)",
+                        hid_val, overwritten, debug_host, int(code)
+                    )
             tmpp[indices] = hid_val
             nhid += indices.size
 
