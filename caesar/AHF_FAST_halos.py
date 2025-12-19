@@ -185,6 +185,23 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
             tmpp[indices] = hid_val
             nhid += indices.size
 
+    # Count hosts that lost all their particles to other hosts ("stolen" hosts)
+    stolen_hosts = []
+    for root_id in host_blocks.keys():
+        # Count particles across all ptypes for this host
+        total_for_host = 0
+        for ptype, arr in halos.haloid.items():
+            total_for_host += np.sum(arr == root_id)
+        if total_for_host == 0:
+            stolen_hosts.append(root_id)
+    if stolen_hosts:
+        mylog.warning(
+            "AHF-FAST: %d hosts had ALL particles stolen by other hosts (MPI boundary artifacts). "
+            "Example IDs: %s",
+            len(stolen_hosts),
+            stolen_hosts[:5]
+        )
+
     # Diagnostic: check halos.haloid after mapping
     if debug_fast and debug_host:
         for ptype, arr in halos.haloid.items():
