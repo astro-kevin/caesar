@@ -462,22 +462,36 @@ def build_galaxies_from_ahf_fast(
                 missing_hosts.add(int(node_id))
             preliminary_indices.append(resolved)
         if missing_hosts:
-            sample = list(sorted(missing_hosts))[:5]
-            if debug_fast:
-                mylog.info(
-                    "AHF-FAST debug: missing_hosts=%d example=%s",
-                    len(missing_hosts),
-                    sample,
+            # Exclude stolen hosts (MPI boundary artifacts) from the error
+            stolen = getattr(sim, '_ahf_stolen_hosts', set())
+            genuine_missing = missing_hosts - stolen
+            stolen_missing = missing_hosts & stolen
+
+            if stolen_missing:
+                mylog.warning(
+                    "AHF-FAST: %d galaxy host(s) were stolen by other hosts (MPI artifacts), "
+                    "galaxies will have parent_halo_index=-1. Example IDs: %s",
+                    len(stolen_missing),
+                    list(sorted(stolen_missing))[:5]
                 )
-            # Invariants for the AHF-FAST path: every galaxy host AHF ID
-            # must correspond to an existing CAESAR halo built from the
-            # top-level hosts.  If we ever violate this, we want an
-            # immediate, loud failure rather than silently synthesizing
-            # halos from the particles file.
-            raise AssertionError(
-                f"AHF-FAST invariant violated: {len(missing_hosts)} galaxy host halo(s) "
-                f"were not resolved; example IDs {sample}"
-            )
+
+            if genuine_missing:
+                sample = list(sorted(genuine_missing))[:5]
+                if debug_fast:
+                    mylog.info(
+                        "AHF-FAST debug: missing_hosts=%d example=%s",
+                        len(genuine_missing),
+                        sample,
+                    )
+                # Invariants for the AHF-FAST path: every galaxy host AHF ID
+                # must correspond to an existing CAESAR halo built from the
+                # top-level hosts.  If we ever violate this, we want an
+                # immediate, loud failure rather than silently synthesizing
+                # halos from the particles file.
+                raise AssertionError(
+                    f"AHF-FAST invariant violated: {len(genuine_missing)} galaxy host halo(s) "
+                    f"were not resolved; example IDs {sample}"
+                )
         host_indices = preliminary_indices
     else:
         sim._ahf_galaxy_ahf_ids = []

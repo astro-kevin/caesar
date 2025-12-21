@@ -198,6 +198,8 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
             len(stolen_hosts),
             stolen_hosts[:5]
         )
+    # Store stolen hosts for use in galaxy matching (to suppress assertion errors)
+    sim._ahf_stolen_hosts = set(stolen_hosts)
 
     # Diagnostic: check halos.haloid after mapping
     if debug_fast and debug_host:
