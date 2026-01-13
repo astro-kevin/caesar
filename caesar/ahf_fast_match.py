@@ -469,11 +469,26 @@ def build_galaxies_from_ahf_fast(
 
             if stolen_missing:
                 mylog.warning(
-                    "AHF-FAST: %d galaxy host(s) were stolen by other hosts (MPI artifacts), "
-                    "galaxies will have parent_halo_index=-1. Example IDs: %s",
+                    "AHF-FAST: %d galaxy host(s) were stolen by other hosts (MPI artifacts). "
+                    "Example IDs: %s",
                     len(stolen_missing),
                     list(sorted(stolen_missing))[:5]
                 )
+                # Remove orphan galaxies whose host was stolen (MPI artifacts)
+                orphan_indices = [i for i, nid in enumerate(galaxy_node_ids)
+                                  if nid in stolen_missing]
+                if orphan_indices:
+                    # Remove in reverse order to preserve indices
+                    for i in sorted(orphan_indices, reverse=True):
+                        del sim.galaxy_list[i]
+                        del preliminary_indices[i]
+                        del galaxy_node_ids[i]
+                    sim.ngalaxies = len(sim.galaxy_list)
+                    sim._ahf_galaxy_ahf_ids = list(galaxy_node_ids)
+                    mylog.warning(
+                        "AHF-FAST: Removed %d orphan galaxies whose hosts were stolen",
+                        len(orphan_indices)
+                    )
 
             if genuine_missing:
                 sample = list(sorted(genuine_missing))[:5]
