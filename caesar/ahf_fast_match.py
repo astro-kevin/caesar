@@ -53,6 +53,25 @@ def build_galaxies_from_ahf_fast(
 
     min_stars = _get_min_stars(sim, override=min_stars)
 
+    # FOF integration: optionally run 6D FOF within each subhalo
+    use_fof = _os.environ.get("CAESAR_AHF_FAST_USE_FOF", "1") == "1"
+    if use_fof:
+        from caesar.fubar import get_mean_interparticle_separation, get_b
+        from caesar.fof6d import kernel_table, fof6d_halo
+        from caesar.property_manager import ptype_ints
+
+        # FOF parameters (same as regular AHF mode)
+        MIS = get_mean_interparticle_separation(sim).d
+        fof_LL = MIS * get_b(sim, 'galaxy')  # typically MIS * 0.02
+        vel_LL = 1.0
+        kerneltab = kernel_table(fof_LL)
+        Lbox = sim.simulation.boxsize.d
+        nHlim, Tlim = 0.13, 1e5
+        mylog.info("AHF-FAST: FOF integration enabled (fof_LL=%.4f, nHlim=%.2f, Tlim=%.0f)", fof_LL, nHlim, Tlim)
+    else:
+        mylog.info("AHF-FAST: FOF integration disabled (direct galaxy assignment)")
+        fof_LL = vel_LL = kerneltab = Lbox = nHlim = Tlim = None
+
     # Optional debug controls for the FAST path
     debug_fast = _os.environ.get("CAESAR_AHF_FAST_DEBUG", "0") == "1"
     debug_host: Optional[int]
@@ -137,6 +156,25 @@ def build_galaxies_from_ahf_fast(
             return mapped
         return np.unique(mapped)
 
+    def get_dense_gas_indices(gas_indices: np.ndarray) -> np.ndarray:
+        """Return gas indices that pass the dense gas gate (pre-FOF filtering).
+
+        Gate: nH > nHlim and (T < Tlim or SFR > 0)
+        Same criteria as standard FOF in fof6d.py setup_indexes().
+        """
+        if not use_fof or len(gas_indices) == 0:
+            return gas_indices
+        try:
+            dm = sim.data_manager
+            gnh = dm.gnh[gas_indices]
+            gT = dm.gT[gas_indices]
+            gsfr = dm.gsfr[gas_indices]
+            mask = (gnh > nHlim) & ((gT < Tlim) | (gsfr > 0))
+            return gas_indices[mask]
+        except Exception:
+            # If gas properties unavailable, return all gas
+            return gas_indices
+
     def _apply_dense_gas_gate(gal) -> None:
         """Optionally restrict galaxy gas to dense/cool/SF gas before computing properties.
 
@@ -183,8 +221,6 @@ def build_galaxies_from_ahf_fast(
 
         from collections import defaultdict as _dd
 
-        payloads: List[Tuple[int, Set[int], Set[int], Set[int], Set[int]]] = []
-
         depth_cache: Dict[int, int] = {}
 
         def node_depth(node: int) -> int:
@@ -202,7 +238,13 @@ def build_galaxies_from_ahf_fast(
         carry_bh = _dd(set)
         carry_dm = _dd(set)
 
+        # Claimed particle tracking (PIDs that have been assigned to galaxies)
+        claimed_star_pids: Set[int] = set()
+        claimed_gas_pids: Set[int] = set()
+        claimed_bh_pids: Set[int] = set()
+
         nodes_sorted = sorted(nodes_for_host, key=node_depth, reverse=True)
+        host_galaxies: List[Tuple[int, object]] = []
 
         for node in nodes_sorted:
             extras_star = carry_star.pop(node, set())
@@ -211,67 +253,155 @@ def build_galaxies_from_ahf_fast(
             extras_dm = carry_dm.pop(node, set())
 
             ex = exclusives.get(node, ParticleMembership(node))
-            star_set = set(ex.parttype4) | extras_star
-            gas_set = set(ex.parttype0) | extras_gas
-            bh_set = set(ex.parttype5) | extras_bh
+            # Subtract claimed particles from available particles
+            star_set = (set(ex.parttype4) | extras_star) - claimed_star_pids
+            gas_set = (set(ex.parttype0) | extras_gas) - claimed_gas_pids
+            bh_set = (set(ex.parttype5) | extras_bh) - claimed_bh_pids
             dm_exc_set = set(ex.parttype1) | extras_dm
 
-            if len(star_set) >= min_stars:
-                payloads.append((node, star_set, gas_set, bh_set, dm_exc_set))
-            else:
+            if len(star_set) < min_stars:
+                # Promote to parent
                 parent = parent_of.get(node, 0)
                 if parent not in (0, None):
                     carry_star[parent].update(star_set)
                     carry_gas[parent].update(gas_set)
                     carry_bh[parent].update(bh_set)
                     carry_dm[parent].update(dm_exc_set)
-
-        if not payloads:
-            return order_idx, []
-
-        host_galaxies: List[Tuple[int, object]] = []
-
-        for payload in payloads:
-            node_id, star_set, gas_set, bh_set, dm_exc = payload
-            dm_pm = bucket.get(node_id)
-            dm_inclusive = dm_pm.parttype1 if dm_pm is not None else set()
-            grp = create_new_group(sim, "galaxy")
-            grp.AHF_haloID = int(node_id)
-            grp.slist = map_sel(star_set, "star")
-            grp.glist = map_sel(gas_set, "gas")
-            _apply_dense_gas_gate(grp)
-            if "bh" in pid_maps_sel:
-                grp.bhlist = map_sel(bh_set, "bh")
-            if "dm" in pid_maps_sel:
-                dm_selected = map_sel(dm_inclusive, "dm")
-            else:
-                dm_selected = np.array([], dtype=np.int32)
-            grp.dmlist = dm_selected
-            grp.global_indexes = np.array([], dtype=np.int64)
-            if dm_exc:
-                grp.__dict__["_dm_exclusive_pids"] = set(dm_exc)
-            else:
-                grp.__dict__["_dm_exclusive_pids"] = set()
-
-            mapped_star = len(grp.slist) if hasattr(grp, "slist") else 0
-            mapped_gas = len(grp.glist) if hasattr(grp, "glist") else 0
-            mapped_bh = len(grp.bhlist) if hasattr(grp, "bhlist") else 0
-            mapped_dm = len(dm_selected)
-            particle_total = mapped_star + mapped_gas + mapped_bh + mapped_dm
-            if particle_total == 0:
-                skipped_empty_payloads += 1
-                if skipped_empty_payloads <= 10:
-                    mylog.warning(
-                        "AHF-FAST: node %d had %d star / %d gas / %d bh / %d dm particles "
-                        "from AHF but none mapped into CAESAR selection",
-                        node_id,
-                        len(star_set),
-                        len(gas_set),
-                        len(bh_set),
-                        len(dm_inclusive),
-                    )
                 continue
-            host_galaxies.append((int(node_id), grp))
+
+            # Map PIDs to indices
+            star_indices = map_sel(star_set, "star")
+            gas_indices = map_sel(gas_set, "gas")
+            bh_indices = map_sel(bh_set, "bh") if "bh" in pid_maps_sel else np.array([], dtype=np.int32)
+
+            # Get DM for later (not used in FOF)
+            dm_pm = bucket.get(node)
+            dm_inclusive = dm_pm.parttype1 if dm_pm is not None else set()
+
+            if use_fof and len(star_indices) >= min_stars:
+                # Apply dense gas gate BEFORE FOF
+                dense_gas_indices = get_dense_gas_indices(gas_indices)
+
+                # Combine eligible particles for FOF (dense gas + stars + bh)
+                fof_parts = [dense_gas_indices, star_indices]
+                if len(bh_indices) > 0:
+                    fof_parts.append(bh_indices)
+                fof_indices = np.concatenate(fof_parts) if any(len(p) > 0 for p in fof_parts) else np.array([], dtype=np.int32)
+
+                if len(fof_indices) < min_stars:
+                    # Not enough particles for FOF, promote to parent
+                    parent = parent_of.get(node, 0)
+                    if parent not in (0, None):
+                        carry_star[parent].update(star_set)
+                        carry_gas[parent].update(gas_set)
+                        carry_bh[parent].update(bh_set)
+                        carry_dm[parent].update(dm_exc_set)
+                    continue
+
+                # Get positions and velocities for FOF
+                pos = sim.data_manager.pos[fof_indices]
+                vel = sim.data_manager.vel[fof_indices]
+                fof_ptype = sim.data_manager.ptype[fof_indices]
+
+                # Run 6D FOF
+                fof_tags, n_galaxies = fof6d_halo(
+                    nparthalo=len(fof_indices),
+                    npart=len(fof_indices),
+                    pos=pos,
+                    vel=vel,
+                    minstars=min_stars,
+                    Lbox=Lbox,
+                    fof_LL=fof_LL,
+                    vel_LL=vel_LL,
+                    kerneltab=kerneltab,
+                )
+
+                if n_galaxies == 0:
+                    # No galaxies found, promote to parent
+                    parent = parent_of.get(node, 0)
+                    if parent not in (0, None):
+                        carry_star[parent].update(star_set)
+                        carry_gas[parent].update(gas_set)
+                        carry_bh[parent].update(bh_set)
+                        carry_dm[parent].update(dm_exc_set)
+                    continue
+
+                # Create galaxies from FOF groups
+                for gal_id in range(n_galaxies):
+                    gal_mask = fof_tags == gal_id
+                    gal_indices = fof_indices[gal_mask]
+
+                    # Separate by particle type
+                    gal_ptype = fof_ptype[gal_mask]
+                    gal_star = gal_indices[gal_ptype == ptype_ints['star']]
+                    gal_gas = gal_indices[gal_ptype == ptype_ints['gas']]
+                    gal_bh = gal_indices[gal_ptype == ptype_ints['bh']] if 'bh' in ptype_ints else np.array([], dtype=np.int32)
+
+                    if len(gal_star) < min_stars:
+                        continue
+
+                    # Create galaxy
+                    grp = create_new_group(sim, "galaxy")
+                    grp.AHF_haloID = int(node)
+                    grp.slist = gal_star
+                    grp.glist = gal_gas
+                    grp.bhlist = gal_bh if len(gal_bh) > 0 else np.array([], dtype=np.int32)
+                    # DM handled separately (use inclusive DM from node)
+                    dm_selected = map_sel(dm_inclusive, "dm") if "dm" in pid_maps_sel else np.array([], dtype=np.int32)
+                    grp.dmlist = dm_selected
+                    grp.global_indexes = np.array([], dtype=np.int64)
+                    if dm_exc_set:
+                        grp.__dict__["_dm_exclusive_pids"] = set(dm_exc_set)
+                    else:
+                        grp.__dict__["_dm_exclusive_pids"] = set()
+
+                    host_galaxies.append((int(node), grp))
+
+                # Mark ALL particles from this node as claimed (they participated in FOF)
+                claimed_star_pids.update(star_set)
+                claimed_gas_pids.update(gas_set)
+                claimed_bh_pids.update(bh_set)
+
+            else:
+                # Non-FOF path: direct galaxy assignment (original behavior)
+                grp = create_new_group(sim, "galaxy")
+                grp.AHF_haloID = int(node)
+                grp.slist = star_indices
+                grp.glist = gas_indices
+                _apply_dense_gas_gate(grp)
+                grp.bhlist = bh_indices
+                dm_selected = map_sel(dm_inclusive, "dm") if "dm" in pid_maps_sel else np.array([], dtype=np.int32)
+                grp.dmlist = dm_selected
+                grp.global_indexes = np.array([], dtype=np.int64)
+                if dm_exc_set:
+                    grp.__dict__["_dm_exclusive_pids"] = set(dm_exc_set)
+                else:
+                    grp.__dict__["_dm_exclusive_pids"] = set()
+
+                mapped_star = len(grp.slist) if hasattr(grp, "slist") else 0
+                mapped_gas = len(grp.glist) if hasattr(grp, "glist") else 0
+                mapped_bh = len(grp.bhlist) if hasattr(grp, "bhlist") else 0
+                mapped_dm = len(dm_selected)
+                particle_total = mapped_star + mapped_gas + mapped_bh + mapped_dm
+                if particle_total == 0:
+                    skipped_empty_payloads += 1
+                    if skipped_empty_payloads <= 10:
+                        mylog.warning(
+                            "AHF-FAST: node %d had %d star / %d gas / %d bh / %d dm particles "
+                            "from AHF but none mapped into CAESAR selection",
+                            node,
+                            len(star_set),
+                            len(gas_set),
+                            len(bh_set),
+                            len(dm_inclusive),
+                        )
+                    continue
+                host_galaxies.append((int(node), grp))
+
+                # Mark particles as claimed (non-FOF path)
+                claimed_star_pids.update(star_set)
+                claimed_gas_pids.update(gas_set)
+                claimed_bh_pids.update(bh_set)
 
         return order_idx, host_galaxies
 
