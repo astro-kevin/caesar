@@ -333,10 +333,32 @@ def build_galaxies_from_ahf_fast(
                         carry_dm[parent].update(dm_exc_set)
                     continue
 
-                # Get positions and velocities for FOF
-                pos = sim.data_manager.pos[fof_indices]
-                vel = sim.data_manager.vel[fof_indices]
-                fof_ptype = sim.data_manager.ptype[fof_indices]
+                # Get positions and velocities per particle type (indices are per-type, not global!)
+                # map_sel() returns indices into per-type arrays, so we must use get_property()
+                pos_parts = []
+                vel_parts = []
+
+                n_dense_gas = len(dense_gas_indices)
+                n_star = len(star_indices)
+                n_bh = len(bh_indices)
+
+                if n_dense_gas > 0:
+                    pos_parts.append(get_property(sim, "pos", "gas").d[dense_gas_indices])
+                    vel_parts.append(get_property(sim, "vel", "gas").d[dense_gas_indices])
+                if n_star > 0:
+                    pos_parts.append(get_property(sim, "pos", "star").d[star_indices])
+                    vel_parts.append(get_property(sim, "vel", "star").d[star_indices])
+                if n_bh > 0:
+                    pos_parts.append(get_property(sim, "pos", "bh").d[bh_indices])
+                    vel_parts.append(get_property(sim, "vel", "bh").d[bh_indices])
+
+                pos = np.concatenate(pos_parts) if pos_parts else np.empty((0, 3))
+                vel = np.concatenate(vel_parts) if vel_parts else np.empty((0, 3))
+
+                # Track slices for mapping FOF results back to per-type indices
+                fof_gas_end = n_dense_gas
+                fof_star_end = n_dense_gas + n_star
+                fof_bh_end = n_dense_gas + n_star + n_bh
 
                 # Run 6D FOF directly (bypass sorting pre-pass to avoid fragmenting small subhalos)
                 fof_tags, n_galaxies = run_fof6d_direct(
@@ -362,13 +384,16 @@ def build_galaxies_from_ahf_fast(
                 # Create galaxies from FOF groups
                 for gal_id in range(n_galaxies):
                     gal_mask = fof_tags == gal_id
-                    gal_indices = fof_indices[gal_mask]
 
-                    # Separate by particle type
-                    gal_ptype = fof_ptype[gal_mask]
-                    gal_star = gal_indices[gal_ptype == ptype_ints['star']]
-                    gal_gas = gal_indices[gal_ptype == ptype_ints['gas']]
-                    gal_bh = gal_indices[gal_ptype == ptype_ints['bh']] if 'bh' in ptype_ints else np.array([], dtype=np.int32)
+                    # Extract per-type indices using tracked slices
+                    gal_gas_mask = gal_mask[:fof_gas_end]
+                    gal_star_mask = gal_mask[fof_gas_end:fof_star_end]
+                    gal_bh_mask = gal_mask[fof_star_end:fof_bh_end] if n_bh > 0 else np.array([], dtype=bool)
+
+                    # Get the original per-type indices for particles in this galaxy
+                    gal_gas = dense_gas_indices[gal_gas_mask] if n_dense_gas > 0 else np.array([], dtype=np.int32)
+                    gal_star = star_indices[gal_star_mask] if n_star > 0 else np.array([], dtype=np.int32)
+                    gal_bh = bh_indices[gal_bh_mask] if n_bh > 0 else np.array([], dtype=np.int32)
 
                     if len(gal_star) < min_stars:
                         continue
