@@ -57,7 +57,7 @@ def build_galaxies_from_ahf_fast(
     use_fof = _os.environ.get("CAESAR_AHF_FAST_USE_FOF", "1") == "1"
     if use_fof:
         from caesar.fubar import get_mean_interparticle_separation, get_b
-        from caesar.fof6d import kernel_table, fof6d_halo
+        from caesar.fof6d import kernel_table, fof6d_main
         from caesar.property_manager import ptype_ints
 
         # FOF parameters (same as regular AHF mode)
@@ -68,6 +68,41 @@ def build_galaxies_from_ahf_fast(
         Lbox = sim.simulation.boxsize.d
         nHlim, Tlim = 0.13, 1e5
         mylog.info("AHF-FAST: FOF integration enabled (fof_LL=%.4f, nHlim=%.2f, Tlim=%.0f)", fof_LL, nHlim, Tlim)
+
+        def run_fof6d_direct(pos, vel, minstars, box_size, ll, vel_ll, ktab):
+            """Run 6D FOF directly without the sorting pre-pass that fragments small groups.
+
+            The standard fof6d_halo() function sorts particles spatially and splits
+            groups at gaps > fof_LL. This fragments small subhalos (barely meeting
+            min_stars) into pieces too small to survive. By calling fof6d_main()
+            directly with a single group, we skip this fragmentation.
+            """
+            npart = len(pos)
+            if npart < minstars:
+                return np.zeros(npart, dtype=np.int64) - 1, 0
+
+            # Call fof6d_main directly with a single group containing all particles
+            groups = [[0, npart]]
+            result = fof6d_main(
+                igrp=0,
+                groups=groups,
+                poslist=pos,    # [npart, ndim] format
+                vellist=vel,
+                kerneltab=ktab,
+                t0=0.,
+                Lbox=box_size,
+                mingrp=minstars,
+                fof_LL=ll,
+                vel_LL=vel_ll,
+            )
+
+            n_galaxies = result[0]
+            if n_galaxies > 0:
+                galind = np.asarray(result[1], dtype=np.int64)
+            else:
+                galind = np.zeros(npart, dtype=np.int64) - 1
+            return galind, n_galaxies
+
     else:
         mylog.info("AHF-FAST: FOF integration disabled (direct galaxy assignment)")
         fof_LL = vel_LL = kerneltab = Lbox = nHlim = Tlim = None
@@ -303,17 +338,15 @@ def build_galaxies_from_ahf_fast(
                 vel = sim.data_manager.vel[fof_indices]
                 fof_ptype = sim.data_manager.ptype[fof_indices]
 
-                # Run 6D FOF
-                fof_tags, n_galaxies = fof6d_halo(
-                    nparthalo=len(fof_indices),
-                    npart=len(fof_indices),
+                # Run 6D FOF directly (bypass sorting pre-pass to avoid fragmenting small subhalos)
+                fof_tags, n_galaxies = run_fof6d_direct(
                     pos=pos,
                     vel=vel,
                     minstars=min_stars,
-                    Lbox=Lbox,
-                    fof_LL=fof_LL,
-                    vel_LL=vel_LL,
-                    kerneltab=kerneltab,
+                    box_size=Lbox,
+                    ll=fof_LL,
+                    vel_ll=vel_LL,
+                    ktab=kerneltab,
                 )
 
                 if n_galaxies == 0:
