@@ -69,6 +69,13 @@ def build_galaxies_from_ahf_fast(
         nHlim, Tlim = 0.13, 1e5
         mylog.info("AHF-FAST: FOF integration enabled (fof_LL=%.4f, nHlim=%.2f, Tlim=%.0f)", fof_LL, nHlim, Tlim)
 
+        # Memory-aware throttling: limit concurrent heavy FOF operations to prevent OOM
+        # Large subhalos (>50k particles) use ~5GB each for neighbor data structures
+        import threading as _threading
+        HEAVY_FOF_THRESHOLD = 50000  # particles
+        MAX_CONCURRENT_HEAVY = 2     # max simultaneous heavy FOF jobs
+        heavy_fof_semaphore = _threading.Semaphore(MAX_CONCURRENT_HEAVY)
+
         def run_fof6d_direct(pos, vel, minstars, box_size, ll, vel_ll, ktab):
             """Run 6D FOF directly without the sorting pre-pass that fragments small groups.
 
@@ -360,16 +367,26 @@ def build_galaxies_from_ahf_fast(
                 fof_star_end = n_dense_gas + n_star
                 fof_bh_end = n_dense_gas + n_star + n_bh
 
-                # Run 6D FOF directly (bypass sorting pre-pass to avoid fragmenting small subhalos)
-                fof_tags, n_galaxies = run_fof6d_direct(
-                    pos=pos,
-                    vel=vel,
-                    minstars=min_stars,
-                    box_size=Lbox,
-                    ll=fof_LL,
-                    vel_ll=vel_LL,
-                    ktab=kerneltab,
-                )
+                # Memory-aware throttling: limit concurrent heavy FOF operations
+                n_particles = n_dense_gas + n_star + n_bh
+                is_heavy_fof = n_particles > HEAVY_FOF_THRESHOLD
+                if is_heavy_fof:
+                    heavy_fof_semaphore.acquire()
+
+                try:
+                    # Run 6D FOF directly (bypass sorting pre-pass to avoid fragmenting small subhalos)
+                    fof_tags, n_galaxies = run_fof6d_direct(
+                        pos=pos,
+                        vel=vel,
+                        minstars=min_stars,
+                        box_size=Lbox,
+                        ll=fof_LL,
+                        vel_ll=vel_LL,
+                        ktab=kerneltab,
+                    )
+                finally:
+                    if is_heavy_fof:
+                        heavy_fof_semaphore.release()
 
                 if n_galaxies == 0:
                     # No galaxies found, promote to parent
