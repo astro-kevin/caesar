@@ -69,12 +69,53 @@ def build_galaxies_from_ahf_fast(
         nHlim, Tlim = 0.13, 1e5
         mylog.info("AHF-FAST: FOF integration enabled (fof_LL=%.4f, nHlim=%.2f, Tlim=%.0f)", fof_LL, nHlim, Tlim)
 
-        # Memory-aware throttling: limit concurrent heavy FOF operations to prevent OOM
-        # Large subhalos (>50k particles) use ~5GB each for neighbor data structures
+        # Memory-aware throttling: limit concurrent FOF operations based on available RAM
         import threading as _threading
-        HEAVY_FOF_THRESHOLD = 50000  # particles
-        MAX_CONCURRENT_HEAVY = 2     # max simultaneous heavy FOF jobs
-        heavy_fof_semaphore = _threading.Semaphore(MAX_CONCURRENT_HEAVY)
+        import psutil as _psutil
+
+        class _MemoryAwareFOFThrottle:
+            """Throttles FOF operations based on actual available system memory."""
+
+            def __init__(self, reserve_gb=10.0, bytes_per_particle=100):
+                """
+                Args:
+                    reserve_gb: Keep this much memory free for system/other ops
+                    bytes_per_particle: Estimated FOF memory per particle
+                                       (~50 bytes neighbor data + overhead)
+                """
+                self.reserve_bytes = int(reserve_gb * 1024**3)
+                self.bytes_per_particle = bytes_per_particle
+                self.current_particles = 0
+                self.lock = _threading.Lock()
+                self.condition = _threading.Condition(self.lock)
+
+            def _get_particle_budget(self):
+                """Calculate particle budget from current available memory."""
+                available = _psutil.virtual_memory().available
+                usable = max(0, available - self.reserve_bytes)
+                return int(usable / self.bytes_per_particle)
+
+            def acquire(self, n_particles):
+                """Block until memory budget allows n_particles."""
+                with self.condition:
+                    while True:
+                        budget = self._get_particle_budget()
+                        # Always allow if nothing is running (prevents deadlock)
+                        # Otherwise, check if we fit in the budget
+                        if self.current_particles == 0 or \
+                           self.current_particles + n_particles <= budget:
+                            self.current_particles += n_particles
+                            return
+                        # Wait for release, re-check memory periodically
+                        self.condition.wait(timeout=1.0)
+
+            def release(self, n_particles):
+                """Release particles back to budget."""
+                with self.condition:
+                    self.current_particles -= n_particles
+                    self.condition.notify_all()
+
+        fof_throttle = _MemoryAwareFOFThrottle(reserve_gb=10.0, bytes_per_particle=100)
 
         def run_fof6d_direct(pos, vel, minstars, box_size, ll, vel_ll, ktab):
             """Run 6D FOF directly without the sorting pre-pass that fragments small groups.
@@ -367,11 +408,9 @@ def build_galaxies_from_ahf_fast(
                 fof_star_end = n_dense_gas + n_star
                 fof_bh_end = n_dense_gas + n_star + n_bh
 
-                # Memory-aware throttling: limit concurrent heavy FOF operations
+                # Memory-aware throttling: limit concurrent FOF based on available RAM
                 n_particles = n_dense_gas + n_star + n_bh
-                is_heavy_fof = n_particles > HEAVY_FOF_THRESHOLD
-                if is_heavy_fof:
-                    heavy_fof_semaphore.acquire()
+                fof_throttle.acquire(n_particles)
 
                 try:
                     # Run 6D FOF directly (bypass sorting pre-pass to avoid fragmenting small subhalos)
@@ -385,8 +424,7 @@ def build_galaxies_from_ahf_fast(
                         ktab=kerneltab,
                     )
                 finally:
-                    if is_heavy_fof:
-                        heavy_fof_semaphore.release()
+                    fof_throttle.release(n_particles)
 
                 if n_galaxies == 0:
                     # No galaxies found, promote to parent
