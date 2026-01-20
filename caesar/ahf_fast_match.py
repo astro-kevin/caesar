@@ -70,22 +70,26 @@ def build_galaxies_from_ahf_fast(
         mylog.info("AHF-FAST: FOF integration enabled (fof_LL=%.4f, nHlim=%.2f, Tlim=%.0f)", fof_LL, nHlim, Tlim)
 
         # Memory-aware throttling: limit concurrent FOF operations based on available RAM
+        # Large FOF ops (>100k particles) run one at a time to prevent OOM
         import threading as _threading
         import psutil as _psutil
 
-        class _MemoryAwareFOFThrottle:
-            """Throttles FOF operations based on actual available system memory."""
+        LARGE_FOF_THRESHOLD = 100000  # Particles - serialize FOF above this
+        BYTES_PER_PARTICLE = 2000     # Conservative estimate for dense regions (K~100 neighbors)
 
-            def __init__(self, reserve_gb=10.0, bytes_per_particle=100):
-                """
-                Args:
-                    reserve_gb: Keep this much memory free for system/other ops
-                    bytes_per_particle: Estimated FOF memory per particle
-                                       (~50 bytes neighbor data + overhead)
-                """
+        class _MemoryAwareFOFThrottle:
+            """Throttles FOF operations based on actual available system memory.
+
+            Large FOF operations (>LARGE_FOF_THRESHOLD particles) are strictly
+            serialized - only one can run at a time. Small FOF operations run
+            in parallel but respect memory budget.
+            """
+
+            def __init__(self, reserve_gb=10.0, bytes_per_particle=BYTES_PER_PARTICLE):
                 self.reserve_bytes = int(reserve_gb * 1024**3)
                 self.bytes_per_particle = bytes_per_particle
                 self.current_particles = 0
+                self.large_fof_running = False  # Track if a large FOF is running
                 self.lock = _threading.Lock()
                 self.condition = _threading.Condition(self.lock)
 
@@ -97,25 +101,37 @@ def build_galaxies_from_ahf_fast(
 
             def acquire(self, n_particles):
                 """Block until memory budget allows n_particles."""
+                is_large = n_particles > LARGE_FOF_THRESHOLD
                 with self.condition:
                     while True:
                         budget = self._get_particle_budget()
-                        # Always allow if nothing is running (prevents deadlock)
-                        # Otherwise, check if we fit in the budget
-                        if self.current_particles == 0 or \
-                           self.current_particles + n_particles <= budget:
-                            self.current_particles += n_particles
-                            return
+
+                        if is_large:
+                            # Large FOF: wait for ALL other FOF to finish (strict serialization)
+                            if self.current_particles == 0:
+                                self.current_particles = n_particles
+                                self.large_fof_running = True
+                                return
+                        else:
+                            # Small FOF: wait if large FOF running OR would exceed budget
+                            if not self.large_fof_running and \
+                               self.current_particles + n_particles <= budget:
+                                self.current_particles += n_particles
+                                return
+
                         # Wait for release, re-check memory periodically
                         self.condition.wait(timeout=1.0)
 
             def release(self, n_particles):
                 """Release particles back to budget."""
+                is_large = n_particles > LARGE_FOF_THRESHOLD
                 with self.condition:
                     self.current_particles -= n_particles
+                    if is_large:
+                        self.large_fof_running = False
                     self.condition.notify_all()
 
-        fof_throttle = _MemoryAwareFOFThrottle(reserve_gb=10.0, bytes_per_particle=100)
+        fof_throttle = _MemoryAwareFOFThrottle(reserve_gb=10.0, bytes_per_particle=BYTES_PER_PARTICLE)
 
         def run_fof6d_direct(pos, vel, minstars, box_size, ll, vel_ll, ktab):
             """Run 6D FOF directly without the sorting pre-pass that fragments small groups.
