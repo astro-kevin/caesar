@@ -70,68 +70,85 @@ def build_galaxies_from_ahf_fast(
         mylog.info("AHF-FAST: FOF integration enabled (fof_LL=%.4f, nHlim=%.2f, Tlim=%.0f)", fof_LL, nHlim, Tlim)
 
         # Memory-aware throttling: limit concurrent FOF operations based on available RAM
-        # Large FOF ops (>100k particles) run one at a time to prevent OOM
+        # Uses density-based estimation: Memory = N × (92 + K × 17) where K = avg neighbors
         import threading as _threading
         import psutil as _psutil
 
-        LARGE_FOF_THRESHOLD = 100000  # Particles - serialize FOF above this
-        BYTES_PER_PARTICLE = 2000     # Conservative estimate for dense regions (K~100 neighbors)
+        def estimate_fof_memory(pos, n_particles, linking_length):
+            """Estimate FOF memory usage from particle positions and linking length.
+
+            Memory = N × (92 + K × 17) bytes, where K = avg neighbors within fof_LL
+            K ≈ density × (4/3)π × fof_LL³
+
+            Args:
+                pos: Particle positions array (N, 3)
+                n_particles: Number of particles
+                linking_length: FOF linking length (fof_LL)
+
+            Returns:
+                Estimated memory in bytes
+            """
+            if n_particles == 0:
+                return 0
+
+            # Compute bounding box volume
+            bbox_min = pos.min(axis=0)
+            bbox_max = pos.max(axis=0)
+            bbox_size = bbox_max - bbox_min
+            # Avoid zero volume - use at least fof_LL in each dimension
+            bbox_size = np.maximum(bbox_size, linking_length)
+            volume = bbox_size[0] * bbox_size[1] * bbox_size[2]
+
+            # Estimate average density and neighbors
+            density = n_particles / volume
+            avg_neighbors = density * (4.0 / 3.0) * np.pi * linking_length**3
+
+            # Memory per particle = 92 (base) + K × 17 (per neighbor)
+            # Add 50% safety margin for sklearn overhead and temporary arrays
+            bytes_per_particle = (92 + avg_neighbors * 17) * 1.5
+
+            return int(n_particles * bytes_per_particle)
 
         class _MemoryAwareFOFThrottle:
-            """Throttles FOF operations based on actual available system memory.
+            """Throttles FOF operations based on estimated memory usage.
 
-            Large FOF operations (>LARGE_FOF_THRESHOLD particles) are strictly
-            serialized - only one can run at a time. Small FOF operations run
-            in parallel but respect memory budget.
+            Tracks actual bytes allocated (not particle count), allowing
+            multiple large FOF to run in parallel if memory permits.
             """
 
-            def __init__(self, reserve_gb=10.0, bytes_per_particle=BYTES_PER_PARTICLE):
+            def __init__(self, reserve_gb=10.0):
                 self.reserve_bytes = int(reserve_gb * 1024**3)
-                self.bytes_per_particle = bytes_per_particle
-                self.current_particles = 0
-                self.large_fof_running = False  # Track if a large FOF is running
+                self.current_memory = 0  # Track bytes, not particles
                 self.lock = _threading.Lock()
                 self.condition = _threading.Condition(self.lock)
 
-            def _get_particle_budget(self):
-                """Calculate particle budget from current available memory."""
+            def _get_available_memory(self):
+                """Get available memory after reserving headroom."""
                 available = _psutil.virtual_memory().available
-                usable = max(0, available - self.reserve_bytes)
-                return int(usable / self.bytes_per_particle)
+                return max(0, available - self.reserve_bytes)
 
-            def acquire(self, n_particles):
-                """Block until memory budget allows n_particles."""
-                is_large = n_particles > LARGE_FOF_THRESHOLD
+            def acquire(self, estimated_bytes):
+                """Block until estimated_bytes of memory is available."""
                 with self.condition:
                     while True:
-                        budget = self._get_particle_budget()
+                        available = self._get_available_memory()
 
-                        if is_large:
-                            # Large FOF: wait for ALL other FOF to finish (strict serialization)
-                            if self.current_particles == 0:
-                                self.current_particles = n_particles
-                                self.large_fof_running = True
-                                return
-                        else:
-                            # Small FOF: wait if large FOF running OR would exceed budget
-                            if not self.large_fof_running and \
-                               self.current_particles + n_particles <= budget:
-                                self.current_particles += n_particles
-                                return
+                        # Allow if: nothing running OR fits in available memory
+                        if self.current_memory == 0 or \
+                           self.current_memory + estimated_bytes <= available:
+                            self.current_memory += estimated_bytes
+                            return
 
                         # Wait for release, re-check memory periodically
                         self.condition.wait(timeout=1.0)
 
-            def release(self, n_particles):
-                """Release particles back to budget."""
-                is_large = n_particles > LARGE_FOF_THRESHOLD
+            def release(self, estimated_bytes):
+                """Release estimated_bytes back to the pool."""
                 with self.condition:
-                    self.current_particles -= n_particles
-                    if is_large:
-                        self.large_fof_running = False
+                    self.current_memory -= estimated_bytes
                     self.condition.notify_all()
 
-        fof_throttle = _MemoryAwareFOFThrottle(reserve_gb=10.0, bytes_per_particle=BYTES_PER_PARTICLE)
+        fof_throttle = _MemoryAwareFOFThrottle(reserve_gb=10.0)
 
         def run_fof6d_direct(pos, vel, minstars, box_size, ll, vel_ll, ktab):
             """Run 6D FOF directly without the sorting pre-pass that fragments small groups.
@@ -424,9 +441,10 @@ def build_galaxies_from_ahf_fast(
                 fof_star_end = n_dense_gas + n_star
                 fof_bh_end = n_dense_gas + n_star + n_bh
 
-                # Memory-aware throttling: limit concurrent FOF based on available RAM
+                # Memory-aware throttling: estimate actual memory usage from density
                 n_particles = n_dense_gas + n_star + n_bh
-                fof_throttle.acquire(n_particles)
+                estimated_memory = estimate_fof_memory(pos, n_particles, fof_LL)
+                fof_throttle.acquire(estimated_memory)
 
                 try:
                     # Run 6D FOF directly (bypass sorting pre-pass to avoid fragmenting small subhalos)
@@ -440,7 +458,7 @@ def build_galaxies_from_ahf_fast(
                         ktab=kerneltab,
                     )
                 finally:
-                    fof_throttle.release(n_particles)
+                    fof_throttle.release(estimated_memory)
 
                 if n_galaxies == 0:
                     # No galaxies found, promote to parent
