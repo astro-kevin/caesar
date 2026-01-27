@@ -30,7 +30,6 @@ def build_galaxies_from_ahf_fast(
     from yt.funcs import mylog
     import os as _os
     from tqdm import tqdm
-    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, ALL_COMPLETED
 
     from caesar.group import create_new_group
     from caesar.group import get_group_properties as _get_group_properties
@@ -68,87 +67,6 @@ def build_galaxies_from_ahf_fast(
         Lbox = sim.simulation.boxsize.d
         nHlim, Tlim = 0.13, 1e5
         mylog.info("AHF-FAST: FOF integration enabled (fof_LL=%.4f, nHlim=%.2f, Tlim=%.0f)", fof_LL, nHlim, Tlim)
-
-        # Memory-aware throttling: limit concurrent FOF operations based on available RAM
-        # Uses density-based estimation: Memory = N × (92 + K × 17) where K = avg neighbors
-        import threading as _threading
-        import psutil as _psutil
-
-        def estimate_fof_memory(pos, n_particles, linking_length):
-            """Estimate FOF memory usage from particle positions and linking length.
-
-            Memory = N × (92 + K × 17) bytes, where K = avg neighbors within fof_LL
-            K ≈ density × (4/3)π × fof_LL³
-
-            Args:
-                pos: Particle positions array (N, 3)
-                n_particles: Number of particles
-                linking_length: FOF linking length (fof_LL)
-
-            Returns:
-                Estimated memory in bytes
-            """
-            if n_particles == 0:
-                return 0
-
-            # Compute bounding box volume
-            bbox_min = pos.min(axis=0)
-            bbox_max = pos.max(axis=0)
-            bbox_size = bbox_max - bbox_min
-            # Avoid zero volume - use at least fof_LL in each dimension
-            bbox_size = np.maximum(bbox_size, linking_length)
-            volume = bbox_size[0] * bbox_size[1] * bbox_size[2]
-
-            # Estimate average density and neighbors
-            density = n_particles / volume
-            avg_neighbors = density * (4.0 / 3.0) * np.pi * linking_length**3
-
-            # Memory per particle = 92 (base) + K × 17 (per neighbor)
-            # Add 50% safety margin for sklearn overhead and temporary arrays
-            bytes_per_particle = (92 + avg_neighbors * 17) * 1.5
-
-            return int(n_particles * bytes_per_particle)
-
-        class _MemoryAwareFOFThrottle:
-            """Throttles FOF operations based on estimated memory usage.
-
-            Tracks actual bytes allocated (not particle count), allowing
-            multiple large FOF to run in parallel if memory permits.
-            """
-
-            def __init__(self, reserve_gb=10.0):
-                self.reserve_bytes = int(reserve_gb * 1024**3)
-                self.current_memory = 0  # Track bytes, not particles
-                self.lock = _threading.Lock()
-                self.condition = _threading.Condition(self.lock)
-
-            def _get_available_memory(self):
-                """Get available memory after reserving headroom."""
-                available = _psutil.virtual_memory().available
-                return max(0, available - self.reserve_bytes)
-
-            def acquire(self, estimated_bytes):
-                """Block until estimated_bytes of memory is available."""
-                with self.condition:
-                    while True:
-                        available = self._get_available_memory()
-
-                        # Allow if: nothing running OR fits in available memory
-                        if self.current_memory == 0 or \
-                           self.current_memory + estimated_bytes <= available:
-                            self.current_memory += estimated_bytes
-                            return
-
-                        # Wait for release, re-check memory periodically
-                        self.condition.wait(timeout=1.0)
-
-            def release(self, estimated_bytes):
-                """Release estimated_bytes back to the pool."""
-                with self.condition:
-                    self.current_memory -= estimated_bytes
-                    self.condition.notify_all()
-
-        fof_throttle = _MemoryAwareFOFThrottle(reserve_gb=10.0)
 
         def run_fof6d_direct(pos, vel, minstars, box_size, ll, vel_ll, ktab):
             """Run 6D FOF directly without the sorting pre-pass that fragments small groups.
@@ -323,7 +241,12 @@ def build_galaxies_from_ahf_fast(
 
     skipped_empty_payloads = 0
 
+    # Import joblib for parallel FOF within each host
+    if use_fof:
+        from joblib import Parallel, delayed
+
     def process_host(order_idx: int, root_id: int, bucket: Dict[int, ParticleMembership]):
+        """Process a single host, running FOF in parallel across subhalos at each depth level."""
         nonlocal skipped_empty_payloads
         nodes_for_host = host_to_nodes.get(root_id, set())
         if not nodes_for_host:
@@ -359,141 +282,137 @@ def build_galaxies_from_ahf_fast(
         claimed_gas_pids: Set[int] = set()
         claimed_bh_pids: Set[int] = set()
 
-        nodes_sorted = sorted(nodes_for_host, key=node_depth, reverse=True)
         host_galaxies: List[Tuple[int, object]] = []
 
-        for node in nodes_sorted:
-            extras_star = carry_star.pop(node, set())
-            extras_gas = carry_gas.pop(node, set())
-            extras_bh = carry_bh.pop(node, set())
-            extras_dm = carry_dm.pop(node, set())
+        # Group nodes by depth for wave-based processing
+        depth_groups: Dict[int, List[int]] = _dd(list)
+        for node in nodes_for_host:
+            depth_groups[node_depth(node)].append(node)
 
-            ex = exclusives.get(node, ParticleMembership(node))
-            # Subtract claimed particles from available particles
-            star_set = (set(ex.parttype4) | extras_star) - claimed_star_pids
-            gas_set = (set(ex.parttype0) | extras_gas) - claimed_gas_pids
-            bh_set = (set(ex.parttype5) | extras_bh) - claimed_bh_pids
-            dm_exc_set = set(ex.parttype1) | extras_dm
+        # Helper function to run FOF for a single task (for joblib.Parallel)
+        def _run_single_fof(task):
+            """Run FOF on a single task and return results."""
+            fof_tags, n_galaxies = run_fof6d_direct(
+                pos=task['pos'],
+                vel=task['vel'],
+                minstars=min_stars,
+                box_size=Lbox,
+                ll=fof_LL,
+                vel_ll=vel_LL,
+                ktab=kerneltab,
+            )
+            return {
+                'node': task['node'],
+                'fof_tags': fof_tags,
+                'n_galaxies': n_galaxies,
+                'star_set': task['star_set'],
+                'gas_set': task['gas_set'],
+                'bh_set': task['bh_set'],
+                'dm_exc_set': task['dm_exc_set'],
+                'dm_inclusive': task['dm_inclusive'],
+                'star_indices': task['star_indices'],
+                'dense_gas_indices': task['dense_gas_indices'],
+                'bh_indices': task['bh_indices'],
+                'fof_gas_end': task['fof_gas_end'],
+                'fof_star_end': task['fof_star_end'],
+                'fof_bh_end': task['fof_bh_end'],
+            }
 
-            if len(star_set) < min_stars:
-                # Promote to parent
-                parent = parent_of.get(node, 0)
-                if parent not in (0, None):
-                    carry_star[parent].update(star_set)
-                    carry_gas[parent].update(gas_set)
-                    carry_bh[parent].update(bh_set)
-                    carry_dm[parent].update(dm_exc_set)
-                continue
+        # Process depth levels from deepest to shallowest
+        for depth in sorted(depth_groups.keys(), reverse=True):
+            nodes_at_depth = depth_groups[depth]
 
-            # Map PIDs to indices
-            star_indices = map_sel(star_set, "star")
-            gas_indices = map_sel(gas_set, "gas")
-            bh_indices = map_sel(bh_set, "bh") if "bh" in pid_maps_sel else np.array([], dtype=np.int32)
+            # Phase 1: Collect FOF tasks and non-FOF nodes for this depth level
+            fof_tasks = []
+            non_fof_nodes = []  # Nodes that skip FOF or have too few particles
 
-            # Get DM for later (not used in FOF)
-            dm_pm = bucket.get(node)
-            dm_inclusive = dm_pm.parttype1 if dm_pm is not None else set()
+            for node in nodes_at_depth:
+                extras_star = carry_star.pop(node, set())
+                extras_gas = carry_gas.pop(node, set())
+                extras_bh = carry_bh.pop(node, set())
+                extras_dm = carry_dm.pop(node, set())
 
-            if use_fof and len(star_indices) >= min_stars:
-                # Apply dense gas gate BEFORE FOF
-                dense_gas_indices = get_dense_gas_indices(gas_indices)
+                ex = exclusives.get(node, ParticleMembership(node))
+                # Subtract claimed particles from available particles
+                star_set = (set(ex.parttype4) | extras_star) - claimed_star_pids
+                gas_set = (set(ex.parttype0) | extras_gas) - claimed_gas_pids
+                bh_set = (set(ex.parttype5) | extras_bh) - claimed_bh_pids
+                dm_exc_set = set(ex.parttype1) | extras_dm
 
-                # Combine eligible particles for FOF (dense gas + stars + bh)
-                fof_parts = [dense_gas_indices, star_indices]
-                if len(bh_indices) > 0:
-                    fof_parts.append(bh_indices)
-                fof_indices = np.concatenate(fof_parts) if any(len(p) > 0 for p in fof_parts) else np.array([], dtype=np.int32)
+                # Get DM for later (not used in FOF)
+                dm_pm = bucket.get(node)
+                dm_inclusive = dm_pm.parttype1 if dm_pm is not None else set()
 
-                if len(fof_indices) < min_stars:
-                    # Not enough particles for FOF, promote to parent
-                    parent = parent_of.get(node, 0)
-                    if parent not in (0, None):
-                        carry_star[parent].update(star_set)
-                        carry_gas[parent].update(gas_set)
-                        carry_bh[parent].update(bh_set)
-                        carry_dm[parent].update(dm_exc_set)
+                if len(star_set) < min_stars:
+                    # Not enough stars, promote to parent
+                    non_fof_nodes.append((node, star_set, gas_set, bh_set, dm_exc_set, dm_inclusive, 'too_few_stars'))
                     continue
 
-                # Get positions and velocities per particle type (indices are per-type, not global!)
-                # map_sel() returns indices into per-type arrays, so we must use get_property()
-                pos_parts = []
-                vel_parts = []
+                # Map PIDs to indices
+                star_indices = map_sel(star_set, "star")
+                gas_indices = map_sel(gas_set, "gas")
+                bh_indices = map_sel(bh_set, "bh") if "bh" in pid_maps_sel else np.array([], dtype=np.int32)
 
-                n_dense_gas = len(dense_gas_indices)
-                n_star = len(star_indices)
-                n_bh = len(bh_indices)
+                if use_fof and len(star_indices) >= min_stars:
+                    # FOF path: prepare task
+                    dense_gas_indices = get_dense_gas_indices(gas_indices)
 
-                if n_dense_gas > 0:
-                    pos_parts.append(get_property(sim, "pos", "gas").d[dense_gas_indices])
-                    vel_parts.append(get_property(sim, "vel", "gas").d[dense_gas_indices])
-                if n_star > 0:
-                    pos_parts.append(get_property(sim, "pos", "star").d[star_indices])
-                    vel_parts.append(get_property(sim, "vel", "star").d[star_indices])
-                if n_bh > 0:
-                    pos_parts.append(get_property(sim, "pos", "bh").d[bh_indices])
-                    vel_parts.append(get_property(sim, "vel", "bh").d[bh_indices])
+                    # Combine eligible particles for FOF
+                    fof_parts = [dense_gas_indices, star_indices]
+                    if len(bh_indices) > 0:
+                        fof_parts.append(bh_indices)
+                    fof_indices = np.concatenate(fof_parts) if any(len(p) > 0 for p in fof_parts) else np.array([], dtype=np.int32)
 
-                pos = np.concatenate(pos_parts) if pos_parts else np.empty((0, 3))
-                vel = np.concatenate(vel_parts) if vel_parts else np.empty((0, 3))
-
-                # Track slices for mapping FOF results back to per-type indices
-                fof_gas_end = n_dense_gas
-                fof_star_end = n_dense_gas + n_star
-                fof_bh_end = n_dense_gas + n_star + n_bh
-
-                # Memory-aware throttling: estimate actual memory usage from density
-                n_particles = n_dense_gas + n_star + n_bh
-                estimated_memory = estimate_fof_memory(pos, n_particles, fof_LL)
-                fof_throttle.acquire(estimated_memory)
-
-                try:
-                    # Run 6D FOF directly (bypass sorting pre-pass to avoid fragmenting small subhalos)
-                    fof_tags, n_galaxies = run_fof6d_direct(
-                        pos=pos,
-                        vel=vel,
-                        minstars=min_stars,
-                        box_size=Lbox,
-                        ll=fof_LL,
-                        vel_ll=vel_LL,
-                        ktab=kerneltab,
-                    )
-                finally:
-                    fof_throttle.release(estimated_memory)
-
-                if n_galaxies == 0:
-                    # No galaxies found, promote to parent
-                    parent = parent_of.get(node, 0)
-                    if parent not in (0, None):
-                        carry_star[parent].update(star_set)
-                        carry_gas[parent].update(gas_set)
-                        carry_bh[parent].update(bh_set)
-                        carry_dm[parent].update(dm_exc_set)
-                    continue
-
-                # Create galaxies from FOF groups
-                for gal_id in range(n_galaxies):
-                    gal_mask = fof_tags == gal_id
-
-                    # Extract per-type indices using tracked slices
-                    gal_gas_mask = gal_mask[:fof_gas_end]
-                    gal_star_mask = gal_mask[fof_gas_end:fof_star_end]
-                    gal_bh_mask = gal_mask[fof_star_end:fof_bh_end] if n_bh > 0 else np.array([], dtype=bool)
-
-                    # Get the original per-type indices for particles in this galaxy
-                    gal_gas = dense_gas_indices[gal_gas_mask] if n_dense_gas > 0 else np.array([], dtype=np.int32)
-                    gal_star = star_indices[gal_star_mask] if n_star > 0 else np.array([], dtype=np.int32)
-                    gal_bh = bh_indices[gal_bh_mask] if n_bh > 0 else np.array([], dtype=np.int32)
-
-                    if len(gal_star) < min_stars:
+                    if len(fof_indices) < min_stars:
+                        non_fof_nodes.append((node, star_set, gas_set, bh_set, dm_exc_set, dm_inclusive, 'too_few_fof'))
                         continue
 
-                    # Create galaxy
+                    # Get positions and velocities
+                    pos_parts = []
+                    vel_parts = []
+
+                    n_dense_gas = len(dense_gas_indices)
+                    n_star = len(star_indices)
+                    n_bh = len(bh_indices)
+
+                    if n_dense_gas > 0:
+                        pos_parts.append(get_property(sim, "pos", "gas").d[dense_gas_indices])
+                        vel_parts.append(get_property(sim, "vel", "gas").d[dense_gas_indices])
+                    if n_star > 0:
+                        pos_parts.append(get_property(sim, "pos", "star").d[star_indices])
+                        vel_parts.append(get_property(sim, "vel", "star").d[star_indices])
+                    if n_bh > 0:
+                        pos_parts.append(get_property(sim, "pos", "bh").d[bh_indices])
+                        vel_parts.append(get_property(sim, "vel", "bh").d[bh_indices])
+
+                    pos = np.concatenate(pos_parts) if pos_parts else np.empty((0, 3))
+                    vel = np.concatenate(vel_parts) if vel_parts else np.empty((0, 3))
+
+                    fof_tasks.append({
+                        'node': node,
+                        'pos': pos,
+                        'vel': vel,
+                        'star_set': star_set,
+                        'gas_set': gas_set,
+                        'bh_set': bh_set,
+                        'dm_exc_set': dm_exc_set,
+                        'dm_inclusive': dm_inclusive,
+                        'star_indices': star_indices,
+                        'dense_gas_indices': dense_gas_indices,
+                        'bh_indices': bh_indices,
+                        'fof_gas_end': n_dense_gas,
+                        'fof_star_end': n_dense_gas + n_star,
+                        'fof_bh_end': n_dense_gas + n_star + n_bh,
+                    })
+
+                else:
+                    # Non-FOF path: direct galaxy assignment
                     grp = create_new_group(sim, "galaxy")
                     grp.AHF_haloID = int(node)
-                    grp.slist = gal_star
-                    grp.glist = gal_gas
-                    grp.bhlist = gal_bh if len(gal_bh) > 0 else np.array([], dtype=np.int32)
-                    # DM handled separately (use inclusive DM from node)
+                    grp.slist = star_indices
+                    grp.glist = gas_indices
+                    _apply_dense_gas_gate(grp)
+                    grp.bhlist = bh_indices
                     dm_selected = map_sel(dm_inclusive, "dm") if "dm" in pid_maps_sel else np.array([], dtype=np.int32)
                     grp.dmlist = dm_selected
                     grp.global_indexes = np.array([], dtype=np.int64)
@@ -502,130 +421,159 @@ def build_galaxies_from_ahf_fast(
                     else:
                         grp.__dict__["_dm_exclusive_pids"] = set()
 
+                    mapped_star = len(grp.slist) if hasattr(grp, "slist") else 0
+                    mapped_gas = len(grp.glist) if hasattr(grp, "glist") else 0
+                    mapped_bh = len(grp.bhlist) if hasattr(grp, "bhlist") else 0
+                    mapped_dm = len(dm_selected)
+                    particle_total = mapped_star + mapped_gas + mapped_bh + mapped_dm
+                    if particle_total == 0:
+                        skipped_empty_payloads += 1
+                        if skipped_empty_payloads <= 10:
+                            mylog.warning(
+                                "AHF-FAST: node %d had %d star / %d gas / %d bh / %d dm particles "
+                                "from AHF but none mapped into CAESAR selection",
+                                node, len(star_set), len(gas_set), len(bh_set), len(dm_inclusive),
+                            )
+                        continue
                     host_galaxies.append((int(node), grp))
 
-                # Mark ALL particles from this node as claimed (they participated in FOF)
-                claimed_star_pids.update(star_set)
-                claimed_gas_pids.update(gas_set)
-                claimed_bh_pids.update(bh_set)
+                    # Mark particles as claimed (non-FOF path)
+                    claimed_star_pids.update(star_set)
+                    claimed_gas_pids.update(gas_set)
+                    claimed_bh_pids.update(bh_set)
 
-            else:
-                # Non-FOF path: direct galaxy assignment (original behavior)
-                grp = create_new_group(sim, "galaxy")
-                grp.AHF_haloID = int(node)
-                grp.slist = star_indices
-                grp.glist = gas_indices
-                _apply_dense_gas_gate(grp)
-                grp.bhlist = bh_indices
-                dm_selected = map_sel(dm_inclusive, "dm") if "dm" in pid_maps_sel else np.array([], dtype=np.int32)
-                grp.dmlist = dm_selected
-                grp.global_indexes = np.array([], dtype=np.int64)
-                if dm_exc_set:
-                    grp.__dict__["_dm_exclusive_pids"] = set(dm_exc_set)
-                else:
-                    grp.__dict__["_dm_exclusive_pids"] = set()
+            # Phase 2: Run FOF in parallel for all tasks at this depth level
+            if fof_tasks:
+                # Run FOF in parallel using joblib
+                results = Parallel(n_jobs=jobs)(
+                    delayed(_run_single_fof)(task) for task in fof_tasks
+                )
 
-                mapped_star = len(grp.slist) if hasattr(grp, "slist") else 0
-                mapped_gas = len(grp.glist) if hasattr(grp, "glist") else 0
-                mapped_bh = len(grp.bhlist) if hasattr(grp, "bhlist") else 0
-                mapped_dm = len(dm_selected)
-                particle_total = mapped_star + mapped_gas + mapped_bh + mapped_dm
-                if particle_total == 0:
-                    skipped_empty_payloads += 1
-                    if skipped_empty_payloads <= 10:
-                        mylog.warning(
-                            "AHF-FAST: node %d had %d star / %d gas / %d bh / %d dm particles "
-                            "from AHF but none mapped into CAESAR selection",
-                            node,
-                            len(star_set),
-                            len(gas_set),
-                            len(bh_set),
-                            len(dm_inclusive),
-                        )
-                    continue
-                host_galaxies.append((int(node), grp))
+                # Phase 3: Process FOF results sequentially and update claimed state
+                for result in results:
+                    node = result['node']
+                    fof_tags = result['fof_tags']
+                    n_galaxies = result['n_galaxies']
+                    star_set = result['star_set']
+                    gas_set = result['gas_set']
+                    bh_set = result['bh_set']
+                    dm_exc_set = result['dm_exc_set']
+                    dm_inclusive = result['dm_inclusive']
+                    star_indices = result['star_indices']
+                    dense_gas_indices = result['dense_gas_indices']
+                    bh_indices = result['bh_indices']
+                    fof_gas_end = result['fof_gas_end']
+                    fof_star_end = result['fof_star_end']
+                    fof_bh_end = result['fof_bh_end']
 
-                # Mark particles as claimed (non-FOF path)
-                claimed_star_pids.update(star_set)
-                claimed_gas_pids.update(gas_set)
-                claimed_bh_pids.update(bh_set)
+                    n_dense_gas = len(dense_gas_indices)
+                    n_star = len(star_indices)
+                    n_bh = len(bh_indices)
+
+                    if n_galaxies == 0:
+                        # No galaxies found, promote to parent
+                        non_fof_nodes.append((node, star_set, gas_set, bh_set, dm_exc_set, dm_inclusive, 'no_galaxies'))
+                        continue
+
+                    # Create galaxies from FOF groups
+                    for gal_id in range(n_galaxies):
+                        gal_mask = fof_tags == gal_id
+
+                        # Extract per-type indices using tracked slices
+                        gal_gas_mask = gal_mask[:fof_gas_end]
+                        gal_star_mask = gal_mask[fof_gas_end:fof_star_end]
+                        gal_bh_mask = gal_mask[fof_star_end:fof_bh_end] if n_bh > 0 else np.array([], dtype=bool)
+
+                        # Get the original per-type indices for particles in this galaxy
+                        gal_gas = dense_gas_indices[gal_gas_mask] if n_dense_gas > 0 else np.array([], dtype=np.int32)
+                        gal_star = star_indices[gal_star_mask] if n_star > 0 else np.array([], dtype=np.int32)
+                        gal_bh = bh_indices[gal_bh_mask] if n_bh > 0 else np.array([], dtype=np.int32)
+
+                        if len(gal_star) < min_stars:
+                            continue
+
+                        # Create galaxy
+                        grp = create_new_group(sim, "galaxy")
+                        grp.AHF_haloID = int(node)
+                        grp.slist = gal_star
+                        grp.glist = gal_gas
+                        grp.bhlist = gal_bh if len(gal_bh) > 0 else np.array([], dtype=np.int32)
+                        dm_selected = map_sel(dm_inclusive, "dm") if "dm" in pid_maps_sel else np.array([], dtype=np.int32)
+                        grp.dmlist = dm_selected
+                        grp.global_indexes = np.array([], dtype=np.int64)
+                        if dm_exc_set:
+                            grp.__dict__["_dm_exclusive_pids"] = set(dm_exc_set)
+                        else:
+                            grp.__dict__["_dm_exclusive_pids"] = set()
+
+                        host_galaxies.append((int(node), grp))
+
+                    # Mark ALL particles from this node as claimed
+                    claimed_star_pids.update(star_set)
+                    claimed_gas_pids.update(gas_set)
+                    claimed_bh_pids.update(bh_set)
+
+            # Phase 4: Handle nodes that skipped FOF or had no galaxies (promote to parent)
+            for item in non_fof_nodes:
+                node, star_set, gas_set, bh_set, dm_exc_set, dm_inclusive, reason = item
+                parent = parent_of.get(node, 0)
+                if parent not in (0, None):
+                    carry_star[parent].update(star_set)
+                    carry_gas[parent].update(gas_set)
+                    carry_bh[parent].update(bh_set)
+                    carry_dm[parent].update(dm_exc_set)
 
         return order_idx, host_galaxies
 
-    pending_results: Dict[int, List] = {}
-    next_to_emit = 0
+    # Process hosts sequentially (FOF is parallelized within each host via joblib)
+    host_order = 0
+    for root_id, nodes_for_host in host_to_nodes.items():
+        # Build a membership bucket for this host from the loader arrays
+        bucket: Dict[int, ParticleMembership] = {}
+        if membership_arrays:
+            for node_id in nodes_for_host:
+                arr = membership_arrays.get(int(node_id))
+                if arr is None:
+                    continue
+                arr = np.asarray(arr, dtype=np.int64)
+                if arr.size == 0:
+                    continue
+                if arr.ndim != 2 or arr.shape[1] != 2:
+                    arr = arr.reshape(-1, 2)
+                pids = arr[:, 0]
+                ptypes = arr[:, 1]
+                pm = ParticleMembership(int(node_id))
+                mask0 = ptypes == 0
+                if np.any(mask0):
+                    pm.parttype0 = set(int(v) for v in pids[mask0])
+                if load_dm:
+                    mask1 = ptypes == 1
+                    if np.any(mask1):
+                        pm.parttype1 = set(int(v) for v in pids[mask1])
+                    mask2 = ptypes == 2
+                    if np.any(mask2):
+                        pm.parttype2 = set(int(v) for v in pids[mask2])
+                    mask3 = ptypes == 3
+                    if np.any(mask3):
+                        pm.parttype3 = set(int(v) for v in pids[mask3])
+                mask4 = ptypes == 4
+                if np.any(mask4):
+                    pm.parttype4 = set(int(v) for v in pids[mask4])
+                mask5 = ptypes == 5
+                if np.any(mask5):
+                    pm.parttype5 = set(int(v) for v in pids[mask5])
+                bucket[int(node_id)] = pm
 
-    def flush_completed(futures, block: bool = False):
-        nonlocal next_to_emit
-        if not futures:
-            return
-        timeout = None if block else 0
-        return_when = ALL_COMPLETED if block else FIRST_COMPLETED
-        done, _ = wait(list(futures.keys()), timeout=timeout, return_when=return_when)
-        if not done:
-            return
-        for fut in done:
-            order_idx, host_gals = fut.result()
-            futures.pop(fut, None)
-            pending_results[order_idx] = host_gals
-        while next_to_emit in pending_results:
-            host_gals = pending_results.pop(next_to_emit)
-            if host_gals:
-                for node_id, grp in host_gals:
-                    galaxies.append(grp)
-                    galaxy_node_ids.append(int(node_id))
-            if host_progress is not None:
-                host_progress.update(1)
-            next_to_emit += 1
+        # Process this host (FOF runs in parallel within via joblib)
+        order_idx, host_gals = process_host(host_order, root_id, bucket)
+        if host_gals:
+            for node_id, grp in host_gals:
+                galaxies.append(grp)
+                galaxy_node_ids.append(int(node_id))
 
-    with ThreadPoolExecutor(max_workers=jobs) as executor:
-        pending_futures: Dict = {}
-        host_order = 0
-
-        for root_id, nodes_for_host in host_to_nodes.items():
-            # Build a membership bucket for this host from the loader arrays
-            bucket: Dict[int, ParticleMembership] = {}
-            if membership_arrays:
-                for node_id in nodes_for_host:
-                    arr = membership_arrays.get(int(node_id))
-                    if arr is None:
-                        continue
-                    arr = np.asarray(arr, dtype=np.int64)
-                    if arr.size == 0:
-                        continue
-                    if arr.ndim != 2 or arr.shape[1] != 2:
-                        arr = arr.reshape(-1, 2)
-                    pids = arr[:, 0]
-                    ptypes = arr[:, 1]
-                    pm = ParticleMembership(int(node_id))
-                    mask0 = ptypes == 0
-                    if np.any(mask0):
-                        pm.parttype0 = set(int(v) for v in pids[mask0])
-                    if load_dm:
-                        mask1 = ptypes == 1
-                        if np.any(mask1):
-                            pm.parttype1 = set(int(v) for v in pids[mask1])
-                        mask2 = ptypes == 2
-                        if np.any(mask2):
-                            pm.parttype2 = set(int(v) for v in pids[mask2])
-                        mask3 = ptypes == 3
-                        if np.any(mask3):
-                            pm.parttype3 = set(int(v) for v in pids[mask3])
-                    mask4 = ptypes == 4
-                    if np.any(mask4):
-                        pm.parttype4 = set(int(v) for v in pids[mask4])
-                    mask5 = ptypes == 5
-                    if np.any(mask5):
-                        pm.parttype5 = set(int(v) for v in pids[mask5])
-                    bucket[int(node_id)] = pm
-
-            bucket_copy = dict(bucket)
-            future = executor.submit(process_host, host_order, root_id, bucket_copy)
-            pending_futures[future] = host_order
-            host_order += 1
-            flush_completed(pending_futures, block=False)
-
-        flush_completed(pending_futures, block=True)
+        if host_progress is not None:
+            host_progress.update(1)
+        host_order += 1
 
     if host_progress is not None:
         host_progress.close()
