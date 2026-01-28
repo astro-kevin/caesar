@@ -447,17 +447,12 @@ def build_galaxies_from_ahf_fast(
                     claimed_gas_pids.update(gas_set)
                     claimed_bh_pids.update(bh_set)
 
-            # Phase 2: Run FOF for all tasks at this depth level
+            # Phase 2: Run FOF in parallel for all tasks at this depth level
             if fof_tasks:
-                # Only use joblib if enough tasks to justify overhead
-                if len(fof_tasks) >= 10:
-                    # Use threading backend (lower overhead than multiprocessing)
-                    results = Parallel(n_jobs=jobs, backend='threading')(
-                        delayed(_run_single_fof)(task) for task in fof_tasks
-                    )
-                else:
-                    # Run sequentially - overhead not worth it for small batches
-                    results = [_run_single_fof(task) for task in fof_tasks]
+                # Always parallelize with threading backend (low overhead)
+                results = Parallel(n_jobs=jobs, backend='threading')(
+                    delayed(_run_single_fof)(task) for task in fof_tasks
+                )
 
                 # Phase 3: Process FOF results sequentially and update claimed state
                 for result in results:
