@@ -260,6 +260,11 @@ def build_galaxies_from_ahf_fast(
 
         from collections import defaultdict as _dd
 
+        # Check if host is large enough for FOF (4×min_stars threshold)
+        # Host's membership is inclusive (includes all subhalo particles)
+        host_pm = bucket.get(root_id, ParticleMembership(root_id))
+        host_needs_fof = use_fof and len(host_pm.parttype4) >= 4 * min_stars
+
         depth_cache: Dict[int, int] = {}
 
         def node_depth(node: int) -> int:
@@ -353,8 +358,8 @@ def build_galaxies_from_ahf_fast(
                 gas_indices = map_sel(gas_set, "gas")
                 bh_indices = map_sel(bh_set, "bh") if "bh" in pid_maps_sel else np.array([], dtype=np.int32)
 
-                if use_fof and len(star_indices) >= min_stars:
-                    # FOF path: prepare task
+                if host_needs_fof and len(star_indices) >= min_stars:
+                    # FOF path: prepare task (only for large hosts)
                     dense_gas_indices = get_dense_gas_indices(gas_indices)
 
                     # Combine eligible particles for FOF
@@ -442,12 +447,17 @@ def build_galaxies_from_ahf_fast(
                     claimed_gas_pids.update(gas_set)
                     claimed_bh_pids.update(bh_set)
 
-            # Phase 2: Run FOF in parallel for all tasks at this depth level
+            # Phase 2: Run FOF for all tasks at this depth level
             if fof_tasks:
-                # Run FOF in parallel using joblib
-                results = Parallel(n_jobs=jobs)(
-                    delayed(_run_single_fof)(task) for task in fof_tasks
-                )
+                # Only use joblib if enough tasks to justify overhead
+                if len(fof_tasks) >= 10:
+                    # Use threading backend (lower overhead than multiprocessing)
+                    results = Parallel(n_jobs=jobs, backend='threading')(
+                        delayed(_run_single_fof)(task) for task in fof_tasks
+                    )
+                else:
+                    # Run sequentially - overhead not worth it for small batches
+                    results = [_run_single_fof(task) for task in fof_tasks]
 
                 # Phase 3: Process FOF results sequentially and update claimed state
                 for result in results:
