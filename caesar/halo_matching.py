@@ -413,7 +413,11 @@ def _prune_halos_after_galaxies(sim) -> None:
 
 @dataclass
 class ParticleMembership:
-    """Store particle IDs for a single halo or galaxy."""
+    """Store particle IDs for a single halo or galaxy.
+
+    By default, parttype fields are Python sets for compatibility with AHF mode.
+    AHF-FAST mode explicitly passes numpy arrays for performance.
+    """
     id: int
     parttype0: Set[int] = field(default_factory=set)
     parttype1: Set[int] = field(default_factory=set)
@@ -887,7 +891,34 @@ def _iter_memberships_stream(
     with _open_ahf_particles(path) as fh:
         current_hid = None
         remaining = 0
-        cur_pm: Optional[ParticleMembership] = None
+        # Use lists to collect particles, convert to numpy when yielding
+        collecting = False
+        pt0_list: List[int] = []
+        pt1_list: List[int] = []
+        pt2_list: List[int] = []
+        pt3_list: List[int] = []
+        pt4_list: List[int] = []
+        pt5_list: List[int] = []
+
+        def _make_membership(hid: int) -> ParticleMembership:
+            return ParticleMembership(
+                id=hid,
+                parttype0=np.array(pt0_list, dtype=np.int64) if pt0_list else np.array([], dtype=np.int64),
+                parttype1=np.array(pt1_list, dtype=np.int64) if pt1_list else np.array([], dtype=np.int64),
+                parttype2=np.array(pt2_list, dtype=np.int64) if pt2_list else np.array([], dtype=np.int64),
+                parttype3=np.array(pt3_list, dtype=np.int64) if pt3_list else np.array([], dtype=np.int64),
+                parttype4=np.array(pt4_list, dtype=np.int64) if pt4_list else np.array([], dtype=np.int64),
+                parttype5=np.array(pt5_list, dtype=np.int64) if pt5_list else np.array([], dtype=np.int64),
+            )
+
+        def _clear_lists():
+            nonlocal pt0_list, pt1_list, pt2_list, pt3_list, pt4_list, pt5_list
+            pt0_list = []
+            pt1_list = []
+            pt2_list = []
+            pt3_list = []
+            pt4_list = []
+            pt5_list = []
 
         for raw in fh:
             line = raw.strip()
@@ -895,22 +926,23 @@ def _iter_memberships_stream(
                 continue
             parts = line.split()
             if remaining == 0 and len(parts) == 2:
-                if cur_pm is not None and cur_pm.id in needed:
-                    yield cur_pm
+                if collecting and current_hid in needed:
+                    yield _make_membership(current_hid)
+                _clear_lists()
                 try:
                     remaining = int(parts[0])
                     current_hid = int(parts[1])
                 except Exception:
                     current_hid = None
                     remaining = 0
-                    cur_pm = None
+                    collecting = False
                     continue
-                cur_pm = ParticleMembership(current_hid) if current_hid in needed else None
+                collecting = current_hid in needed
                 continue
 
             if remaining > 0:
                 remaining -= 1
-                if cur_pm is None:
+                if not collecting:
                     continue
                 pparts = line.split()
                 if len(pparts) != 2:
@@ -922,20 +954,20 @@ def _iter_memberships_stream(
                     continue
 
                 if ptype == 0:
-                    cur_pm.parttype0.add(pid)
+                    pt0_list.append(pid)
                 elif ptype == 4:
-                    cur_pm.parttype4.add(pid)
+                    pt4_list.append(pid)
                 elif ptype == 5:
-                    cur_pm.parttype5.add(pid)
+                    pt5_list.append(pid)
                 elif ptype == 1 and load_dm:
-                    cur_pm.parttype1.add(pid)
+                    pt1_list.append(pid)
                 elif ptype == 2 and load_dm:
-                    cur_pm.parttype2.add(pid)
+                    pt2_list.append(pid)
                 elif ptype == 3 and load_dm:
-                    cur_pm.parttype3.add(pid)
+                    pt3_list.append(pid)
 
-        if cur_pm is not None and cur_pm.id in needed:
-            yield cur_pm
+        if collecting and current_hid in needed:
+            yield _make_membership(current_hid)
 
 
 def _read_memberships_for_ids(
@@ -953,7 +985,36 @@ def _read_memberships_for_ids(
     with _open_ahf_particles(path) as f:
         current_hid = None
         remaining = 0
-        cur_pm: Optional[ParticleMembership] = None
+        collecting = False
+        # Use lists to collect particles, convert to numpy when finalizing
+        pt0_list: List[int] = []
+        pt1_list: List[int] = []
+        pt2_list: List[int] = []
+        pt3_list: List[int] = []
+        pt4_list: List[int] = []
+        pt5_list: List[int] = []
+
+        def _finalize():
+            if collecting and current_hid in needed:
+                out[current_hid] = ParticleMembership(
+                    id=current_hid,
+                    parttype0=np.array(pt0_list, dtype=np.int64) if pt0_list else np.array([], dtype=np.int64),
+                    parttype1=np.array(pt1_list, dtype=np.int64) if pt1_list else np.array([], dtype=np.int64),
+                    parttype2=np.array(pt2_list, dtype=np.int64) if pt2_list else np.array([], dtype=np.int64),
+                    parttype3=np.array(pt3_list, dtype=np.int64) if pt3_list else np.array([], dtype=np.int64),
+                    parttype4=np.array(pt4_list, dtype=np.int64) if pt4_list else np.array([], dtype=np.int64),
+                    parttype5=np.array(pt5_list, dtype=np.int64) if pt5_list else np.array([], dtype=np.int64),
+                )
+
+        def _clear_lists():
+            nonlocal pt0_list, pt1_list, pt2_list, pt3_list, pt4_list, pt5_list
+            pt0_list = []
+            pt1_list = []
+            pt2_list = []
+            pt3_list = []
+            pt4_list = []
+            pt5_list = []
+
         for raw in f:
             line = raw.strip()
             if not line:
@@ -961,8 +1022,8 @@ def _read_memberships_for_ids(
             parts = line.split()
             if remaining == 0 and len(parts) == 2:
                 # finalize previous if any
-                if cur_pm is not None and cur_pm.id in needed:
-                    out[cur_pm.id] = cur_pm
+                _finalize()
+                _clear_lists()
                 # new header
                 try:
                     remaining = int(parts[0])
@@ -970,13 +1031,13 @@ def _read_memberships_for_ids(
                 except Exception:
                     current_hid = None
                     remaining = 0
-                    cur_pm = None
+                    collecting = False
                     continue
-                cur_pm = ParticleMembership(current_hid) if current_hid in needed else None
+                collecting = current_hid in needed
                 continue
             if remaining > 0:
                 remaining -= 1
-                if cur_pm is None:
+                if not collecting:
                     continue
                 pparts = line.split()
                 if len(pparts) != 2:
@@ -987,20 +1048,19 @@ def _read_memberships_for_ids(
                 except Exception:
                     continue
                 if ptype == 0:
-                    cur_pm.parttype0.add(pid)
+                    pt0_list.append(pid)
                 elif ptype == 1 and load_dm:
-                    cur_pm.parttype1.add(pid)
+                    pt1_list.append(pid)
                 elif ptype == 2 and load_dm:
-                    cur_pm.parttype2.add(pid)
+                    pt2_list.append(pid)
                 elif ptype == 3 and load_dm:
-                    cur_pm.parttype3.add(pid)
+                    pt3_list.append(pid)
                 elif ptype == 4:
-                    cur_pm.parttype4.add(pid)
+                    pt4_list.append(pid)
                 elif ptype == 5:
-                    cur_pm.parttype5.add(pid)
+                    pt5_list.append(pid)
         # finalize last
-    if cur_pm is not None and cur_pm.id in needed:
-        out[cur_pm.id] = cur_pm
+        _finalize()
     return out
 
 
@@ -1530,6 +1590,10 @@ def _compute_exclusive_memberships(
     """Compute exclusive particle memberships E(h) for needed AHF nodes.
 
     E(h) = M(h) - union(E(children(h))) computed bottom-up.
+
+    This function assumes ahf_members contains ParticleMembership objects
+    with numpy array parttype fields (AHF-FAST mode). It uses numpy setdiff1d
+    for O(n log n) set difference instead of Python set operations.
     """
     exclusives: Dict[int, ParticleMembership] = {}
 
@@ -1538,27 +1602,33 @@ def _compute_exclusive_memberships(
             return exclusives[h]
         M = ahf_members.get(h)
         if M is None:
-            # No data; return empty
-            exclusives[h] = ParticleMembership(h)
+            # No data; return empty with numpy arrays
+            exclusives[h] = ParticleMembership(
+                id=h,
+                parttype0=np.array([], dtype=np.int64),
+                parttype1=np.array([], dtype=np.int64),
+                parttype4=np.array([], dtype=np.int64),
+                parttype5=np.array([], dtype=np.int64),
+            )
             return exclusives[h]
-        # Copy raw sets
-        e0 = set(M.parttype0)
-        e1 = set(M.parttype1)
-        e4 = set(M.parttype4)
-        e5 = set(M.parttype5)
-        # subtract children exclusives
+        # Start with copies of parent's arrays
+        e0 = np.asarray(M.parttype0, dtype=np.int64).copy()
+        e1 = np.asarray(M.parttype1, dtype=np.int64).copy()
+        e4 = np.asarray(M.parttype4, dtype=np.int64).copy()
+        e5 = np.asarray(M.parttype5, dtype=np.int64).copy()
+        # subtract children exclusives using numpy setdiff1d
         for c in children_of.get(h, []):
             if c not in needed:
                 continue
             Ec = postorder(c)
-            if Ec.parttype0:
-                e0.difference_update(Ec.parttype0)
-            if Ec.parttype1:
-                e1.difference_update(Ec.parttype1)
-            if Ec.parttype4:
-                e4.difference_update(Ec.parttype4)
-            if Ec.parttype5:
-                e5.difference_update(Ec.parttype5)
+            if Ec.parttype0.size > 0:
+                e0 = np.setdiff1d(e0, Ec.parttype0, assume_unique=False)
+            if Ec.parttype1.size > 0:
+                e1 = np.setdiff1d(e1, Ec.parttype1, assume_unique=False)
+            if Ec.parttype4.size > 0:
+                e4 = np.setdiff1d(e4, Ec.parttype4, assume_unique=False)
+            if Ec.parttype5.size > 0:
+                e5 = np.setdiff1d(e5, Ec.parttype5, assume_unique=False)
         exclusives[h] = ParticleMembership(id=h, parttype0=e0, parttype1=e1, parttype4=e4, parttype5=e5)
         return exclusives[h]
 
