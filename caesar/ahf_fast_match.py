@@ -528,8 +528,9 @@ def build_galaxies_from_ahf_fast(
 
             # Phase 2: Run FOF in parallel for all tasks at this depth level
             if fof_tasks:
-                # Use loky (multiprocessing) for true parallelism
-                results = Parallel(n_jobs=jobs, backend='loky')(
+                # Use threading for parallelism (avoids pickle issues with sim)
+                # KD-tree operations release GIL, so threading is effective
+                results = Parallel(n_jobs=jobs, backend='threading')(
                     delayed(_run_single_fof)(task) for task in fof_tasks
                 )
 
@@ -718,7 +719,7 @@ def build_galaxies_from_ahf_fast(
             return process_host(order_idx, root_id, bucket)
 
         mylog.info("AHF-FAST: processing %d small hosts in parallel", len(small_hosts))
-        small_results = Parallel(n_jobs=jobs, backend='loky')(
+        small_results = Parallel(n_jobs=jobs, backend='threading')(
             delayed(process_small_host)(host_order + i, root_id, nodes)
             for i, (root_id, nodes) in enumerate(small_hosts)
         )
