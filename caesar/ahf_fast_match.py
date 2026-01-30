@@ -987,15 +987,7 @@ def build_galaxies_from_ahf_fast(
                             gal.parent_halo_index = halo_idx
                             sim.halo_list[halo_idx].galaxy_index_list.append(gal_idx)
 
-            # Suppress log spam during per-host property calculation
-            import caesar.utils
-            old_suppress = caesar.utils._suppress_memlog
-            caesar.utils._suppress_memlog = True
-            try:
-                # Compute properties and optionally write to HDF5
-                _compute_and_write_galaxy_properties(galaxies_only)
-            finally:
-                caesar.utils._suppress_memlog = old_suppress
+            # Property calculation deferred to batch at end (HI/H2 needs complete galaxy_list)
 
         return HostProcessingResult(
             host_id=root_id,
@@ -1318,7 +1310,18 @@ def build_galaxies_from_ahf_fast(
 
     _prune_halos_after_galaxies(sim)
 
-    # Properties were already computed per-host in process_host()
+    # Compute properties for ALL galaxies in batch
+    # (HI/H2 calculation requires complete galaxy_list with all halo associations)
+    if sim.ngalaxies > 0:
+        mylog.info("AHF-FAST: Computing properties for %d galaxies...", sim.ngalaxies)
+        import caesar.utils
+        old_suppress = caesar.utils._suppress_memlog
+        caesar.utils._suppress_memlog = True
+        try:
+            _compute_and_write_galaxy_properties(sim.galaxy_list)
+        finally:
+            caesar.utils._suppress_memlog = old_suppress
+
     # Log incremental writer stats if enabled
     if incremental_writer is not None:
         mylog.info("AHF-FAST: Incremental HDF5 writer completed with %d galaxies",
