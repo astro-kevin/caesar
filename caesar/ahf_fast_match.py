@@ -222,12 +222,8 @@ def build_galaxies_from_ahf_fast(
 
     show_progress = bool(getattr(sim, "_show_progress", True))
     total_hosts = len(host_to_nodes)
-    host_progress = tqdm(
-        total=total_hosts,
-        desc="Building galaxies (AHF-FAST)",
-        disable=(not show_progress or total_hosts == 0),
-        leave=False,
-    )
+    # Progress bar will be configured after host categorization
+    host_progress = None
 
     def map_sel(pids: np.ndarray, key: str) -> np.ndarray:
         """Map particle IDs to indices using PID lookup tables.
@@ -717,20 +713,40 @@ def build_galaxies_from_ahf_fast(
         return total
 
     # Categorize hosts into small (parallel) and large (sequential)
+    # Store particle counts for sorting (most populous first)
     size_threshold = 4 * min_stars  # Same threshold used for FOF decision
-    small_hosts: List[Tuple[int, Set[int]]] = []
-    large_hosts: List[Tuple[int, Set[int]]] = []
+    small_hosts: List[Tuple[int, Set[int], int]] = []  # (root_id, nodes, star_count)
+    large_hosts: List[Tuple[int, Set[int], int]] = []  # (root_id, nodes, star_count)
 
     for root_id, nodes in host_to_nodes.items():
-        if estimate_host_stars(nodes) < size_threshold:
-            small_hosts.append((root_id, nodes))
+        star_count = estimate_host_stars(nodes)
+        if star_count < size_threshold:
+            small_hosts.append((root_id, nodes, star_count))
         else:
-            large_hosts.append((root_id, nodes))
+            large_hosts.append((root_id, nodes, star_count))
+
+    # Sort by particle count descending (most populous first)
+    small_hosts.sort(key=lambda x: x[2], reverse=True)
+    large_hosts.sort(key=lambda x: x[2], reverse=True)
 
     mylog.info(
         "AHF-FAST: categorized %d small hosts (parallel) and %d large hosts (sequential)",
         len(small_hosts), len(large_hosts)
     )
+
+    # Track remaining counts for progress bar
+    remaining_large = len(large_hosts)
+    remaining_small = len(small_hosts)
+
+    # Configure progress bar with category breakdown
+    host_progress = tqdm(
+        total=total_hosts,
+        desc="Building galaxies",
+        disable=(not show_progress or total_hosts == 0),
+        leave=False,
+    )
+    if host_progress is not None and not host_progress.disable:
+        host_progress.set_postfix(massive=remaining_large, other=remaining_small)
 
     total_skipped = 0
     host_order = 0
@@ -746,7 +762,7 @@ def build_galaxies_from_ahf_fast(
         mylog.info("AHF-FAST: processing %d small hosts in parallel", len(small_hosts))
         small_results = Parallel(n_jobs=jobs, backend='threading')(
             delayed(process_small_host)(host_order + i, root_id, nodes)
-            for i, (root_id, nodes) in enumerate(small_hosts)
+            for i, (root_id, nodes, _) in enumerate(small_hosts)
         )
 
         for result in small_results:
@@ -757,12 +773,14 @@ def build_galaxies_from_ahf_fast(
             total_skipped += result.skipped_empty_payloads
 
         host_order += len(small_hosts)
+        remaining_small = 0
         if host_progress is not None:
             host_progress.update(len(small_hosts))
+            host_progress.set_postfix(massive=remaining_large, other=remaining_small)
 
     elif small_hosts:
         # No FOF, process small hosts sequentially
-        for root_id, nodes in small_hosts:
+        for root_id, nodes, _ in small_hosts:
             bucket = build_bucket(nodes)
             result = process_host(host_order, root_id, bucket)
             if result.galaxies:
@@ -771,11 +789,14 @@ def build_galaxies_from_ahf_fast(
                     galaxy_node_ids.append(int(node_id))
             total_skipped += result.skipped_empty_payloads
             host_order += 1
+            remaining_small -= 1
             if host_progress is not None:
                 host_progress.update(1)
+                host_progress.set_postfix(massive=remaining_large, other=remaining_small)
 
     # Process large hosts sequentially (FOF parallelized within each)
-    for root_id, nodes in large_hosts:
+    # Already sorted by particle count descending (most populous first)
+    for root_id, nodes, _ in large_hosts:
         bucket = build_bucket(nodes)
         result = process_host(host_order, root_id, bucket)
         if result.galaxies:
@@ -784,8 +805,10 @@ def build_galaxies_from_ahf_fast(
                 galaxy_node_ids.append(int(node_id))
         total_skipped += result.skipped_empty_payloads
         host_order += 1
+        remaining_large -= 1
         if host_progress is not None:
             host_progress.update(1)
+            host_progress.set_postfix(massive=remaining_large, other=remaining_small)
 
     if host_progress is not None:
         host_progress.close()
