@@ -418,6 +418,11 @@ def build_galaxies_from_ahf_fast(
     galaxies: List = []
     galaxy_node_ids: List[int] = []
 
+    # Initialize galaxy_list early so property computation can access it
+    # (get_HIH2_masses needs sim.galaxy_list to exist)
+    sim.galaxy_list = []
+    sim.ngalaxies = 0
+
     # Ensure we have memberships for all needed nodes.
     load_dm = dm_pid_lookup is not None
     if membership_arrays is None:
