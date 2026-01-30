@@ -101,8 +101,11 @@ def build_galaxies_from_ahf_fast(
     use_fof = _os.environ.get("CAESAR_AHF_FAST_USE_FOF", "1") == "1"
     if use_fof:
         from caesar.fubar import get_mean_interparticle_separation, get_b
-        from caesar.fof6d import kernel_table, fof6d_main
+        from caesar.fof6d import kernel_table, fof6d_main, fof6d_halo
         from caesar.property_manager import ptype_ints
+
+        # Threshold for sharded FOF on central halos (configurable via environment variable)
+        SHARDED_FOF_THRESHOLD = int(_os.environ.get("CAESAR_AHF_FAST_SHARDED_THRESHOLD", "1000"))
 
         # FOF parameters (same as regular AHF mode)
         MIS = get_mean_interparticle_separation(sim).d
@@ -355,15 +358,33 @@ def build_galaxies_from_ahf_fast(
         # Helper function to run FOF for a single task (for joblib.Parallel)
         def _run_single_fof(task):
             """Run FOF on a single task and return results."""
-            fof_tags, n_galaxies = run_fof6d_direct(
-                pos=task['pos'],
-                vel=task['vel'],
-                minstars=min_stars,
-                box_size=Lbox,
-                ll=fof_LL,
-                vel_ll=vel_LL,
-                ktab=kerneltab,
-            )
+            if task.get('use_sharded', False):
+                # Use sharded FOF for very large central halos
+                # fof6d_halo expects [ndim, npart] format
+                pos_T = task['pos'].T
+                vel_T = task['vel'].T
+                fof_tags, n_galaxies = fof6d_halo(
+                    nparthalo=len(task['pos']),
+                    npart=len(task['pos']),
+                    pos=pos_T,
+                    vel=vel_T,
+                    minstars=min_stars,
+                    Lbox=Lbox,
+                    fof_LL=fof_LL,
+                    vel_LL=vel_LL,
+                    kerneltab=kerneltab,
+                )
+            else:
+                # Use direct FOF for subhalos (avoids fragmentation)
+                fof_tags, n_galaxies = run_fof6d_direct(
+                    pos=task['pos'],
+                    vel=task['vel'],
+                    minstars=min_stars,
+                    box_size=Lbox,
+                    ll=fof_LL,
+                    vel_ll=vel_LL,
+                    ktab=kerneltab,
+                )
             return {
                 'node': task['node'],
                 'fof_tags': fof_tags,
@@ -471,10 +492,14 @@ def build_galaxies_from_ahf_fast(
                     pos = np.concatenate(pos_parts) if pos_parts else np.empty((0, 3))
                     vel = np.concatenate(vel_parts) if vel_parts else np.empty((0, 3))
 
+                    # Use sharded FOF for very large central halos (depth 0 with many stars)
+                    use_sharded = (depth == 0 and len(star_indices) >= SHARDED_FOF_THRESHOLD)
+
                     fof_tasks.append({
                         'node': node,
                         'pos': pos,
                         'vel': vel,
+                        'use_sharded': use_sharded,
                         'star_arr': star_arr,
                         'gas_arr': gas_arr,
                         'bh_arr': bh_arr,
