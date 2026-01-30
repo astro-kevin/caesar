@@ -10,8 +10,13 @@ from functools import wraps
 _profile_data = {}
 _profile_enabled = os.environ.get('CAESAR_PROFILE', '0') == '1'
 
+# Flag to suppress memlog output (used during per-host property calculation)
+_suppress_memlog = False
+
 
 def memlog(msg):
+    if _suppress_memlog:
+        return
     process = psutil.Process(os.getpid())
     mylog.info('%s, RAM=%.4g GB'%(msg,process.memory_info()[0]/2.**30))
 

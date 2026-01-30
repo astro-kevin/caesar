@@ -18,6 +18,9 @@ import numpy as np
 # Thread lock for incremental HDF5 writes (used when processing hosts in parallel)
 _hdf5_write_lock = threading.Lock()
 
+# Thread lock for galaxy_list updates (used when processing hosts in parallel)
+_galaxy_list_lock = threading.Lock()
+
 
 @dataclass
 class HostProcessingContext:
@@ -422,6 +425,22 @@ def build_galaxies_from_ahf_fast(
     # (get_HIH2_masses needs sim.galaxy_list to exist)
     sim.galaxy_list = []
     sim.ngalaxies = 0
+
+    # Initialize galaxy_index_list for all halos early
+    # (so we can build associations incrementally during host processing)
+    for halo in sim.halo_list:
+        halo.galaxy_index_list = []
+
+    # Build AHF halo ID -> halo index mapping early for incremental association building
+    ahf_to_halo_index: Dict[int, int] = {}
+    for halo_index, halo in enumerate(sim.halo_list):
+        ahf_hid = getattr(halo, "AHF_haloID", None)
+        if ahf_hid is None:
+            continue
+        try:
+            ahf_to_halo_index[int(ahf_hid)] = halo_index
+        except Exception:
+            continue
 
     # Ensure we have memberships for all needed nodes.
     load_dm = dm_pid_lookup is not None
@@ -950,8 +969,33 @@ def build_galaxies_from_ahf_fast(
             for gal in galaxies_only:
                 gal.global_indexes = _compute_global_indexes_local(gal)
 
-            # Compute properties and optionally write to HDF5
-            _compute_and_write_galaxy_properties(galaxies_only)
+            # Thread-safe update of sim.galaxy_list and halo associations
+            # This must happen BEFORE computing properties (HI/H2 needs galaxy_list)
+            with _galaxy_list_lock:
+                base_idx = len(sim.galaxy_list)
+                sim.galaxy_list.extend(galaxies_only)
+                sim.ngalaxies = len(sim.galaxy_list)
+
+                # Set up halo-galaxy associations for this host's galaxies
+                for i, gal in enumerate(galaxies_only):
+                    gal_idx = base_idx + i
+                    gal.GroupID = gal_idx  # Update GroupID to final index
+                    ahf_hid = getattr(gal, "AHF_haloID", None)
+                    if ahf_hid is not None:
+                        halo_idx = ahf_to_halo_index.get(int(ahf_hid))
+                        if halo_idx is not None and 0 <= halo_idx < len(sim.halo_list):
+                            gal.parent_halo_index = halo_idx
+                            sim.halo_list[halo_idx].galaxy_index_list.append(gal_idx)
+
+            # Suppress log spam during per-host property calculation
+            import caesar.utils
+            old_suppress = caesar.utils._suppress_memlog
+            caesar.utils._suppress_memlog = True
+            try:
+                # Compute properties and optionally write to HDF5
+                _compute_and_write_galaxy_properties(galaxies_only)
+            finally:
+                caesar.utils._suppress_memlog = old_suppress
 
         return HostProcessingResult(
             host_id=root_id,
@@ -1193,6 +1237,7 @@ def build_galaxies_from_ahf_fast(
 
         missing_hosts: Set[int] = set()
         preliminary_indices: List[int] = []
+        _orphans_removed = False  # Track if we need to rebuild associations
         for node_id in galaxy_node_ids:
             if node_id is None or node_id == -1:
                 preliminary_indices.append(-1)
@@ -1225,6 +1270,8 @@ def build_galaxies_from_ahf_fast(
                         del galaxy_node_ids[i]
                     sim.ngalaxies = len(sim.galaxy_list)
                     sim._ahf_galaxy_ahf_ids = list(galaxy_node_ids)
+                    # Mark that we need to rebuild associations (indices shifted)
+                    _orphans_removed = True
                     mylog.warning(
                         "AHF-FAST: Removed %d orphan galaxies whose hosts were stolen",
                         len(orphan_indices)
@@ -1252,15 +1299,20 @@ def build_galaxies_from_ahf_fast(
         sim._ahf_galaxy_ahf_ids = []
         _update_ahf_galaxy_maps(sim, [])
         host_indices = [-1 for _ in range(sim.ngalaxies)]
+        _orphans_removed = False  # No orphans possible in this branch
 
-    for halo in sim.halo_list:
-        halo.galaxy_index_list = []
+    # Associations were built incrementally in process_host(), but if orphans
+    # were removed (MPI artifacts), indices shifted and we must rebuild.
+    if _orphans_removed:
+        for halo in sim.halo_list:
+            halo.galaxy_index_list = []
 
-    for gi, host_idx in enumerate(host_indices):
-        idx = int(host_idx) if host_idx is not None else -1
-        sim.galaxy_list[gi].parent_halo_index = idx
-        if idx >= 0 and idx < len(sim.halo_list):
-            sim.halo_list[idx].galaxy_index_list.append(gi)
+        for gi, host_idx in enumerate(host_indices):
+            idx = int(host_idx) if host_idx is not None else -1
+            sim.galaxy_list[gi].parent_halo_index = idx
+            sim.galaxy_list[gi].GroupID = gi  # Update to final index
+            if idx >= 0 and idx < len(sim.halo_list):
+                sim.halo_list[idx].galaxy_index_list.append(gi)
 
     sim._ahf_galaxy_hosts = [int(h) if h is not None else -1 for h in host_indices]
 
