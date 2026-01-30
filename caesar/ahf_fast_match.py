@@ -9,10 +9,14 @@ source of truth lives here.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
+
+# Thread lock for incremental HDF5 writes (used when processing hosts in parallel)
+_hdf5_write_lock = threading.Lock()
 
 
 @dataclass
@@ -59,12 +63,224 @@ class HostProcessingResult:
     skipped_empty_payloads: int = 0
 
 
+class IncrementalGalaxyWriter:
+    """Thread-safe incremental HDF5 writer for galaxy data.
+
+    This class manages appending galaxy data to an HDF5 file as hosts are
+    processed, rather than waiting until all galaxies are collected.
+
+    Thread safety is achieved via a module-level lock (_hdf5_write_lock).
+    """
+
+    def __init__(self, filename: str, sim, overwrite: bool = True):
+        """Initialize the incremental writer.
+
+        Args:
+            filename: Path to the HDF5 output file
+            sim: CAESAR simulation object (for unit registry, data_manager info)
+            overwrite: If True, delete existing file; if False, append
+        """
+        import os
+        import h5py
+
+        self.filename = filename
+        self.sim = sim
+        self._galaxy_count = 0
+        self._list_offsets: Dict[str, int] = {}  # Track cumulative offsets for serialized lists
+
+        # Initialize file
+        if overwrite and os.path.exists(filename):
+            os.remove(filename)
+
+        with _hdf5_write_lock:
+            with h5py.File(filename, 'a') as hf:
+                # Create galaxy_data group if not exists
+                if 'galaxy_data' not in hf:
+                    hf.create_group('galaxy_data')
+                    hf['galaxy_data'].create_group('lists')
+                    hf['galaxy_data'].create_group('dicts')
+                    # Store metadata for later
+                    hf['galaxy_data'].attrs['incremental'] = True
+
+    def append_galaxies(self, galaxies: List[Any]) -> None:
+        """Thread-safe append of galaxy data to HDF5 file.
+
+        Args:
+            galaxies: List of Galaxy Group objects with computed properties
+        """
+        import h5py
+        from yt.units.yt_array import YTQuantity, YTArray
+
+        if not galaxies:
+            return
+
+        with _hdf5_write_lock:
+            with h5py.File(self.filename, 'a') as hf:
+                grp = hf['galaxy_data']
+                lists_grp = grp['lists']
+                dicts_grp = grp['dicts']
+
+                start_idx = self._galaxy_count
+                n_new = len(galaxies)
+
+                # Get attribute schema from first galaxy
+                sample = galaxies[0]
+
+                for k, v in sample.__dict__.items():
+                    if k.startswith('_') or k in ('G', 'initial_mass', 'valid',
+                                                   'vel_conversion', 'unbound_particles',
+                                                   '_units', 'unit_registry_json',
+                                                   'unbound_indexes', 'lists', 'dicts',
+                                                   'obj'):
+                        continue
+
+                    # Handle particle index lists (glist, slist, etc.)
+                    if k.endswith('list') and isinstance(v, np.ndarray):
+                        self._append_serialized_list(lists_grp, galaxies, k)
+                        continue
+
+                    # Handle dict attributes (masses, radii, etc.)
+                    if isinstance(v, dict):
+                        self._append_dict_attribute(dicts_grp, galaxies, k, v)
+                        continue
+
+                    # Handle scalar/vector attributes
+                    self._append_scalar_or_vector(grp, galaxies, k, v, start_idx, n_new)
+
+                self._galaxy_count += n_new
+
+    def _append_serialized_list(self, hd, galaxies, key: str) -> None:
+        """Append a serialized particle list (glist, slist, etc.)."""
+        import h5py
+
+        # Collect all particles and track offsets
+        all_particles = []
+        base_offset = self._list_offsets.get(key, 0)
+
+        for gal in galaxies:
+            plist = getattr(gal, key, None)
+            if plist is None:
+                plist = np.array([], dtype=np.int64)
+            plist = np.asarray(plist)
+            n = len(plist)
+            all_particles.extend(plist)
+
+            # Set start/end attributes on galaxy object
+            setattr(gal, f'{key}_start', base_offset)
+            base_offset += n
+            setattr(gal, f'{key}_end', base_offset)
+
+        self._list_offsets[key] = base_offset
+
+        if not all_particles:
+            return
+
+        new_data = np.array(all_particles, dtype=np.int64)
+
+        # Append to dataset (create if not exists)
+        if key not in hd:
+            maxshape = (None,)
+            hd.create_dataset(key, data=new_data, maxshape=maxshape,
+                              compression=1, chunks=True)
+        else:
+            ds = hd[key]
+            old_size = ds.shape[0]
+            new_size = old_size + len(new_data)
+            ds.resize((new_size,))
+            ds[old_size:new_size] = new_data
+
+    def _append_dict_attribute(self, hd, galaxies, key: str, sample_dict: dict) -> None:
+        """Append dictionary attributes (masses, radii, etc.)."""
+        import h5py
+        from yt.units.yt_array import YTQuantity, YTArray
+
+        for kk, vv in sample_dict.items():
+            ds_name = f'{key}.{kk}'
+            unit = None
+
+            if isinstance(vv, (YTQuantity, YTArray)):
+                data = np.array([getattr(g, key, {}).get(kk, vv).d for g in galaxies])
+                unit = str(vv.units)
+            else:
+                data = np.array([getattr(g, key, {}).get(kk, vv) for g in galaxies])
+
+            self._append_1d_data(hd, ds_name, data, unit)
+
+    def _append_scalar_or_vector(self, hd, galaxies, key: str, sample_val,
+                                  start_idx: int, n_new: int) -> None:
+        """Append scalar or vector attributes."""
+        import h5py
+        from yt.units.yt_array import YTQuantity, YTArray
+
+        unit = None
+
+        if isinstance(sample_val, YTQuantity):
+            data = np.array([getattr(g, key).d for g in galaxies])
+            unit = str(sample_val.units)
+        elif isinstance(sample_val, YTArray):
+            if np.shape(sample_val)[0] == 3:
+                data = np.vstack([getattr(g, key).d for g in galaxies])
+            else:
+                data = np.array([getattr(g, key).d for g in galaxies])
+            unit = str(sample_val.units)
+        elif isinstance(sample_val, np.ndarray) and np.shape(sample_val)[0] == 3 and 'list' not in key:
+            try:
+                data = np.vstack([getattr(g, key) for g in galaxies])
+            except Exception:
+                return
+        elif isinstance(sample_val, (int, float, bool, np.number)):
+            data = np.array([getattr(g, key) for g in galaxies])
+        else:
+            return
+
+        # Append to dataset
+        if data.ndim == 1:
+            self._append_1d_data(hd, key, data, unit)
+        elif data.ndim == 2:
+            self._append_2d_data(hd, key, data, unit)
+
+    def _append_1d_data(self, hd, key: str, data: np.ndarray, unit: Optional[str]) -> None:
+        """Append 1D data to a dataset."""
+        if key not in hd:
+            hd.create_dataset(key, data=data, maxshape=(None,),
+                              compression=1, chunks=True)
+            if unit:
+                hd[key].attrs.create('unit', unit.encode('utf8'))
+        else:
+            ds = hd[key]
+            old_size = ds.shape[0]
+            new_size = old_size + len(data)
+            ds.resize((new_size,))
+            ds[old_size:new_size] = data
+
+    def _append_2d_data(self, hd, key: str, data: np.ndarray, unit: Optional[str]) -> None:
+        """Append 2D data (e.g., positions, velocities) to a dataset."""
+        if key not in hd:
+            hd.create_dataset(key, data=data, maxshape=(None, data.shape[1]),
+                              compression=1, chunks=True)
+            if unit:
+                hd[key].attrs.create('unit', unit.encode('utf8'))
+        else:
+            ds = hd[key]
+            old_size = ds.shape[0]
+            new_size = old_size + len(data)
+            ds.resize((new_size, ds.shape[1]))
+            ds[old_size:new_size] = data
+
+    @property
+    def galaxy_count(self) -> int:
+        """Return the number of galaxies written so far."""
+        return self._galaxy_count
+
+
 def build_galaxies_from_ahf_fast(
     sim,
     ahf_particles_file: str,
     *,
     min_stars: Optional[int] = None,
     n_jobs: Optional[int] = None,
+    incremental_output: Optional[str] = None,
+    overwrite_output: bool = True,
 ) -> None:
     """Build galaxies directly from AHF nodes using a star-count gate.
 
@@ -220,6 +436,55 @@ def build_galaxies_from_ahf_fast(
         jobs = 1
     jobs = max(1, jobs)
 
+    # Initialize incremental HDF5 writer if requested
+    incremental_writer: Optional[IncrementalGalaxyWriter] = None
+    if incremental_output:
+        incremental_writer = IncrementalGalaxyWriter(
+            incremental_output, sim, overwrite=overwrite_output
+        )
+        mylog.info("AHF-FAST: Incremental output enabled -> %s (overwrite=%s)",
+                   incremental_output, overwrite_output)
+
+    # Helper to compute properties for a batch of galaxies and optionally write to HDF5
+    def _compute_and_write_galaxy_properties(galaxy_list: List) -> None:
+        """Compute properties for galaxies and optionally write to incremental HDF5."""
+        if not galaxy_list:
+            return
+
+        # Build minimal context for property computation
+        class _PropCtx:
+            def __init__(self, sim, gal_list):
+                self.obj = sim
+                self.obj_type = "galaxy"
+                self.nproc = getattr(sim, "nproc", 1)
+                self.load_pot = getattr(sim, "load_pot", True)
+                self.nparttot = sum(len(getattr(g, "global_indexes", [])) for g in gal_list)
+                mapping = {
+                    "gas": "glist", "star": "slist", "bh": "bhlist",
+                    "dm": "dmlist", "dm2": "dm2list", "dm3": "dm3list",
+                }
+                present = set(getattr(sim.data_manager, "ptypes", []))
+                counts: Dict[str, int] = {}
+                for p, attr in mapping.items():
+                    if present and p not in present:
+                        continue
+                    data = getattr(sim.data_manager, attr, None)
+                    if data is None:
+                        continue
+                    try:
+                        counts[p] = len(data)
+                    except TypeError:
+                        continue
+                self.nparttype = counts
+                self.counts = {"galaxy": len(gal_list)}
+
+        ctx = _PropCtx(sim, galaxy_list)
+        _get_group_properties(ctx, galaxy_list)
+
+        # Write to incremental HDF5 if enabled
+        if incremental_writer is not None:
+            incremental_writer.append_galaxies(galaxy_list)
+
     show_progress = bool(getattr(sim, "_show_progress", True))
     total_hosts = len(host_to_nodes)
     # Progress bar will be configured after host categorization
@@ -356,14 +621,12 @@ def build_galaxies_from_ahf_fast(
             """Run FOF on a single task and return results."""
             if task.get('use_sharded', False):
                 # Use sharded FOF for very large central halos
-                # fof6d_halo expects [ndim, npart] format
-                pos_T = task['pos'].T
-                vel_T = task['vel'].T
+                # fof6d_halo expects [npart, ndim] format (it transposes internally)
                 fof_tags, n_galaxies = fof6d_halo(
                     nparthalo=len(task['pos']),
                     npart=len(task['pos']),
-                    pos=pos_T,
-                    vel=vel_T,
+                    pos=task['pos'],
+                    vel=task['vel'],
                     minstars=min_stars,
                     Lbox=Lbox,
                     fof_LL=fof_LL,
@@ -452,6 +715,11 @@ def build_galaxies_from_ahf_fast(
                 star_indices = map_sel(star_arr, "star")
                 gas_indices = map_sel(gas_arr, "gas")
                 bh_indices = map_sel(bh_arr, "bh") if "bh" in pid_maps_sel else np.array([], dtype=np.int32)
+
+                # Skip nodes with insufficient mapped stars (no galaxy created)
+                if len(star_indices) < min_stars:
+                    non_fof_nodes.append((node, star_arr, gas_arr, bh_arr, dm_exc_arr, dm_inclusive, 'too_few_mapped'))
+                    continue
 
                 if host_needs_fof and len(star_indices) >= min_stars:
                     # FOF path: prepare task (only for large hosts)
@@ -643,6 +911,43 @@ def build_galaxies_from_ahf_fast(
                     else:
                         carry_dm[parent] = dm_exc_arr
 
+        # Compute properties for this host's galaxies immediately (not deferred)
+        if host_galaxies:
+            galaxies_only = [grp for _, grp in host_galaxies]
+
+            # Compute global_indexes for each galaxy
+            def _compute_global_indexes_local(gal) -> np.ndarray:
+                blocks = []
+                try:
+                    if hasattr(gal, "glist") and gal.glist is not None and len(gal.glist) > 0:
+                        blocks.append(sim.data_manager.glist[gal.glist])
+                except Exception:
+                    pass
+                try:
+                    if hasattr(gal, "slist") and gal.slist is not None and len(gal.slist) > 0:
+                        blocks.append(sim.data_manager.slist[gal.slist])
+                except Exception:
+                    pass
+                try:
+                    if hasattr(gal, "dmlist") and gal.dmlist is not None and len(gal.dmlist) > 0 and has_ptype(sim, "dm"):
+                        blocks.append(sim.data_manager.dmlist[gal.dmlist])
+                except Exception:
+                    pass
+                try:
+                    if hasattr(gal, "bhlist") and gal.bhlist is not None and len(gal.bhlist) > 0:
+                        blocks.append(sim.data_manager.bhlist[gal.bhlist])
+                except Exception:
+                    pass
+                if blocks:
+                    return np.concatenate(blocks).astype(np.int64)
+                return np.array([], dtype=np.int64)
+
+            for gal in galaxies_only:
+                gal.global_indexes = _compute_global_indexes_local(gal)
+
+            # Compute properties and optionally write to HDF5
+            _compute_and_write_galaxy_properties(galaxies_only)
+
         return HostProcessingResult(
             host_id=root_id,
             order_idx=order_idx,
@@ -830,37 +1135,7 @@ def build_galaxies_from_ahf_fast(
         sim._ahf_galaxy_hosts = []
         return
 
-    def _compute_global_indexes(gal) -> np.ndarray:
-        blocks = []
-        try:
-            if hasattr(gal, "glist") and gal.glist is not None and len(gal.glist) > 0:
-                blocks.append(sim.data_manager.glist[gal.glist])
-        except Exception:
-            pass
-        try:
-            if hasattr(gal, "slist") and gal.slist is not None and len(gal.slist) > 0:
-                blocks.append(sim.data_manager.slist[gal.slist])
-        except Exception:
-            pass
-        try:
-            if hasattr(gal, "dmlist") and gal.dmlist is not None and len(gal.dmlist) > 0 and has_ptype(sim, "dm"):
-                blocks.append(sim.data_manager.dmlist[gal.dmlist])
-        except Exception:
-            pass
-        try:
-            if hasattr(gal, "bhlist") and gal.bhlist is not None and len(gal.bhlist) > 0:
-                blocks.append(sim.data_manager.bhlist[gal.bhlist])
-        except Exception:
-            pass
-        if blocks:
-            return np.concatenate(blocks).astype(np.int64)
-        return np.array([], dtype=np.int64)
-
-    def _refresh_global_indexes(gal) -> None:
-        gal.global_indexes = _compute_global_indexes(gal)
-
-    for gal in sim.galaxy_list:
-        _refresh_global_indexes(gal)
+    # global_indexes were already computed in process_host()
 
     host_indices: List[int] = []
     if galaxy_node_ids and len(galaxy_node_ids) == sim.ngalaxies:
@@ -986,46 +1261,11 @@ def build_galaxies_from_ahf_fast(
 
     _prune_halos_after_galaxies(sim)
 
-    class _Ctx:
-        def __init__(self, sim):
-            self.obj = sim
-            self.obj_type = "galaxy"
-            self.nproc = getattr(sim, "nproc", 1)
-            self.load_pot = getattr(sim, "load_pot", True)
-            self.nparttot = sum(len(getattr(g, "global_indexes", [])) for g in sim.galaxy_list)
-            mapping = {
-                "gas": "glist",
-                "star": "slist",
-                "bh": "bhlist",
-                "dm": "dmlist",
-                "dm2": "dm2list",
-                "dm3": "dm3list",
-            }
-            present = set(getattr(sim.data_manager, "ptypes", []))
-            counts: Dict[str, int] = {}
-            for p, attr in mapping.items():
-                if present and p not in present:
-                    continue
-                data = getattr(sim.data_manager, attr, None)
-                if data is None:
-                    continue
-                try:
-                    counts[p] = len(data)
-                except TypeError:
-                    continue
-            self.nparttype = counts
-            self.counts = {"galaxy": len(sim.galaxy_list)}
-
-    ctx = _Ctx(sim)
-    prop_bar = None
-    if show_progress and sim.ngalaxies > 0:
-        prop_bar = tqdm(total=1, desc="Computing galaxy properties", leave=False)
-    try:
-        _get_group_properties(ctx, sim.galaxy_list)
-    finally:
-        if prop_bar is not None:
-            prop_bar.update(1)
-            prop_bar.close()
+    # Properties were already computed per-host in process_host()
+    # Log incremental writer stats if enabled
+    if incremental_writer is not None:
+        mylog.info("AHF-FAST: Incremental HDF5 writer completed with %d galaxies",
+                   incremental_writer.galaxy_count)
 
     try:
         if "galaxy" not in sim.group_types:
