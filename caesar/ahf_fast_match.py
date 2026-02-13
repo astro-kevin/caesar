@@ -1070,7 +1070,7 @@ def build_galaxies_from_ahf_fast(
     #   huge:   >= seq_threshold stars → sequential, multi-thread FOF
     import os as _os
     fof_threshold = 4 * min_stars  # Below this, no FOF needed
-    seq_threshold = int(_os.environ.get("CAESAR_AHF_FAST_SEQ_THRESHOLD", "1000000"))
+    seq_threshold = int(_os.environ.get("CAESAR_AHF_FAST_SEQ_THRESHOLD", "100000"))
 
     tiny_hosts: List[Tuple[int, Set[int], int]] = []
     medium_hosts: List[Tuple[int, Set[int], int]] = []
