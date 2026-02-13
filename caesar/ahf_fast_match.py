@@ -784,8 +784,8 @@ def build_galaxies_from_ahf_fast(
                     pos = np.concatenate(pos_parts) if pos_parts else np.empty((0, 3))
                     vel = np.concatenate(vel_parts) if vel_parts else np.empty((0, 3))
 
-                    # Use sharded FOF for very large central halos (depth 0 with many stars)
-                    use_sharded = (depth == 0 and len(star_indices) >= SHARDED_FOF_THRESHOLD)
+                    # Use sharded FOF for any node with many stars (spatial pre-sorting)
+                    use_sharded = len(star_indices) >= SHARDED_FOF_THRESHOLD
 
                     fof_tasks.append({
                         'node': node,
@@ -1064,10 +1064,25 @@ def build_galaxies_from_ahf_fast(
             total += np.sum(ptypes == 4)  # Count star particles (type 4)
         return total
 
+    def estimate_host_total_particles(nodes: Set[int]) -> int:
+        """Count total particles (all types) across all nodes in a host."""
+        total = 0
+        for node_id in nodes:
+            arr = membership_arrays.get(int(node_id))
+            if arr is None:
+                continue
+            arr = np.asarray(arr, dtype=np.int64)
+            if arr.size == 0:
+                continue
+            if arr.ndim != 2:
+                arr = arr.reshape(-1, 2)
+            total += len(arr)  # Count ALL particles, not just stars
+        return total
+
     # Three-tier host categorization:
     #   tiny:   < fof_threshold stars  → parallel, no FOF (direct assignment)
-    #   medium: fof_threshold to seq_threshold stars → parallel, single-thread FOF
-    #   huge:   >= seq_threshold stars → sequential, multi-thread FOF
+    #   medium: fof_threshold stars to seq_threshold total particles → parallel, single-thread FOF
+    #   huge:   >= seq_threshold total particles → sequential, multi-thread FOF
     import os as _os
     fof_threshold = 4 * min_stars  # Below this, no FOF needed
     seq_threshold = int(_os.environ.get("CAESAR_AHF_FAST_SEQ_THRESHOLD", "100000"))
@@ -1080,10 +1095,12 @@ def build_galaxies_from_ahf_fast(
         star_count = estimate_host_stars(nodes)
         if star_count < fof_threshold:
             tiny_hosts.append((root_id, nodes, star_count))
-        elif star_count < seq_threshold:
-            medium_hosts.append((root_id, nodes, star_count))
         else:
-            huge_hosts.append((root_id, nodes, star_count))
+            total_count = estimate_host_total_particles(nodes)
+            if total_count < seq_threshold:
+                medium_hosts.append((root_id, nodes, star_count))
+            else:
+                huge_hosts.append((root_id, nodes, star_count))
 
     # Sort ascending for better progress estimation (tiny/medium finish fast first)
     tiny_hosts.sort(key=lambda x: x[2])
