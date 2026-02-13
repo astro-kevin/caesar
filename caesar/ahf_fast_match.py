@@ -460,6 +460,10 @@ def build_galaxies_from_ahf_fast(
         jobs = 1
     jobs = max(1, jobs)
 
+    # Inner FOF parallelism: controlled per-tier to avoid thread explosion
+    # Medium hosts set this to 1 (outer parallel), huge hosts use full parallelism
+    fof_njobs = jobs
+
     # Initialize incremental HDF5 writer if requested
     incremental_writer: Optional[IncrementalGalaxyWriter] = None
     if incremental_output:
@@ -843,7 +847,9 @@ def build_galaxies_from_ahf_fast(
             if fof_tasks:
                 # Use threading for parallelism (avoids pickle issues with sim)
                 # KD-tree operations release GIL, so threading is effective
-                results = Parallel(n_jobs=jobs, backend='threading')(
+                # fof_njobs is set per-tier: 1 for medium hosts (outer parallel),
+                # full parallelism for huge hosts (outer sequential)
+                results = Parallel(n_jobs=fof_njobs, backend='threading')(
                     delayed(_run_single_fof)(task) for task in fof_tasks
                 )
 
@@ -1058,31 +1064,42 @@ def build_galaxies_from_ahf_fast(
             total += np.sum(ptypes == 4)  # Count star particles (type 4)
         return total
 
-    # Categorize hosts into small (parallel) and large (sequential)
-    # Store particle counts for sorting (most populous first)
-    size_threshold = 4 * min_stars  # Same threshold used for FOF decision
-    small_hosts: List[Tuple[int, Set[int], int]] = []  # (root_id, nodes, star_count)
-    large_hosts: List[Tuple[int, Set[int], int]] = []  # (root_id, nodes, star_count)
+    # Three-tier host categorization:
+    #   tiny:   < fof_threshold stars  → parallel, no FOF (direct assignment)
+    #   medium: fof_threshold to seq_threshold stars → parallel, single-thread FOF
+    #   huge:   >= seq_threshold stars → sequential, multi-thread FOF
+    import os as _os
+    fof_threshold = 4 * min_stars  # Below this, no FOF needed
+    seq_threshold = int(_os.environ.get("CAESAR_AHF_FAST_SEQ_THRESHOLD", "1000000"))
+
+    tiny_hosts: List[Tuple[int, Set[int], int]] = []
+    medium_hosts: List[Tuple[int, Set[int], int]] = []
+    huge_hosts: List[Tuple[int, Set[int], int]] = []
 
     for root_id, nodes in host_to_nodes.items():
         star_count = estimate_host_stars(nodes)
-        if star_count < size_threshold:
-            small_hosts.append((root_id, nodes, star_count))
+        if star_count < fof_threshold:
+            tiny_hosts.append((root_id, nodes, star_count))
+        elif star_count < seq_threshold:
+            medium_hosts.append((root_id, nodes, star_count))
         else:
-            large_hosts.append((root_id, nodes, star_count))
+            huge_hosts.append((root_id, nodes, star_count))
 
-    # Sort by particle count descending (most populous first)
-    small_hosts.sort(key=lambda x: x[2], reverse=True)
-    large_hosts.sort(key=lambda x: x[2], reverse=True)
+    # Sort ascending for better progress estimation (tiny/medium finish fast first)
+    tiny_hosts.sort(key=lambda x: x[2])
+    medium_hosts.sort(key=lambda x: x[2])
+    # Huge hosts: biggest first (get them started)
+    huge_hosts.sort(key=lambda x: x[2], reverse=True)
 
     mylog.info(
-        "AHF-FAST: categorized %d small hosts (parallel) and %d large hosts (sequential)",
-        len(small_hosts), len(large_hosts)
+        "AHF-FAST: categorized %d tiny (no FOF), %d medium (parallel FOF), %d huge (sequential FOF)",
+        len(tiny_hosts), len(medium_hosts), len(huge_hosts)
     )
 
     # Track remaining counts for progress bar
-    remaining_large = len(large_hosts)
-    remaining_small = len(small_hosts)
+    remaining_huge = len(huge_hosts)
+    remaining_medium = len(medium_hosts)
+    remaining_tiny = len(tiny_hosts)
 
     # Configure progress bar with category breakdown
     host_progress = tqdm(
@@ -1092,57 +1109,60 @@ def build_galaxies_from_ahf_fast(
         leave=False,
     )
     if host_progress is not None and not host_progress.disable:
-        host_progress.set_postfix(massive=remaining_large, other=remaining_small)
+        host_progress.set_postfix(huge=remaining_huge, medium=remaining_medium, tiny=remaining_tiny)
 
     total_skipped = 0
     host_order = 0
 
-    # Process small hosts in parallel batches
-    if small_hosts and use_fof:
-        from joblib import Parallel, delayed
+    from joblib import Parallel, delayed
 
-        def process_small_host(order_idx: int, root_id: int, nodes: Set[int]) -> HostProcessingResult:
-            bucket = build_bucket(nodes)
-            return process_host(order_idx, root_id, bucket)
+    def _process_host_for_parallel(order_idx: int, root_id: int, nodes: Set[int]) -> HostProcessingResult:
+        bucket = build_bucket(nodes)
+        return process_host(order_idx, root_id, bucket)
 
-        mylog.info("AHF-FAST: processing %d small hosts in parallel", len(small_hosts))
-        small_results = Parallel(n_jobs=jobs, backend='threading')(
-            delayed(process_small_host)(host_order + i, root_id, nodes)
-            for i, (root_id, nodes, _) in enumerate(small_hosts)
+    def _aggregate_results(results):
+        nonlocal total_skipped, host_order
+        for result in results:
+            if result.galaxies:
+                for node_id, grp in result.galaxies:
+                    galaxies.append(grp)
+                    galaxy_node_ids.append(int(node_id))
+            total_skipped += result.skipped_empty_payloads
+
+    # --- Tier 1: Tiny hosts (no FOF, parallel) ---
+    if tiny_hosts:
+        fof_njobs = 1  # No FOF needed, but set defensively
+        mylog.info("AHF-FAST: processing %d tiny hosts in parallel (no FOF)", len(tiny_hosts))
+        tiny_results = Parallel(n_jobs=jobs, backend='threading')(
+            delayed(_process_host_for_parallel)(host_order + i, root_id, nodes)
+            for i, (root_id, nodes, _) in enumerate(tiny_hosts)
         )
-
-        for result in small_results:
-            if result.galaxies:
-                for node_id, grp in result.galaxies:
-                    galaxies.append(grp)
-                    galaxy_node_ids.append(int(node_id))
-            total_skipped += result.skipped_empty_payloads
-
-        host_order += len(small_hosts)
-        remaining_small = 0
+        _aggregate_results(tiny_results)
+        host_order += len(tiny_hosts)
+        remaining_tiny = 0
         if host_progress is not None:
-            host_progress.update(len(small_hosts))
-            host_progress.set_postfix(massive=remaining_large, other=remaining_small)
+            host_progress.update(len(tiny_hosts))
+            host_progress.set_postfix(huge=remaining_huge, medium=remaining_medium, tiny=remaining_tiny)
 
-    elif small_hosts:
-        # No FOF, process small hosts sequentially
-        for root_id, nodes, _ in small_hosts:
-            bucket = build_bucket(nodes)
-            result = process_host(host_order, root_id, bucket)
-            if result.galaxies:
-                for node_id, grp in result.galaxies:
-                    galaxies.append(grp)
-                    galaxy_node_ids.append(int(node_id))
-            total_skipped += result.skipped_empty_payloads
-            host_order += 1
-            remaining_small -= 1
-            if host_progress is not None:
-                host_progress.update(1)
-                host_progress.set_postfix(massive=remaining_large, other=remaining_small)
+    # --- Tier 2: Medium hosts (parallel, single-thread FOF) ---
+    if medium_hosts:
+        fof_njobs = 1  # Single-thread inner FOF to avoid thread explosion
+        mylog.info("AHF-FAST: processing %d medium hosts in parallel (FOF n_jobs=1)", len(medium_hosts))
+        medium_results = Parallel(n_jobs=jobs, backend='threading')(
+            delayed(_process_host_for_parallel)(host_order + i, root_id, nodes)
+            for i, (root_id, nodes, _) in enumerate(medium_hosts)
+        )
+        _aggregate_results(medium_results)
+        host_order += len(medium_hosts)
+        remaining_medium = 0
+        if host_progress is not None:
+            host_progress.update(len(medium_hosts))
+            host_progress.set_postfix(huge=remaining_huge, medium=remaining_medium, tiny=remaining_tiny)
 
-    # Process large hosts sequentially (FOF parallelized within each)
-    # Already sorted by particle count descending (most populous first)
-    for root_id, nodes, _ in large_hosts:
+    # --- Tier 3: Huge hosts (sequential, multi-thread FOF) ---
+    fof_njobs = jobs  # Full parallelism for inner FOF
+    for root_id, nodes, sc in huge_hosts:
+        mylog.info("AHF-FAST: processing huge host %d (%d stars) sequentially", root_id, sc)
         bucket = build_bucket(nodes)
         result = process_host(host_order, root_id, bucket)
         if result.galaxies:
@@ -1151,10 +1171,10 @@ def build_galaxies_from_ahf_fast(
                 galaxy_node_ids.append(int(node_id))
         total_skipped += result.skipped_empty_payloads
         host_order += 1
-        remaining_large -= 1
+        remaining_huge -= 1
         if host_progress is not None:
             host_progress.update(1)
-            host_progress.set_postfix(massive=remaining_large, other=remaining_small)
+            host_progress.set_postfix(huge=remaining_huge, medium=remaining_medium, tiny=remaining_tiny)
 
     if host_progress is not None:
         host_progress.close()
