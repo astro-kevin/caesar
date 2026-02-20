@@ -32,6 +32,7 @@ def build_galaxies_from_ahf_fast(
     import json as _json
     import time as _time
     import threading as _threading
+    from collections import deque as _deque
     from tqdm import tqdm
     from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
@@ -39,6 +40,10 @@ def build_galaxies_from_ahf_fast(
     from caesar.group import get_group_properties as _get_group_properties
     from caesar.property_manager import get_property, has_ptype
     from caesar.AHF_FAST_loader import load_ahf_particle_blocks
+    from caesar.fof6d import fof6d_halo as _fof6d_halo
+    from caesar.fof6d import kernel_table as _fof6d_kernel_table
+    from caesar.fubar import get_b as _get_b
+    from caesar.fubar import get_mean_interparticle_separation as _get_mean_interparticle_separation
     from caesar.halo_matching import (
         ParticleMembership,
         _PidLookup,
@@ -257,21 +262,10 @@ def build_galaxies_from_ahf_fast(
                 "fof_candidates": fof_candidates,
                 "star_count": star_count,
                 "is_heavy": False,
-                "lane": "light",
+                "work_units": 1,
             }
         )
         host_workloads.append(fof_candidates)
-
-    tri_bin_requested = (_os.environ.get("CAESAR_AHF_FAST_THREE_BIN", "1") == "1")
-    tri_bin_enabled = jobs > 1 and tri_bin_requested
-    heavy_inflight_limit = 0
-    light_worker_limit = jobs
-    medium_worker_limit = 0
-    heavy_threshold = 0
-    medium_threshold = 0
-    heavy_count = 0
-    medium_count = 0
-    adaptive_enabled = False
 
     def _env_int(name: str, default: int) -> int:
         try:
@@ -285,173 +279,137 @@ def build_galaxies_from_ahf_fast(
         except Exception:
             return float(default)
 
-    cap_init = {"light": jobs, "medium": 0, "heavy": 0}
-    cap_min = {"light": 1, "medium": 0, "heavy": 0}
-    cap_max = {"light": jobs, "medium": jobs, "heavy": jobs}
-    adjust_every = 25
-    mem_crit_gb = 120.0
-    mem_low_gb = 240.0
-    mem_high_gb = 340.0
+    adaptive_enabled = (_os.environ.get("CAESAR_AHF_FAST_ADAPTIVE", "1") == "1")
+    scheduler_enabled = jobs > 1 and bool(host_schedule)
+    heavy_threshold = 0
+    heavy_count = 0
 
-    if tri_bin_enabled and host_schedule:
-        medium_percentile = min(100.0, max(0.0, _env_float("CAESAR_AHF_FAST_MEDIUM_PERCENTILE", 65.0)))
-        heavy_percentile = min(100.0, max(0.0, _env_float("CAESAR_AHF_FAST_HEAVY_PERCENTILE", 90.0)))
+    # Adaptive scheduler controls.
+    work_unit = 1
+    scan_window = max(8, _env_int("CAESAR_AHF_FAST_SCAN_WINDOW", max(32, jobs * 4)))
+    adjust_every = max(1, _env_int("CAESAR_AHF_FAST_ADJUST_EVERY", max(2, jobs // 2)))
+    adjust_interval_s = max(0.2, _env_float("CAESAR_AHF_FAST_ADJUST_INTERVAL_S", 1.0))
+    runtime_ewma_alpha = min(0.95, max(0.05, _env_float("CAESAR_AHF_FAST_RUNTIME_EWMA_ALPHA", 0.25)))
+    mem_drop_warn_gbps = max(0.1, _env_float("CAESAR_AHF_FAST_MEM_DROP_WARN_GBPS", 1.0))
+    mem_drop_crit_gbps = max(mem_drop_warn_gbps, _env_float("CAESAR_AHF_FAST_MEM_DROP_CRIT_GBPS", 2.5))
+    mem_trend_window = max(3, _env_int("CAESAR_AHF_FAST_MEM_TREND_WINDOW", 8))
 
-        medium_min = max(0, _env_int("CAESAR_AHF_FAST_MEDIUM_MIN_CANDIDATES", 8000))
-        heavy_min = max(0, _env_int("CAESAR_AHF_FAST_HEAVY_MIN_CANDIDATES", 50000))
+    worker_scale = {
+        "critical": min(1.0, max(0.05, _env_float("CAESAR_AHF_FAST_WORKERS_CRIT_SCALE", 0.35))),
+        "low": min(1.0, max(0.10, _env_float("CAESAR_AHF_FAST_WORKERS_LOW_SCALE", 0.60))),
+        "nominal": min(1.0, max(0.20, _env_float("CAESAR_AHF_FAST_WORKERS_NOMINAL_SCALE", 1.0))),
+        "high": min(1.0, max(0.20, _env_float("CAESAR_AHF_FAST_WORKERS_HIGH_SCALE", 1.0))),
+    }
+    budget_scale = {
+        "critical": max(1.0, _env_float("CAESAR_AHF_FAST_WORK_BUDGET_SCALE_CRIT", 1.0)),
+        "low": max(1.0, _env_float("CAESAR_AHF_FAST_WORK_BUDGET_SCALE_LOW", 1.25)),
+        "nominal": max(1.0, _env_float("CAESAR_AHF_FAST_WORK_BUDGET_SCALE_NOMINAL", 1.8)),
+        "high": max(1.0, _env_float("CAESAR_AHF_FAST_WORK_BUDGET_SCALE_HIGH", 2.3)),
+    }
 
-        workload_arr = np.asarray(host_workloads, dtype=np.float64)
-        medium_cut = int(np.percentile(workload_arr, medium_percentile))
-        heavy_cut = int(np.percentile(workload_arr, heavy_percentile))
-        medium_threshold = max(medium_min, medium_cut)
-        heavy_threshold = max(heavy_min, heavy_cut, medium_threshold)
+    # Obtain total memory once to set scale-aware defaults when thresholds are
+    # not explicitly configured.
+    if _psutil is None or _proc is None:
+        try:
+            import psutil as _ps
+            _psutil = _ps
+            _proc = _psutil.Process()
+        except Exception:
+            pass
+    _, _, _avail_b0, _total_b0 = _snapshot_memory()
+    total_gb = (_total_b0 / 2**30) if _total_b0 and _total_b0 > 0 else 0.0
+    crit_default = max(32.0, total_gb * 0.15) if total_gb > 0 else 120.0
+    low_default = max(64.0, total_gb * 0.25) if total_gb > 0 else 240.0
+    high_default = max(96.0, total_gb * 0.35) if total_gb > 0 else 340.0
+    mem_crit_gb = _env_float("CAESAR_AHF_FAST_MEM_HEADROOM_CRIT_GB", crit_default)
+    mem_low_gb = _env_float("CAESAR_AHF_FAST_MEM_HEADROOM_LOW_GB", low_default)
+    mem_high_gb = _env_float("CAESAR_AHF_FAST_MEM_HEADROOM_HIGH_GB", high_default)
+    if mem_low_gb < mem_crit_gb:
+        mem_low_gb = mem_crit_gb
+    if mem_high_gb < mem_low_gb:
+        mem_high_gb = mem_low_gb
 
-        for item in host_schedule:
-            w = int(item["fof_candidates"])
-            if w >= heavy_threshold:
-                lane = "heavy"
-            elif w >= medium_threshold:
-                lane = "medium"
-            else:
-                lane = "light"
-            item["lane"] = lane
-            item["is_heavy"] = lane == "heavy"
+    positive_workloads = [int(w) for w in host_workloads if int(w) > 0]
+    if positive_workloads:
+        work_unit = max(1, int(np.percentile(np.asarray(positive_workloads, dtype=np.float64), 50.0)))
 
-        heavy_count = int(sum(1 for item in host_schedule if item["lane"] == "heavy"))
-        medium_count = int(sum(1 for item in host_schedule if item["lane"] == "medium"))
-        light_count = int(len(host_schedule) - heavy_count - medium_count)
+    trace_heavy_percentile = min(100.0, max(0.0, _env_float("CAESAR_AHF_FAST_TRACE_HEAVY_PERCENTILE", 97.0)))
+    trace_heavy_min = max(0, _env_int("CAESAR_AHF_FAST_TRACE_HEAVY_MIN_CANDIDATES", 50000))
+    if host_workloads:
+        heavy_threshold = max(
+            trace_heavy_min,
+            int(np.percentile(np.asarray(host_workloads, dtype=np.float64), trace_heavy_percentile)),
+        )
+    else:
+        heavy_threshold = trace_heavy_min
 
-        heavy_default = 1 if heavy_count > 0 else 0
-        heavy_inflight_limit = max(0, min(_env_int("CAESAR_AHF_FAST_HEAVY_INFLIGHT", heavy_default), jobs - 1))
-        medium_default = 0
-        if medium_count > 0:
-            medium_default = max(1, min(max(2, jobs // 10), max(1, jobs - heavy_inflight_limit - 1)))
-        medium_worker_limit = max(0, min(_env_int("CAESAR_AHF_FAST_MEDIUM_INFLIGHT", medium_default), jobs))
+    for item in host_schedule:
+        w = int(item["fof_candidates"])
+        item["is_heavy"] = bool(w >= heavy_threshold)
+        # Sub-linear work units preserve scale differences without making
+        # high-work hosts effectively single-threaded.
+        scaled = float(max(1, w)) / float(max(1, work_unit))
+        item["work_units"] = int(min(max(1, np.ceil(np.sqrt(max(1.0, scaled)))), max(2, jobs * 2)))
 
-        light_worker_limit = max(1, jobs - heavy_inflight_limit - medium_worker_limit)
-        spill = max(0, (heavy_inflight_limit + medium_worker_limit + light_worker_limit) - jobs)
-        if spill > 0:
-            take_m = min(spill, max(0, medium_worker_limit))
-            medium_worker_limit -= take_m
-            spill -= take_m
-            if spill > 0:
-                heavy_inflight_limit = max(0, heavy_inflight_limit - spill)
-        light_worker_limit = max(1, jobs - heavy_inflight_limit - medium_worker_limit)
-
-        cap_init = {
-            "light": int(light_worker_limit),
-            "medium": int(medium_worker_limit),
-            "heavy": int(heavy_inflight_limit),
-        }
-
-        heavy_min_cap_default = 0
-        heavy_max_cap_default = max(heavy_inflight_limit, min(4, max(0, jobs - 1)))
-        medium_min_cap_default = 0
-        medium_max_cap_default = max(medium_worker_limit, min(max(4, jobs // 3), max(0, jobs - 1)))
-
-        cap_min["heavy"] = max(0, min(_env_int("CAESAR_AHF_FAST_HEAVY_INFLIGHT_MIN", heavy_min_cap_default), jobs))
-        cap_max["heavy"] = max(cap_min["heavy"], min(_env_int("CAESAR_AHF_FAST_HEAVY_INFLIGHT_MAX", heavy_max_cap_default), jobs))
-        cap_min["medium"] = max(0, min(_env_int("CAESAR_AHF_FAST_MEDIUM_INFLIGHT_MIN", medium_min_cap_default), jobs))
-        cap_max["medium"] = max(cap_min["medium"], min(_env_int("CAESAR_AHF_FAST_MEDIUM_INFLIGHT_MAX", medium_max_cap_default), jobs))
-        cap_min["light"] = 1
-        cap_max["light"] = jobs
-
-        if heavy_count == 0:
-            cap_init["heavy"] = 0
-            cap_min["heavy"] = 0
-            cap_max["heavy"] = 0
-        if medium_count == 0:
-            cap_init["medium"] = 0
-            cap_min["medium"] = 0
-            cap_max["medium"] = 0
-        cap_init["light"] = max(1, jobs - cap_init["heavy"] - cap_init["medium"])
-
-        adaptive_enabled = (_os.environ.get("CAESAR_AHF_FAST_ADAPTIVE", "1") == "1")
-        adjust_every = max(1, _env_int("CAESAR_AHF_FAST_ADJUST_EVERY", 25))
-
-        # Obtain total memory once to set scale-aware defaults when thresholds
-        # are not explicitly configured.
-        if _psutil is None or _proc is None:
-            try:
-                import psutil as _ps
-                _psutil = _ps
-                _proc = _psutil.Process()
-            except Exception:
-                pass
-        _, _, _avail_b0, _total_b0 = _snapshot_memory()
-        total_gb = (_total_b0 / 2**30) if _total_b0 and _total_b0 > 0 else 0.0
-        crit_default = max(32.0, total_gb * 0.15) if total_gb > 0 else 120.0
-        low_default = max(64.0, total_gb * 0.25) if total_gb > 0 else 240.0
-        high_default = max(96.0, total_gb * 0.35) if total_gb > 0 else 340.0
-        mem_crit_gb = _env_float("CAESAR_AHF_FAST_MEM_HEADROOM_CRIT_GB", crit_default)
-        mem_low_gb = _env_float("CAESAR_AHF_FAST_MEM_HEADROOM_LOW_GB", low_default)
-        mem_high_gb = _env_float("CAESAR_AHF_FAST_MEM_HEADROOM_HIGH_GB", high_default)
-        if mem_low_gb < mem_crit_gb:
-            mem_low_gb = mem_crit_gb
-        if mem_high_gb < mem_low_gb:
-            mem_high_gb = mem_low_gb
-
-        heavy_examples = sorted(
+    heavy_count = int(sum(1 for item in host_schedule if item["is_heavy"]))
+    heavy_examples = sorted(
+        (
             (
-                (int(item["fof_candidates"]), int(item["star_count"]), int(item["root_id"]))
-                for item in host_schedule
-                if item["lane"] == "heavy"
-            ),
-            reverse=True,
-        )[:5]
-        medium_examples = sorted(
-            (
-                (int(item["fof_candidates"]), int(item["star_count"]), int(item["root_id"]))
-                for item in host_schedule
-                if item["lane"] == "medium"
-            ),
-            reverse=True,
-        )[:5]
+                int(item["fof_candidates"]),
+                int(item["work_units"]),
+                int(item["star_count"]),
+                int(item["root_id"]),
+            )
+            for item in host_schedule
+            if item["is_heavy"]
+        ),
+        reverse=True,
+    )[:5]
 
+    if scheduler_enabled:
         mylog.info(
-            "AHF-FAST: tri-bin scheduler enabled: hosts=%d light=%d medium=%d heavy=%d "
-            "(thresholds medium=%d [p=%.1f,min=%d], heavy=%d [p=%.1f,min=%d]), "
-            "caps(light=%d, medium=%d, heavy=%d), adaptive=%d",
+            "AHF-FAST: adaptive scheduler enabled: hosts=%d workers=%d work_unit=%d scan_window=%d adaptive=%d",
             len(host_schedule),
-            light_count,
-            medium_count,
-            heavy_count,
-            medium_threshold,
-            medium_percentile,
-            medium_min,
-            heavy_threshold,
-            heavy_percentile,
-            heavy_min,
-            cap_init["light"],
-            cap_init["medium"],
-            cap_init["heavy"],
+            jobs,
+            work_unit,
+            scan_window,
             int(adaptive_enabled),
         )
         mylog.info(
-            "AHF-FAST: medium host examples (fof_candidates, stars, host_id): %s",
-            medium_examples,
+            "AHF-FAST: tracing threshold fof_candidates >= %d (count=%d)",
+            heavy_threshold,
+            heavy_count,
         )
         mylog.info(
-            "AHF-FAST: heavy host examples (fof_candidates, stars, host_id): %s",
+            "AHF-FAST: largest host examples (fof_candidates, work_units, stars, host_id): %s",
             heavy_examples,
         )
         if adaptive_enabled:
             mylog.info(
-                "AHF-FAST: adaptive caps adjust_every=%d headroom_gb=(crit=%.1f,low=%.1f,high=%.1f) "
-                "bounds medium=[%d,%d] heavy=[%d,%d]",
+                "AHF-FAST: controller adjust_every=%d adjust_interval_s=%.2f ewma_alpha=%.2f "
+                "headroom_gb=(crit=%.1f,low=%.1f,high=%.1f) mem_drop_gbps=(warn=%.2f,crit=%.2f) "
+                "worker_scale=(crit=%.2f,low=%.2f,nominal=%.2f,high=%.2f) "
+                "work_budget_scale=(crit=%.2f,low=%.2f,nominal=%.2f,high=%.2f)",
                 adjust_every,
+                adjust_interval_s,
+                runtime_ewma_alpha,
                 mem_crit_gb,
                 mem_low_gb,
                 mem_high_gb,
-                cap_min["medium"],
-                cap_max["medium"],
-                cap_min["heavy"],
-                cap_max["heavy"],
+                mem_drop_warn_gbps,
+                mem_drop_crit_gbps,
+                worker_scale["critical"],
+                worker_scale["low"],
+                worker_scale["nominal"],
+                worker_scale["high"],
+                budget_scale["critical"],
+                budget_scale["low"],
+                budget_scale["nominal"],
+                budget_scale["high"],
             )
-
-    if not tri_bin_enabled:
+    else:
         mylog.info(
-            "AHF-FAST: single-lane scheduler (workers=%d, hosts=%d)",
+            "AHF-FAST: serial scheduler (workers=%d, hosts=%d)",
             jobs,
             len(host_schedule),
         )
@@ -467,15 +425,11 @@ def build_galaxies_from_ahf_fast(
         "host_prepare",
         hosts_total=len(host_schedule),
         jobs=jobs,
-        two_lane=0,
-        tri_bin=int(tri_bin_enabled),
+        scheduler_mode="adaptive_global" if scheduler_enabled else "serial",
+        scan_window=int(scan_window),
+        work_unit=int(work_unit),
         heavy_hosts=heavy_count,
-        medium_hosts=medium_count,
         heavy_threshold=heavy_threshold,
-        medium_threshold=medium_threshold,
-        light_workers=light_worker_limit,
-        medium_workers=medium_worker_limit,
-        heavy_workers=heavy_inflight_limit,
         adaptive=int(adaptive_enabled),
     )
 
@@ -488,35 +442,141 @@ def build_galaxies_from_ahf_fast(
             return mapped
         return np.unique(mapped)
 
-    def _apply_dense_gas_gate(gal) -> None:
-        """Optionally restrict galaxy gas to dense/cool/SF gas before computing properties.
+    # 6D-FOF configuration for subhalo payloads in AHF-FAST mode.
+    subhalo_fof6d_enabled = _os.environ.get("CAESAR_AHF_FAST_SUBHALO_FOF6D", "1") == "1"
+    fof_nHlim = _env_float("CAESAR_AHF_FAST_FOF_NHLIM", 0.13)
+    fof_Tlim = _env_float("CAESAR_AHF_FAST_FOF_TLIM", 1.0e5)
+    fof_use_sfr_gate = _os.environ.get("CAESAR_AHF_FAST_FOF_USE_SFR", "1") == "1"
+    fof_vel_ll = 1.0
+    try:
+        _vel_env = _os.environ.get("CAESAR_FOF6D_VEL_LL")
+        if _vel_env is not None and _vel_env != "":
+            fof_vel_ll = float(_vel_env)
+    except Exception:
+        pass
+    if _os.environ.get("CAESAR_FOF6D_DISABLE_VEL", "0") == "1":
+        fof_vel_ll = None
 
-        Mirrors the gate used by 6D-FOF:
-        nH > 0.13 and (T < 1e5 or SFR > 0).
-        """
+    fof_ll = 0.0
+    fof_kerneltab = None
+    fof_boxsize = float(sim.simulation.boxsize.d)
+    if subhalo_fof6d_enabled:
         try:
-            gidx = getattr(gal, "glist", None)
-            if gidx is None or len(gidx) == 0:
-                return
-            dm = getattr(sim, "data_manager", None)
-            if dm is None:
-                return
-            gnh = getattr(dm, "gnh", None)
-            gT = getattr(dm, "gT", None)
-            gsfr = getattr(dm, "gsfr", None)
-            if gnh is None or gT is None or gsfr is None:
-                return
-            gidx_arr = np.asarray(gidx, dtype=np.int64)
+            fof_mis = float(_get_mean_interparticle_separation(sim).d)
+            fof_ll = float(fof_mis * _get_b(sim, "galaxy"))
+            fof_kerneltab = _fof6d_kernel_table(fof_ll)
+            mylog.info(
+                "AHF-FAST: subhalo 6D-FOF enabled (LL=%g, vel_LL=%s, min_stars=%d)",
+                fof_ll,
+                "None" if fof_vel_ll is None else f"{fof_vel_ll:g}",
+                int(min_stars),
+            )
+        except Exception as exc:
+            subhalo_fof6d_enabled = False
+            mylog.warning("AHF-FAST: disabling subhalo 6D-FOF due to setup error: %s", exc)
+    else:
+        mylog.info("AHF-FAST: subhalo 6D-FOF disabled via CAESAR_AHF_FAST_SUBHALO_FOF6D=0")
+
+    tiny_star_threshold = 32
+    huge_q = min(0.99, max(0.55, _env_float("CAESAR_AHF_FAST_BIN_HUGE_Q", 0.85)))
+    payload_update_every = max(1, _env_int("CAESAR_AHF_FAST_BIN_UPDATE_EVERY", 32))
+    payload_warmup = max(8, _env_int("CAESAR_AHF_FAST_BIN_WARMUP", max(16, jobs * 4)))
+    payload_sample_cap = max(128, _env_int("CAESAR_AHF_FAST_BIN_SAMPLE_CAP", 4096))
+    payload_samples = _deque(maxlen=payload_sample_cap)
+    if positive_workloads:
+        for w in positive_workloads:
+            payload_samples.append(max(0, int(w)))
+    if not payload_samples:
+        payload_samples.append(int(max(1, min_stars)))
+
+    payload_cutoffs = {"tiny": int(tiny_star_threshold), "huge": int(max(2, min_stars + 1))}
+    payload_lock = _threading.Lock()
+
+    def _refresh_payload_cutoffs_locked() -> None:
+        if not payload_samples:
+            payload_cutoffs["tiny"] = int(tiny_star_threshold)
+            payload_cutoffs["huge"] = int(max(2, min_stars + 1))
+            return
+        arr = np.asarray(payload_samples, dtype=np.float64)
+        huge_est = int(np.percentile(arr, 100.0 * huge_q))
+        huge_floor = max(int(min_stars) + 1, int(np.percentile(arr, 60.0)))
+        huge_est = max(huge_floor, huge_est)
+        payload_cutoffs["tiny"] = int(tiny_star_threshold)
+        payload_cutoffs["huge"] = int(huge_est)
+
+    with payload_lock:
+        _refresh_payload_cutoffs_locked()
+        init_tiny = int(payload_cutoffs["tiny"])
+        init_huge = int(payload_cutoffs["huge"])
+    mylog.info(
+        "AHF-FAST: dynamic payload bins enabled (tiny_stars<=%d fixed, huge_q=%.2f init_cutoffs=(tiny=%d,huge=%d))",
+        int(tiny_star_threshold),
+        huge_q,
+        init_tiny,
+        init_huge,
+    )
+
+    def _classify_payload_size(star_particle_count: int, fof_particle_count: int) -> Tuple[str, int, int]:
+        stars = max(0, int(star_particle_count))
+        count = max(0, int(fof_particle_count))
+        with payload_lock:
+            if stars > int(tiny_star_threshold):
+                payload_samples.append(count)
+                n = len(payload_samples)
+                if n <= payload_warmup or (n % payload_update_every) == 0:
+                    _refresh_payload_cutoffs_locked()
+            else:
+                payload_cutoffs["tiny"] = int(tiny_star_threshold)
+            tiny_cut = int(payload_cutoffs["tiny"])
+            huge_cut = int(payload_cutoffs["huge"])
+        if stars <= tiny_cut:
+            return "tiny", tiny_cut, huge_cut
+        if count >= huge_cut:
+            return "huge", tiny_cut, huge_cut
+        return "normal", tiny_cut, huge_cut
+
+    def _dense_gas_selected(gidx: np.ndarray) -> np.ndarray:
+        gidx_arr = np.asarray(gidx, dtype=np.int64)
+        if gidx_arr.size == 0:
+            return np.empty(0, dtype=np.int32)
+        dm = getattr(sim, "data_manager", None)
+        if dm is None:
+            return gidx_arr.astype(np.int32, copy=False)
+        gnh = getattr(dm, "gnh", None)
+        gT = getattr(dm, "gT", None)
+        gsfr = getattr(dm, "gsfr", None)
+        if gnh is None or gT is None or gsfr is None:
+            return gidx_arr.astype(np.int32, copy=False)
+        try:
             nh = gnh[gidx_arr]
             temp = gT[gidx_arr]
             sfr = gsfr[gidx_arr]
-            nHlim = 0.13
-            Tlim = 1.0e5
-            mask = (nh > nHlim) & ((temp < Tlim) | (sfr > 0))
-            gal.glist = gidx_arr[mask]
+            if fof_use_sfr_gate:
+                mask = (nh > fof_nHlim) & ((temp < fof_Tlim) | (sfr > 0))
+            else:
+                mask = (nh > fof_nHlim) & (temp < fof_Tlim)
+            return gidx_arr[mask].astype(np.int32, copy=False)
         except Exception:
-            # If anything goes wrong, leave glist unchanged.
-            return
+            return gidx_arr.astype(np.int32, copy=False)
+
+    def _make_group(
+        node_id: int,
+        star_sel: np.ndarray,
+        gas_sel_dense: np.ndarray,
+        bh_sel: np.ndarray,
+        dm_selected: np.ndarray,
+        dm_exc: Optional[Set[int]] = None,
+    ):
+        grp = create_new_group(sim, "galaxy")
+        grp.AHF_haloID = int(node_id)
+        grp.slist = np.asarray(star_sel, dtype=np.int32)
+        grp.glist = np.asarray(gas_sel_dense, dtype=np.int32)
+        if "bh" in pid_maps_sel:
+            grp.bhlist = np.asarray(bh_sel, dtype=np.int32)
+        grp.dmlist = np.asarray(dm_selected, dtype=np.int32)
+        grp.global_indexes = np.array([], dtype=np.int64)
+        grp.__dict__["_dm_exclusive_pids"] = set(dm_exc) if dm_exc else set()
+        return grp
 
     skipped_empty_payloads = 0
 
@@ -529,7 +589,7 @@ def build_galaxies_from_ahf_fast(
     ):
         nodes_for_host = host_to_nodes.get(root_id, set())
         if not nodes_for_host:
-            return order_idx, [], 0
+            return order_idx, [], 0, {}
 
         if _trace_host(order_idx, is_heavy):
             _phase_memlog(
@@ -603,33 +663,124 @@ def build_galaxies_from_ahf_fast(
                     payloads=0,
                     skipped=0,
                 )
-            return order_idx, [], 0
+            return order_idx, [], 0, {}
 
         host_galaxies: List[Tuple[int, object]] = []
         local_skipped = 0
+        host_stats = {
+            "payloads": 0,
+            "tiny": 0,
+            "normal": 0,
+            "huge": 0,
+            "tiny_skips": 0,
+            "fof_runs": 0,
+            "fof_groups": 0,
+            "fof_unassigned": 0,
+            "fof_empty": 0,
+            "fof_fallback": 0,
+        }
 
         for payload in payloads:
             node_id, star_set, gas_set, bh_set, dm_exc = payload
             dm_pm = bucket.get(node_id)
             dm_inclusive = dm_pm.parttype1 if dm_pm is not None else set()
-            grp = create_new_group(sim, "galaxy")
-            grp.AHF_haloID = int(node_id)
-            grp.slist = map_sel(star_set, "star")
-            grp.glist = map_sel(gas_set, "gas")
-            _apply_dense_gas_gate(grp)
+
+            star_sel = map_sel(star_set, "star")
+            gas_sel = map_sel(gas_set, "gas")
+            gas_sel_dense = _dense_gas_selected(gas_sel)
             if "bh" in pid_maps_sel:
-                grp.bhlist = map_sel(bh_set, "bh")
+                bh_sel = map_sel(bh_set, "bh")
+            else:
+                bh_sel = np.empty(0, dtype=np.int32)
             if "dm" in pid_maps_sel:
                 dm_selected = map_sel(dm_inclusive, "dm")
             else:
-                dm_selected = np.array([], dtype=np.int32)
-            grp.dmlist = dm_selected
-            grp.global_indexes = np.array([], dtype=np.int64)
-            if dm_exc:
-                grp.__dict__["_dm_exclusive_pids"] = set(dm_exc)
-            else:
-                grp.__dict__["_dm_exclusive_pids"] = set()
+                dm_selected = np.empty(0, dtype=np.int32)
 
+            star_particle_count = int(len(star_sel))
+            fof_particle_count = int(star_particle_count + len(gas_sel_dense) + len(bh_sel))
+            mode, tiny_cut, huge_cut = _classify_payload_size(star_particle_count, fof_particle_count)
+            host_stats["payloads"] += 1
+            host_stats[mode] += 1
+
+            did_run_fof = False
+            built_from_fof = False
+
+            if (
+                subhalo_fof6d_enabled
+                and fof_kerneltab is not None
+                and fof_ll > 0.0
+                and mode != "tiny"
+                and fof_particle_count > int(min_stars)
+            ):
+                gas_concat = sim.data_manager.selected_to_concat("gas", np.asarray(gas_sel_dense, dtype=np.int64))
+                star_concat = sim.data_manager.selected_to_concat("star", np.asarray(star_sel, dtype=np.int64))
+                if bh_sel.size > 0:
+                    bh_concat = sim.data_manager.selected_to_concat("bh", np.asarray(bh_sel, dtype=np.int64))
+                else:
+                    bh_concat = np.empty(0, dtype=np.int64)
+                eligible_concat = np.concatenate((gas_concat, star_concat, bh_concat), axis=None).astype(np.int64, copy=False)
+
+                if eligible_concat.size > int(min_stars):
+                    did_run_fof = True
+                    host_stats["fof_runs"] += 1
+                    tags, nfof = _fof6d_halo(
+                        int(eligible_concat.size),
+                        int(eligible_concat.size),
+                        sim.data_manager.pos[eligible_concat],
+                        sim.data_manager.vel[eligible_concat],
+                        int(min_stars),
+                        fof_boxsize,
+                        fof_ll,
+                        fof_vel_ll,
+                        fof_kerneltab,
+                    )
+                    tags = np.asarray(tags, dtype=np.int64)
+                    valid_tags = np.unique(tags[tags >= 0])
+                    host_stats["fof_unassigned"] += int(np.sum(tags < 0))
+
+                    if valid_tags.size > 0:
+                        ng = int(gas_sel_dense.size)
+                        ns = int(star_sel.size)
+                        nb = int(bh_sel.size)
+                        allow_dm = (valid_tags.size == 1)
+                        if (not allow_dm) and dm_selected.size > 0:
+                            dm_selected = np.empty(0, dtype=np.int32)
+                        built_local = 0
+                        for gid in valid_tags:
+                            mask = tags == int(gid)
+                            gsub = gas_sel_dense[mask[:ng]] if ng > 0 else np.empty(0, dtype=np.int32)
+                            ssub = star_sel[mask[ng:ng + ns]] if ns > 0 else np.empty(0, dtype=np.int32)
+                            bsub = bh_sel[mask[ng + ns:ng + ns + nb]] if nb > 0 else np.empty(0, dtype=np.int32)
+                            # Keep the same galaxy validity gate as CAESAR core.
+                            if int(ssub.size) < int(min_stars):
+                                continue
+                            grp = _make_group(
+                                int(node_id),
+                                ssub,
+                                gsub,
+                                bsub,
+                                dm_selected if allow_dm else np.empty(0, dtype=np.int32),
+                                dm_exc if allow_dm else None,
+                            )
+                            host_galaxies.append((int(node_id), grp))
+                            built_local += 1
+
+                        if built_local > 0:
+                            built_from_fof = True
+                            host_stats["fof_groups"] += int(built_local)
+                    else:
+                        host_stats["fof_empty"] += 1
+
+            if built_from_fof:
+                continue
+
+            if did_run_fof:
+                host_stats["fof_fallback"] += 1
+            if mode == "tiny":
+                host_stats["tiny_skips"] += 1
+
+            grp = _make_group(int(node_id), star_sel, gas_sel_dense, bh_sel, dm_selected, dm_exc)
             mapped_star = len(grp.slist) if hasattr(grp, "slist") else 0
             mapped_gas = len(grp.glist) if hasattr(grp, "glist") else 0
             mapped_bh = len(grp.bhlist) if hasattr(grp, "bhlist") else 0
@@ -657,17 +808,35 @@ def build_galaxies_from_ahf_fast(
                 host_id=int(root_id),
                 heavy=int(is_heavy),
                 fof_candidates=int(fof_candidates),
-                payloads=int(len(payloads)),
+                payloads=int(host_stats["payloads"]),
                 galaxies=int(len(host_galaxies)),
                 skipped=int(local_skipped),
+                fof_runs=int(host_stats["fof_runs"]),
+                fof_groups=int(host_stats["fof_groups"]),
+                tiny_cut=int(tiny_cut),
+                huge_cut=int(huge_cut),
             )
 
-        return order_idx, host_galaxies, local_skipped
+        return order_idx, host_galaxies, local_skipped, host_stats
 
     pending_results: Dict[int, List] = {}
     host_meta = {int(item["order_idx"]): item for item in host_schedule}
     next_to_emit = 0
-    inflight_by_lane = {"light": 0, "medium": 0, "heavy": 0}
+    inflight_count = 0
+    inflight_work = 0
+    runtime_stats = {"done": 0, "ewma_s": 0.0, "last_s": 0.0}
+    fof_totals = {
+        "payloads": 0,
+        "tiny": 0,
+        "normal": 0,
+        "huge": 0,
+        "tiny_skips": 0,
+        "fof_runs": 0,
+        "fof_groups": 0,
+        "fof_unassigned": 0,
+        "fof_empty": 0,
+        "fof_fallback": 0,
+    }
 
     def build_bucket(nodes_for_host: Set[int]) -> Dict[int, ParticleMembership]:
         """Build a membership bucket for one host from loader arrays."""
@@ -710,7 +879,7 @@ def build_galaxies_from_ahf_fast(
         return bucket
 
     def flush_completed(futures, block: bool = False):
-        nonlocal next_to_emit, skipped_empty_payloads
+        nonlocal next_to_emit, skipped_empty_payloads, inflight_count, inflight_work, fof_totals
         if not futures:
             return 0
         timeout = None if block else 0
@@ -718,12 +887,39 @@ def build_galaxies_from_ahf_fast(
         if not done:
             return 0
         for fut in done:
-            lane, _ = futures.pop(fut, (None, None))
-            if lane not in inflight_by_lane:
-                lane = "light"
-            inflight_by_lane[lane] = max(0, inflight_by_lane[lane] - 1)
-            order_idx, host_gals, local_skipped = fut.result()
+            fut_meta = futures.pop(fut, None)
+            started_at = None
+            submitted_units = 0
+            if isinstance(fut_meta, dict):
+                started_at = fut_meta.get("started_at")
+                try:
+                    submitted_units = int(fut_meta.get("work_units", 0))
+                except Exception:
+                    submitted_units = 0
+            inflight_count = max(0, int(inflight_count) - 1)
+            if submitted_units > 0:
+                inflight_work = max(0, int(inflight_work) - submitted_units)
+            if started_at is not None:
+                try:
+                    elapsed_s = max(0.0, _time.time() - float(started_at))
+                    prev = float(runtime_stats.get("ewma_s", 0.0))
+                    if prev <= 0.0:
+                        runtime_stats["ewma_s"] = elapsed_s
+                    else:
+                        runtime_stats["ewma_s"] = (
+                            float(runtime_ewma_alpha) * elapsed_s
+                            + (1.0 - float(runtime_ewma_alpha)) * prev
+                        )
+                    runtime_stats["last_s"] = elapsed_s
+                    runtime_stats["done"] = int(runtime_stats.get("done", 0)) + 1
+                except Exception:
+                    pass
+            order_idx, host_gals, local_skipped, host_stats = fut.result()
             skipped_empty_payloads += int(local_skipped)
+            if isinstance(host_stats, dict):
+                for key in fof_totals.keys():
+                    if key in host_stats:
+                        fof_totals[key] += int(host_stats[key])
             pending_results[order_idx] = host_gals
         while next_to_emit in pending_results:
             host_gals = pending_results.pop(next_to_emit)
@@ -741,9 +937,8 @@ def build_galaxies_from_ahf_fast(
                     host_id=host_id,
                     heavy=int(is_heavy),
                     galaxies=int(len(host_gals)),
-                    inflight_light=int(inflight_by_lane["light"]),
-                    inflight_medium=int(inflight_by_lane["medium"]),
-                    inflight_heavy=int(inflight_by_lane["heavy"]),
+                    inflight=int(inflight_count),
+                    inflight_work=int(inflight_work),
                     hosts_done=int(next_to_emit + 1),
                     hosts_total=int(total_hosts),
                     pending=int(len(pending_results)),
@@ -755,200 +950,134 @@ def build_galaxies_from_ahf_fast(
 
     with ThreadPoolExecutor(max_workers=jobs) as executor:
         pending_futures: Dict = {}
-        if tri_bin_enabled:
-            from collections import deque as _deque
 
-            lane_queues = {
-                "heavy": _deque([item for item in host_schedule if item.get("lane") == "heavy"]),
-                "medium": _deque([item for item in host_schedule if item.get("lane") == "medium"]),
-                "light": _deque([item for item in host_schedule if item.get("lane") == "light"]),
-            }
-            caps = {
-                "light": int(cap_init.get("light", jobs)),
-                "medium": int(cap_init.get("medium", 0)),
-                "heavy": int(cap_init.get("heavy", 0)),
-            }
+        pending_hosts = _deque(host_schedule)
+        pending_work = int(sum(int(item.get("work_units", 1)) for item in pending_hosts))
+        completed_since_adjust = 0
+        last_adjust_ts = 0.0
+        target_workers = max(1, min(jobs, jobs if scheduler_enabled else 1))
+        work_budget = max(target_workers, int(round(target_workers * float(budget_scale.get("nominal", 1.8)))))
+        mem_samples = _deque(maxlen=max(3, int(mem_trend_window)))
+
+        def _mem_mode_from_state(avail_gb: float, slope_gbps: float) -> str:
+            mode = "nominal"
+            if avail_gb >= 0:
+                if avail_gb <= mem_crit_gb:
+                    mode = "critical"
+                elif avail_gb < mem_low_gb:
+                    mode = "low"
+                elif avail_gb >= mem_high_gb:
+                    mode = "high"
+            if slope_gbps <= -float(mem_drop_warn_gbps):
+                mode = {
+                    "high": "nominal",
+                    "nominal": "low",
+                    "low": "critical",
+                    "critical": "critical",
+                }[mode]
+            if slope_gbps <= -float(mem_drop_crit_gbps):
+                mode = {
+                    "high": "low",
+                    "nominal": "critical",
+                    "low": "critical",
+                    "critical": "critical",
+                }[mode]
+            return mode
+
+        def _adjust_scheduler(done_count: int = 0, force: bool = False) -> None:
+            nonlocal completed_since_adjust, last_adjust_ts, target_workers, work_budget
+            if not scheduler_enabled:
+                target_workers = 1
+                work_budget = max(1, int(inflight_work))
+                return
+            if not adaptive_enabled:
+                target_workers = jobs
+                work_budget = max(target_workers, int(round(target_workers * float(budget_scale.get("nominal", 1.8)))))
+                return
+
+            completed_since_adjust += int(done_count)
+            now = _time.time()
+            if (not force) and completed_since_adjust < adjust_every and (now - last_adjust_ts) < adjust_interval_s:
+                return
             completed_since_adjust = 0
+            last_adjust_ts = now
 
-            def _rebalance_caps() -> None:
-                active_lanes = [
-                    lane for lane in ("light", "medium", "heavy")
-                    if lane_queues[lane] or inflight_by_lane[lane] > 0
-                ]
-                if not active_lanes:
-                    caps["light"] = 0
-                    caps["medium"] = 0
-                    caps["heavy"] = 0
-                    return
+            old_workers = int(target_workers)
+            old_budget = int(work_budget)
 
-                min_caps = {"light": 0, "medium": 0, "heavy": 0}
-                for lane in ("light", "medium", "heavy"):
-                    if lane not in active_lanes:
-                        min_caps[lane] = 0
-                        continue
-                    lane_min = int(cap_min.get(lane, 0))
-                    if lane == "light":
-                        lane_min = max(1, lane_min)
-                    min_caps[lane] = min(lane_min, int(cap_max.get(lane, jobs)))
+            _, _, avail_bytes, _ = _snapshot_memory()
+            avail_gb = (avail_bytes / 2**30) if avail_bytes is not None and avail_bytes >= 0 else -1.0
+            slope_gbps = 0.0
+            if avail_gb >= 0:
+                mem_samples.append((now, float(avail_gb)))
+                if len(mem_samples) >= 2:
+                    t0, a0 = mem_samples[0]
+                    t1, a1 = mem_samples[-1]
+                    dt = max(1.0e-6, float(t1) - float(t0))
+                    slope_gbps = float(a1 - a0) / dt
 
-                total_min = sum(min_caps.values())
-                if total_min > jobs:
-                    for lane in ("heavy", "medium", "light"):
-                        floor = 1 if (lane == "light" and lane in active_lanes) else 0
-                        reducible = max(0, min_caps[lane] - floor)
-                        if reducible <= 0:
-                            continue
-                        take = min(reducible, total_min - jobs)
-                        min_caps[lane] -= take
-                        total_min -= take
-                        if total_min <= jobs:
-                            break
+            mode = _mem_mode_from_state(float(avail_gb), float(slope_gbps))
+            worker_frac = float(worker_scale.get(mode, 1.0))
+            target_workers = max(1, min(jobs, int(round(float(jobs) * worker_frac))))
 
-                desired = {"light": 0, "medium": 0, "heavy": 0}
-                for lane in ("light", "medium", "heavy"):
-                    if lane in active_lanes:
-                        cap_hi = int(cap_max.get(lane, jobs))
-                        desired[lane] = max(min_caps[lane], min(cap_hi, int(caps.get(lane, 0))))
-                    if desired[lane] < inflight_by_lane[lane]:
-                        desired[lane] = inflight_by_lane[lane]
+            avg_pending_units = (float(pending_work) / float(len(pending_hosts))) if pending_hosts else 1.0
+            mix_boost = 1.0 + min(0.60, max(0.0, (avg_pending_units - 1.0) / 10.0))
+            budget_per_worker = float(budget_scale.get(mode, budget_scale.get("nominal", 1.8)))
+            work_budget = int(max(target_workers, round(float(target_workers) * budget_per_worker * mix_boost)))
+            if work_budget < int(inflight_work):
+                work_budget = int(inflight_work)
 
-                total = sum(desired.values())
-                if total > jobs:
-                    for lane in ("heavy", "medium", "light"):
-                        floor = max(min_caps[lane], inflight_by_lane[lane])
-                        reducible = max(0, desired[lane] - floor)
-                        if reducible <= 0:
-                            continue
-                        take = min(reducible, total - jobs)
-                        desired[lane] -= take
-                        total -= take
-                        if total <= jobs:
-                            break
+            if target_workers != old_workers or work_budget != old_budget:
+                mylog.info(
+                    "AHF-FAST: scheduler update mode=%s avail=%.1fGB slope=%.3fGB/s "
+                    "pending=%d inflight=%d target_workers=%d work_budget=%d inflight_work=%d runtime_ewma_s=%.3f",
+                    mode,
+                    avail_gb,
+                    slope_gbps,
+                    int(len(pending_hosts)),
+                    int(inflight_count),
+                    int(target_workers),
+                    int(work_budget),
+                    int(inflight_work),
+                    float(runtime_stats.get("ewma_s", 0.0)),
+                )
 
-                if total < jobs:
-                    spare = jobs - total
-                    for lane in ("light", "medium", "heavy"):
-                        if spare <= 0:
-                            break
-                        if not lane_queues[lane]:
-                            continue
-                        room = max(0, int(cap_max.get(lane, jobs)) - desired[lane])
-                        if room <= 0:
-                            continue
-                        give = min(room, spare)
-                        desired[lane] += give
-                        spare -= give
+        def _pop_best_host(max_units: int, allow_oversize: bool = False):
+            if not pending_hosts:
+                return None
+            window = min(int(len(pending_hosts)), int(scan_window))
+            best_idx = -1
+            best_units = -1
+            for idx in range(window):
+                item = pending_hosts[idx]
+                units = int(item.get("work_units", 1))
+                if units <= int(max_units) and units > best_units:
+                    best_idx = idx
+                    best_units = units
+            if best_idx < 0:
+                if not allow_oversize:
+                    return None
+                best_idx = 0
+            pending_hosts.rotate(-best_idx)
+            item = pending_hosts.popleft()
+            pending_hosts.rotate(best_idx)
+            return item
 
-                caps.update(desired)
+        _adjust_scheduler(done_count=adjust_every, force=True)
 
-            def _maybe_adjust_caps(done_count: int = 0, force: bool = False) -> None:
-                nonlocal completed_since_adjust
-                if not adaptive_enabled:
-                    _rebalance_caps()
-                    return
+        while pending_hosts or pending_futures:
+            _adjust_scheduler(done_count=0, force=False)
+            submitted = False
 
-                completed_since_adjust += int(done_count)
-                if (not force) and completed_since_adjust < adjust_every:
-                    return
-                completed_since_adjust = 0
+            while pending_hosts and inflight_count < int(target_workers):
+                remaining_budget = int(work_budget) - int(inflight_work)
+                allow_oversize = inflight_count == 0
+                item = _pop_best_host(max_units=max(0, remaining_budget), allow_oversize=allow_oversize)
+                if item is None:
+                    break
 
-                old_caps = dict(caps)
-                _, _, avail_bytes, _ = _snapshot_memory()
-                avail_gb = (avail_bytes / 2**30) if avail_bytes is not None and avail_bytes >= 0 else -1.0
-
-                if avail_gb >= 0:
-                    if avail_gb <= mem_crit_gb:
-                        caps["heavy"] = 0
-                        if caps["medium"] > max(cap_min.get("medium", 0), 1 if lane_queues["medium"] else 0):
-                            caps["medium"] -= 1
-                    elif avail_gb < mem_low_gb:
-                        if caps["heavy"] > int(cap_min.get("heavy", 0)):
-                            caps["heavy"] -= 1
-                        elif caps["medium"] > int(cap_min.get("medium", 0)):
-                            caps["medium"] -= 1
-                    elif avail_gb > mem_high_gb:
-                        if lane_queues["heavy"] and caps["heavy"] < int(cap_max.get("heavy", jobs)):
-                            caps["heavy"] += 1
-                        elif lane_queues["medium"] and caps["medium"] < int(cap_max.get("medium", jobs)):
-                            caps["medium"] += 1
-
-                _rebalance_caps()
-                if caps != old_caps:
-                    mylog.info(
-                        "AHF-FAST: adaptive caps update avail=%.1fGB "
-                        "pending(light=%d,medium=%d,heavy=%d) "
-                        "inflight(light=%d,medium=%d,heavy=%d) "
-                        "caps(light=%d,medium=%d,heavy=%d)",
-                        avail_gb,
-                        len(lane_queues["light"]),
-                        len(lane_queues["medium"]),
-                        len(lane_queues["heavy"]),
-                        inflight_by_lane["light"],
-                        inflight_by_lane["medium"],
-                        inflight_by_lane["heavy"],
-                        caps["light"],
-                        caps["medium"],
-                        caps["heavy"],
-                    )
-
-            _rebalance_caps()
-            _maybe_adjust_caps(done_count=adjust_every, force=True)
-
-            while (
-                lane_queues["heavy"]
-                or lane_queues["medium"]
-                or lane_queues["light"]
-                or pending_futures
-            ):
-                submitted = False
-
-                while True:
-                    made_progress = False
-                    inflight_total = (
-                        inflight_by_lane["light"]
-                        + inflight_by_lane["medium"]
-                        + inflight_by_lane["heavy"]
-                    )
-                    if inflight_total >= jobs:
-                        break
-
-                    for lane in ("heavy", "medium", "light"):
-                        if not lane_queues[lane]:
-                            continue
-                        if inflight_by_lane[lane] >= int(caps.get(lane, 0)):
-                            continue
-                        item = lane_queues[lane].popleft()
-                        bucket = build_bucket(item["nodes"])
-                        future = executor.submit(
-                            process_host,
-                            int(item["order_idx"]),
-                            int(item["root_id"]),
-                            bucket,
-                            int(item["fof_candidates"]),
-                            bool(item.get("lane") == "heavy"),
-                        )
-                        pending_futures[future] = (lane, int(item["order_idx"]))
-                        inflight_by_lane[lane] += 1
-                        submitted = True
-                        made_progress = True
-
-                        inflight_total += 1
-                        if inflight_total >= jobs:
-                            break
-                    if not made_progress:
-                        break
-
-                if pending_futures:
-                    done_now = flush_completed(pending_futures, block=(not submitted))
-                    _maybe_adjust_caps(done_count=done_now, force=False)
-                elif lane_queues["heavy"] or lane_queues["medium"] or lane_queues["light"]:
-                    _maybe_adjust_caps(done_count=adjust_every, force=True)
-
-            while pending_futures:
-                done_now = flush_completed(pending_futures, block=True)
-                _maybe_adjust_caps(done_count=done_now, force=False)
-        else:
-            for item in host_schedule:
+                units_needed = int(item.get("work_units", 1))
+                pending_work = max(0, int(pending_work) - units_needed)
                 bucket = build_bucket(item["nodes"])
                 future = executor.submit(
                     process_host,
@@ -956,14 +1085,20 @@ def build_galaxies_from_ahf_fast(
                     int(item["root_id"]),
                     bucket,
                     int(item["fof_candidates"]),
-                    False,
+                    bool(item.get("is_heavy", False)),
                 )
-                pending_futures[future] = ("light", int(item["order_idx"]))
-                inflight_by_lane["light"] += 1
-                flush_completed(pending_futures, block=False)
+                pending_futures[future] = {
+                    "order_idx": int(item["order_idx"]),
+                    "started_at": _time.time(),
+                    "work_units": int(units_needed),
+                }
+                inflight_count += 1
+                inflight_work += int(units_needed)
+                submitted = True
 
-            while pending_futures:
-                flush_completed(pending_futures, block=True)
+            if pending_futures:
+                done_now = flush_completed(pending_futures, block=(not submitted))
+                _adjust_scheduler(done_count=done_now, force=False)
 
     if host_progress is not None:
         host_progress.close()
@@ -973,6 +1108,27 @@ def build_galaxies_from_ahf_fast(
             "AHF-FAST: skipped %d galaxy payload(s) with no mapped particles"
             % skipped_empty_payloads
         )
+
+    with payload_lock:
+        final_tiny_cut = int(payload_cutoffs["tiny"])
+        final_huge_cut = int(payload_cutoffs["huge"])
+    mylog.info(
+        "AHF-FAST: payload summary payloads=%d tiny=%d normal=%d huge=%d "
+        "tiny_direct=%d fof_runs=%d fof_groups=%d fof_unassigned=%d fof_empty=%d fof_fallback=%d "
+        "final_cutoffs=(tiny_stars<=%d,huge_fof>=%d)",
+        int(fof_totals["payloads"]),
+        int(fof_totals["tiny"]),
+        int(fof_totals["normal"]),
+        int(fof_totals["huge"]),
+        int(fof_totals["tiny_skips"]),
+        int(fof_totals["fof_runs"]),
+        int(fof_totals["fof_groups"]),
+        int(fof_totals["fof_unassigned"]),
+        int(fof_totals["fof_empty"]),
+        int(fof_totals["fof_fallback"]),
+        int(final_tiny_cut),
+        int(final_huge_cut),
+    )
 
     sim.galaxy_list = galaxies
     sim.ngalaxies = len(galaxies)
