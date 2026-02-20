@@ -257,71 +257,199 @@ def build_galaxies_from_ahf_fast(
                 "fof_candidates": fof_candidates,
                 "star_count": star_count,
                 "is_heavy": False,
+                "lane": "light",
             }
         )
         host_workloads.append(fof_candidates)
 
-    two_lane_enabled = jobs > 1 and (_os.environ.get("CAESAR_AHF_FAST_TWO_LANE", "1") == "1")
+    tri_bin_requested = (_os.environ.get("CAESAR_AHF_FAST_THREE_BIN", "1") == "1")
+    tri_bin_enabled = jobs > 1 and tri_bin_requested
     heavy_inflight_limit = 0
     light_worker_limit = jobs
+    medium_worker_limit = 0
     heavy_threshold = 0
+    medium_threshold = 0
     heavy_count = 0
+    medium_count = 0
+    adaptive_enabled = False
 
-    if two_lane_enabled and host_schedule:
+    def _env_int(name: str, default: int) -> int:
         try:
-            heavy_percentile = float(_os.environ.get("CAESAR_AHF_FAST_HEAVY_PERCENTILE", "90"))
+            return int(_os.environ.get(name, str(default)))
         except Exception:
-            heavy_percentile = 90.0
-        heavy_percentile = min(100.0, max(0.0, heavy_percentile))
+            return int(default)
 
+    def _env_float(name: str, default: float) -> float:
         try:
-            heavy_min = int(_os.environ.get("CAESAR_AHF_FAST_HEAVY_MIN_CANDIDATES", "50000"))
+            return float(_os.environ.get(name, str(default)))
         except Exception:
-            heavy_min = 50000
-        heavy_min = max(0, heavy_min)
+            return float(default)
 
-        percentile_cut = int(np.percentile(np.asarray(host_workloads, dtype=np.float64), heavy_percentile))
-        heavy_threshold = max(heavy_min, percentile_cut)
+    cap_init = {"light": jobs, "medium": 0, "heavy": 0}
+    cap_min = {"light": 1, "medium": 0, "heavy": 0}
+    cap_max = {"light": jobs, "medium": jobs, "heavy": jobs}
+    adjust_every = 25
+    mem_crit_gb = 120.0
+    mem_low_gb = 240.0
+    mem_high_gb = 340.0
+
+    if tri_bin_enabled and host_schedule:
+        medium_percentile = min(100.0, max(0.0, _env_float("CAESAR_AHF_FAST_MEDIUM_PERCENTILE", 65.0)))
+        heavy_percentile = min(100.0, max(0.0, _env_float("CAESAR_AHF_FAST_HEAVY_PERCENTILE", 90.0)))
+
+        medium_min = max(0, _env_int("CAESAR_AHF_FAST_MEDIUM_MIN_CANDIDATES", 8000))
+        heavy_min = max(0, _env_int("CAESAR_AHF_FAST_HEAVY_MIN_CANDIDATES", 50000))
+
+        workload_arr = np.asarray(host_workloads, dtype=np.float64)
+        medium_cut = int(np.percentile(workload_arr, medium_percentile))
+        heavy_cut = int(np.percentile(workload_arr, heavy_percentile))
+        medium_threshold = max(medium_min, medium_cut)
+        heavy_threshold = max(heavy_min, heavy_cut, medium_threshold)
 
         for item in host_schedule:
-            item["is_heavy"] = item["fof_candidates"] >= heavy_threshold
+            w = int(item["fof_candidates"])
+            if w >= heavy_threshold:
+                lane = "heavy"
+            elif w >= medium_threshold:
+                lane = "medium"
+            else:
+                lane = "light"
+            item["lane"] = lane
+            item["is_heavy"] = lane == "heavy"
 
-        heavy_count = int(sum(1 for item in host_schedule if item["is_heavy"]))
-        if heavy_count > 0:
+        heavy_count = int(sum(1 for item in host_schedule if item["lane"] == "heavy"))
+        medium_count = int(sum(1 for item in host_schedule if item["lane"] == "medium"))
+        light_count = int(len(host_schedule) - heavy_count - medium_count)
+
+        heavy_default = 1 if heavy_count > 0 else 0
+        heavy_inflight_limit = max(0, min(_env_int("CAESAR_AHF_FAST_HEAVY_INFLIGHT", heavy_default), jobs - 1))
+        medium_default = 0
+        if medium_count > 0:
+            medium_default = max(1, min(max(2, jobs // 10), max(1, jobs - heavy_inflight_limit - 1)))
+        medium_worker_limit = max(0, min(_env_int("CAESAR_AHF_FAST_MEDIUM_INFLIGHT", medium_default), jobs))
+
+        light_worker_limit = max(1, jobs - heavy_inflight_limit - medium_worker_limit)
+        spill = max(0, (heavy_inflight_limit + medium_worker_limit + light_worker_limit) - jobs)
+        if spill > 0:
+            take_m = min(spill, max(0, medium_worker_limit))
+            medium_worker_limit -= take_m
+            spill -= take_m
+            if spill > 0:
+                heavy_inflight_limit = max(0, heavy_inflight_limit - spill)
+        light_worker_limit = max(1, jobs - heavy_inflight_limit - medium_worker_limit)
+
+        cap_init = {
+            "light": int(light_worker_limit),
+            "medium": int(medium_worker_limit),
+            "heavy": int(heavy_inflight_limit),
+        }
+
+        heavy_min_cap_default = 0
+        heavy_max_cap_default = max(heavy_inflight_limit, min(4, max(0, jobs - 1)))
+        medium_min_cap_default = 0
+        medium_max_cap_default = max(medium_worker_limit, min(max(4, jobs // 3), max(0, jobs - 1)))
+
+        cap_min["heavy"] = max(0, min(_env_int("CAESAR_AHF_FAST_HEAVY_INFLIGHT_MIN", heavy_min_cap_default), jobs))
+        cap_max["heavy"] = max(cap_min["heavy"], min(_env_int("CAESAR_AHF_FAST_HEAVY_INFLIGHT_MAX", heavy_max_cap_default), jobs))
+        cap_min["medium"] = max(0, min(_env_int("CAESAR_AHF_FAST_MEDIUM_INFLIGHT_MIN", medium_min_cap_default), jobs))
+        cap_max["medium"] = max(cap_min["medium"], min(_env_int("CAESAR_AHF_FAST_MEDIUM_INFLIGHT_MAX", medium_max_cap_default), jobs))
+        cap_min["light"] = 1
+        cap_max["light"] = jobs
+
+        if heavy_count == 0:
+            cap_init["heavy"] = 0
+            cap_min["heavy"] = 0
+            cap_max["heavy"] = 0
+        if medium_count == 0:
+            cap_init["medium"] = 0
+            cap_min["medium"] = 0
+            cap_max["medium"] = 0
+        cap_init["light"] = max(1, jobs - cap_init["heavy"] - cap_init["medium"])
+
+        adaptive_enabled = (_os.environ.get("CAESAR_AHF_FAST_ADAPTIVE", "1") == "1")
+        adjust_every = max(1, _env_int("CAESAR_AHF_FAST_ADJUST_EVERY", 25))
+
+        # Obtain total memory once to set scale-aware defaults when thresholds
+        # are not explicitly configured.
+        if _psutil is None or _proc is None:
             try:
-                heavy_inflight_limit = int(_os.environ.get("CAESAR_AHF_FAST_HEAVY_INFLIGHT", "1"))
+                import psutil as _ps
+                _psutil = _ps
+                _proc = _psutil.Process()
             except Exception:
-                heavy_inflight_limit = 1
-            heavy_inflight_limit = max(1, min(heavy_inflight_limit, jobs - 1))
-            light_worker_limit = max(1, jobs - heavy_inflight_limit)
+                pass
+        _, _, _avail_b0, _total_b0 = _snapshot_memory()
+        total_gb = (_total_b0 / 2**30) if _total_b0 and _total_b0 > 0 else 0.0
+        crit_default = max(32.0, total_gb * 0.15) if total_gb > 0 else 120.0
+        low_default = max(64.0, total_gb * 0.25) if total_gb > 0 else 240.0
+        high_default = max(96.0, total_gb * 0.35) if total_gb > 0 else 340.0
+        mem_crit_gb = _env_float("CAESAR_AHF_FAST_MEM_HEADROOM_CRIT_GB", crit_default)
+        mem_low_gb = _env_float("CAESAR_AHF_FAST_MEM_HEADROOM_LOW_GB", low_default)
+        mem_high_gb = _env_float("CAESAR_AHF_FAST_MEM_HEADROOM_HIGH_GB", high_default)
+        if mem_low_gb < mem_crit_gb:
+            mem_low_gb = mem_crit_gb
+        if mem_high_gb < mem_low_gb:
+            mem_high_gb = mem_low_gb
 
-            heavy_examples = sorted(
-                (
-                    (int(item["fof_candidates"]), int(item["star_count"]), int(item["root_id"]))
-                    for item in host_schedule
-                    if item["is_heavy"]
-                ),
-                reverse=True,
-            )[:5]
-            mylog.info(
-                "AHF-FAST: two-lane scheduler enabled: hosts=%d heavy=%d "
-                "(threshold=%d, percentile=%.1f, min=%d), workers(light=%d, heavy=%d)",
-                len(host_schedule),
-                heavy_count,
-                heavy_threshold,
-                heavy_percentile,
-                heavy_min,
-                light_worker_limit,
-                heavy_inflight_limit,
-            )
-            mylog.info(
-                "AHF-FAST: heavy host examples (fof_candidates, stars, host_id): %s",
-                heavy_examples,
-            )
-        else:
-            two_lane_enabled = False
+        heavy_examples = sorted(
+            (
+                (int(item["fof_candidates"]), int(item["star_count"]), int(item["root_id"]))
+                for item in host_schedule
+                if item["lane"] == "heavy"
+            ),
+            reverse=True,
+        )[:5]
+        medium_examples = sorted(
+            (
+                (int(item["fof_candidates"]), int(item["star_count"]), int(item["root_id"]))
+                for item in host_schedule
+                if item["lane"] == "medium"
+            ),
+            reverse=True,
+        )[:5]
 
-    if not two_lane_enabled:
+        mylog.info(
+            "AHF-FAST: tri-bin scheduler enabled: hosts=%d light=%d medium=%d heavy=%d "
+            "(thresholds medium=%d [p=%.1f,min=%d], heavy=%d [p=%.1f,min=%d]), "
+            "caps(light=%d, medium=%d, heavy=%d), adaptive=%d",
+            len(host_schedule),
+            light_count,
+            medium_count,
+            heavy_count,
+            medium_threshold,
+            medium_percentile,
+            medium_min,
+            heavy_threshold,
+            heavy_percentile,
+            heavy_min,
+            cap_init["light"],
+            cap_init["medium"],
+            cap_init["heavy"],
+            int(adaptive_enabled),
+        )
+        mylog.info(
+            "AHF-FAST: medium host examples (fof_candidates, stars, host_id): %s",
+            medium_examples,
+        )
+        mylog.info(
+            "AHF-FAST: heavy host examples (fof_candidates, stars, host_id): %s",
+            heavy_examples,
+        )
+        if adaptive_enabled:
+            mylog.info(
+                "AHF-FAST: adaptive caps adjust_every=%d headroom_gb=(crit=%.1f,low=%.1f,high=%.1f) "
+                "bounds medium=[%d,%d] heavy=[%d,%d]",
+                adjust_every,
+                mem_crit_gb,
+                mem_low_gb,
+                mem_high_gb,
+                cap_min["medium"],
+                cap_max["medium"],
+                cap_min["heavy"],
+                cap_max["heavy"],
+            )
+
+    if not tri_bin_enabled:
         mylog.info(
             "AHF-FAST: single-lane scheduler (workers=%d, hosts=%d)",
             jobs,
@@ -339,11 +467,16 @@ def build_galaxies_from_ahf_fast(
         "host_prepare",
         hosts_total=len(host_schedule),
         jobs=jobs,
-        two_lane=int(two_lane_enabled),
+        two_lane=0,
+        tri_bin=int(tri_bin_enabled),
         heavy_hosts=heavy_count,
+        medium_hosts=medium_count,
         heavy_threshold=heavy_threshold,
+        medium_threshold=medium_threshold,
         light_workers=light_worker_limit,
+        medium_workers=medium_worker_limit,
         heavy_workers=heavy_inflight_limit,
+        adaptive=int(adaptive_enabled),
     )
 
     def map_sel(pidset: Set[int], key: str) -> np.ndarray:
@@ -534,8 +667,7 @@ def build_galaxies_from_ahf_fast(
     pending_results: Dict[int, List] = {}
     host_meta = {int(item["order_idx"]): item for item in host_schedule}
     next_to_emit = 0
-    inflight_light = 0
-    inflight_heavy = 0
+    inflight_by_lane = {"light": 0, "medium": 0, "heavy": 0}
 
     def build_bucket(nodes_for_host: Set[int]) -> Dict[int, ParticleMembership]:
         """Build a membership bucket for one host from loader arrays."""
@@ -578,7 +710,7 @@ def build_galaxies_from_ahf_fast(
         return bucket
 
     def flush_completed(futures, block: bool = False):
-        nonlocal next_to_emit, inflight_light, inflight_heavy, skipped_empty_payloads
+        nonlocal next_to_emit, skipped_empty_payloads
         if not futures:
             return 0
         timeout = None if block else 0
@@ -587,10 +719,9 @@ def build_galaxies_from_ahf_fast(
             return 0
         for fut in done:
             lane, _ = futures.pop(fut, (None, None))
-            if lane == "heavy":
-                inflight_heavy = max(0, inflight_heavy - 1)
-            else:
-                inflight_light = max(0, inflight_light - 1)
+            if lane not in inflight_by_lane:
+                lane = "light"
+            inflight_by_lane[lane] = max(0, inflight_by_lane[lane] - 1)
             order_idx, host_gals, local_skipped = fut.result()
             skipped_empty_payloads += int(local_skipped)
             pending_results[order_idx] = host_gals
@@ -610,8 +741,9 @@ def build_galaxies_from_ahf_fast(
                     host_id=host_id,
                     heavy=int(is_heavy),
                     galaxies=int(len(host_gals)),
-                    inflight_light=int(inflight_light),
-                    inflight_heavy=int(inflight_heavy),
+                    inflight_light=int(inflight_by_lane["light"]),
+                    inflight_medium=int(inflight_by_lane["medium"]),
+                    inflight_heavy=int(inflight_by_lane["heavy"]),
                     hosts_done=int(next_to_emit + 1),
                     hosts_total=int(total_hosts),
                     pending=int(len(pending_results)),
@@ -623,50 +755,198 @@ def build_galaxies_from_ahf_fast(
 
     with ThreadPoolExecutor(max_workers=jobs) as executor:
         pending_futures: Dict = {}
-        if two_lane_enabled:
+        if tri_bin_enabled:
             from collections import deque as _deque
 
-            heavy_queue = _deque([item for item in host_schedule if item["is_heavy"]])
-            light_queue = _deque([item for item in host_schedule if not item["is_heavy"]])
+            lane_queues = {
+                "heavy": _deque([item for item in host_schedule if item.get("lane") == "heavy"]),
+                "medium": _deque([item for item in host_schedule if item.get("lane") == "medium"]),
+                "light": _deque([item for item in host_schedule if item.get("lane") == "light"]),
+            }
+            caps = {
+                "light": int(cap_init.get("light", jobs)),
+                "medium": int(cap_init.get("medium", 0)),
+                "heavy": int(cap_init.get("heavy", 0)),
+            }
+            completed_since_adjust = 0
 
-            while heavy_queue or light_queue or pending_futures:
+            def _rebalance_caps() -> None:
+                active_lanes = [
+                    lane for lane in ("light", "medium", "heavy")
+                    if lane_queues[lane] or inflight_by_lane[lane] > 0
+                ]
+                if not active_lanes:
+                    caps["light"] = 0
+                    caps["medium"] = 0
+                    caps["heavy"] = 0
+                    return
+
+                min_caps = {"light": 0, "medium": 0, "heavy": 0}
+                for lane in ("light", "medium", "heavy"):
+                    if lane not in active_lanes:
+                        min_caps[lane] = 0
+                        continue
+                    lane_min = int(cap_min.get(lane, 0))
+                    if lane == "light":
+                        lane_min = max(1, lane_min)
+                    min_caps[lane] = min(lane_min, int(cap_max.get(lane, jobs)))
+
+                total_min = sum(min_caps.values())
+                if total_min > jobs:
+                    for lane in ("heavy", "medium", "light"):
+                        floor = 1 if (lane == "light" and lane in active_lanes) else 0
+                        reducible = max(0, min_caps[lane] - floor)
+                        if reducible <= 0:
+                            continue
+                        take = min(reducible, total_min - jobs)
+                        min_caps[lane] -= take
+                        total_min -= take
+                        if total_min <= jobs:
+                            break
+
+                desired = {"light": 0, "medium": 0, "heavy": 0}
+                for lane in ("light", "medium", "heavy"):
+                    if lane in active_lanes:
+                        cap_hi = int(cap_max.get(lane, jobs))
+                        desired[lane] = max(min_caps[lane], min(cap_hi, int(caps.get(lane, 0))))
+                    if desired[lane] < inflight_by_lane[lane]:
+                        desired[lane] = inflight_by_lane[lane]
+
+                total = sum(desired.values())
+                if total > jobs:
+                    for lane in ("heavy", "medium", "light"):
+                        floor = max(min_caps[lane], inflight_by_lane[lane])
+                        reducible = max(0, desired[lane] - floor)
+                        if reducible <= 0:
+                            continue
+                        take = min(reducible, total - jobs)
+                        desired[lane] -= take
+                        total -= take
+                        if total <= jobs:
+                            break
+
+                if total < jobs:
+                    spare = jobs - total
+                    for lane in ("light", "medium", "heavy"):
+                        if spare <= 0:
+                            break
+                        if not lane_queues[lane]:
+                            continue
+                        room = max(0, int(cap_max.get(lane, jobs)) - desired[lane])
+                        if room <= 0:
+                            continue
+                        give = min(room, spare)
+                        desired[lane] += give
+                        spare -= give
+
+                caps.update(desired)
+
+            def _maybe_adjust_caps(done_count: int = 0, force: bool = False) -> None:
+                nonlocal completed_since_adjust
+                if not adaptive_enabled:
+                    _rebalance_caps()
+                    return
+
+                completed_since_adjust += int(done_count)
+                if (not force) and completed_since_adjust < adjust_every:
+                    return
+                completed_since_adjust = 0
+
+                old_caps = dict(caps)
+                _, _, avail_bytes, _ = _snapshot_memory()
+                avail_gb = (avail_bytes / 2**30) if avail_bytes is not None and avail_bytes >= 0 else -1.0
+
+                if avail_gb >= 0:
+                    if avail_gb <= mem_crit_gb:
+                        caps["heavy"] = 0
+                        if caps["medium"] > max(cap_min.get("medium", 0), 1 if lane_queues["medium"] else 0):
+                            caps["medium"] -= 1
+                    elif avail_gb < mem_low_gb:
+                        if caps["heavy"] > int(cap_min.get("heavy", 0)):
+                            caps["heavy"] -= 1
+                        elif caps["medium"] > int(cap_min.get("medium", 0)):
+                            caps["medium"] -= 1
+                    elif avail_gb > mem_high_gb:
+                        if lane_queues["heavy"] and caps["heavy"] < int(cap_max.get("heavy", jobs)):
+                            caps["heavy"] += 1
+                        elif lane_queues["medium"] and caps["medium"] < int(cap_max.get("medium", jobs)):
+                            caps["medium"] += 1
+
+                _rebalance_caps()
+                if caps != old_caps:
+                    mylog.info(
+                        "AHF-FAST: adaptive caps update avail=%.1fGB "
+                        "pending(light=%d,medium=%d,heavy=%d) "
+                        "inflight(light=%d,medium=%d,heavy=%d) "
+                        "caps(light=%d,medium=%d,heavy=%d)",
+                        avail_gb,
+                        len(lane_queues["light"]),
+                        len(lane_queues["medium"]),
+                        len(lane_queues["heavy"]),
+                        inflight_by_lane["light"],
+                        inflight_by_lane["medium"],
+                        inflight_by_lane["heavy"],
+                        caps["light"],
+                        caps["medium"],
+                        caps["heavy"],
+                    )
+
+            _rebalance_caps()
+            _maybe_adjust_caps(done_count=adjust_every, force=True)
+
+            while (
+                lane_queues["heavy"]
+                or lane_queues["medium"]
+                or lane_queues["light"]
+                or pending_futures
+            ):
                 submitted = False
 
-                while heavy_queue and inflight_heavy < heavy_inflight_limit:
-                    item = heavy_queue.popleft()
-                    bucket = build_bucket(item["nodes"])
-                    future = executor.submit(
-                        process_host,
-                        int(item["order_idx"]),
-                        int(item["root_id"]),
-                        bucket,
-                        int(item["fof_candidates"]),
-                        bool(item["is_heavy"]),
+                while True:
+                    made_progress = False
+                    inflight_total = (
+                        inflight_by_lane["light"]
+                        + inflight_by_lane["medium"]
+                        + inflight_by_lane["heavy"]
                     )
-                    pending_futures[future] = ("heavy", int(item["order_idx"]))
-                    inflight_heavy += 1
-                    submitted = True
+                    if inflight_total >= jobs:
+                        break
 
-                while light_queue and inflight_light < light_worker_limit:
-                    item = light_queue.popleft()
-                    bucket = build_bucket(item["nodes"])
-                    future = executor.submit(
-                        process_host,
-                        int(item["order_idx"]),
-                        int(item["root_id"]),
-                        bucket,
-                        int(item["fof_candidates"]),
-                        bool(item["is_heavy"]),
-                    )
-                    pending_futures[future] = ("light", int(item["order_idx"]))
-                    inflight_light += 1
-                    submitted = True
+                    for lane in ("heavy", "medium", "light"):
+                        if not lane_queues[lane]:
+                            continue
+                        if inflight_by_lane[lane] >= int(caps.get(lane, 0)):
+                            continue
+                        item = lane_queues[lane].popleft()
+                        bucket = build_bucket(item["nodes"])
+                        future = executor.submit(
+                            process_host,
+                            int(item["order_idx"]),
+                            int(item["root_id"]),
+                            bucket,
+                            int(item["fof_candidates"]),
+                            bool(item.get("lane") == "heavy"),
+                        )
+                        pending_futures[future] = (lane, int(item["order_idx"]))
+                        inflight_by_lane[lane] += 1
+                        submitted = True
+                        made_progress = True
+
+                        inflight_total += 1
+                        if inflight_total >= jobs:
+                            break
+                    if not made_progress:
+                        break
 
                 if pending_futures:
-                    flush_completed(pending_futures, block=(not submitted))
+                    done_now = flush_completed(pending_futures, block=(not submitted))
+                    _maybe_adjust_caps(done_count=done_now, force=False)
+                elif lane_queues["heavy"] or lane_queues["medium"] or lane_queues["light"]:
+                    _maybe_adjust_caps(done_count=adjust_every, force=True)
 
             while pending_futures:
-                flush_completed(pending_futures, block=True)
+                done_now = flush_completed(pending_futures, block=True)
+                _maybe_adjust_caps(done_count=done_now, force=False)
         else:
             for item in host_schedule:
                 bucket = build_bucket(item["nodes"])
@@ -679,7 +959,7 @@ def build_galaxies_from_ahf_fast(
                     False,
                 )
                 pending_futures[future] = ("light", int(item["order_idx"]))
-                inflight_light += 1
+                inflight_by_lane["light"] += 1
                 flush_completed(pending_futures, block=False)
 
             while pending_futures:
