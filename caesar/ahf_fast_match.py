@@ -1181,7 +1181,11 @@ def build_galaxies_from_ahf_fast(
 
         # Write memory report file (survives OOM kills)
         try:
-            _report_path = ahf_particles_file + ".memory_report.json"
+            if incremental_output:
+                _report_dir = _os.path.dirname(_os.path.abspath(incremental_output))
+            else:
+                _report_dir = _os.getcwd()
+            _report_path = _os.path.join(_report_dir, "ahf_fast_memory_report.json")
             _mem_report = {
                 "timestamp": str(_datetime.now()),
                 "system_total_gb": round(_total_gb, 1),
@@ -1259,97 +1263,108 @@ def build_galaxies_from_ahf_fast(
             host_progress.update(len(tiny_hosts))
             host_progress.set_postfix(huge=remaining_huge, medium=remaining_medium, tiny=remaining_tiny)
 
-    # --- Tier 2: Medium hosts (parallel, single-thread FOF) ---
+    # --- Tier 2: Medium hosts (parallel, single-thread FOF, batched) ---
     if medium_hosts:
         fof_njobs = 1  # Single-thread inner FOF to avoid thread explosion
 
-        # Calibration: run the 3 largest medium hosts sequentially first to
-        # measure actual memory usage and refine the concurrency limit.
         import gc as _gc
-        _N_CALIBRATION = min(3, len(medium_hosts))
-        _calibration_hosts = medium_hosts[-_N_CALIBRATION:]  # Largest (sorted asc)
-        _medium_remaining = medium_hosts[:-_N_CALIBRATION]
+        import ctypes as _ctypes
+        _libc = None
+        try:
+            _libc = _ctypes.CDLL("libc.so.6")
+        except OSError:
+            pass
 
-        _peak_deltas = []
-        if _N_CALIBRATION > 0:
-            mylog.info(
-                "AHF-FAST: calibrating on %d largest medium hosts (stars: %s)",
-                _N_CALIBRATION,
-                [sc for _, _, sc in _calibration_hosts],
+        _BATCH_SIZE = int(_os.environ.get("CAESAR_AHF_FAST_BATCH_SIZE", "500"))
+        _MEM_GUARD_FRAC = float(_os.environ.get("CAESAR_AHF_FAST_MEM_GUARD_FRAC", "0.10"))
+        _mem_guard_bytes = _psutil.virtual_memory().total * _MEM_GUARD_FRAC
+
+        _n_batches = (len(medium_hosts) + _BATCH_SIZE - 1) // _BATCH_SIZE
+        _batch_gal_total = 0
+
+        mylog.info(
+            "AHF-FAST: processing %d medium hosts in %d batches "
+            "(batch_size=%d, n_jobs=%d, FOF n_jobs=1)",
+            len(medium_hosts), _n_batches, _BATCH_SIZE, medium_njobs,
+        )
+
+        for _bi in range(_n_batches):
+            _bs = _bi * _BATCH_SIZE
+            _be = min(_bs + _BATCH_SIZE, len(medium_hosts))
+            _batch = medium_hosts[_bs:_be]
+
+            # Memory guard: halve concurrency if available memory is low
+            _avail_now = _psutil.virtual_memory().available
+            if _avail_now < _mem_guard_bytes and medium_njobs > 1:
+                _old_njobs = medium_njobs
+                medium_njobs = max(1, medium_njobs // 2)
+                mylog.warning(
+                    "AHF-FAST: batch %d/%d: available %.1f GB < guard %.1f GB, "
+                    "n_jobs %d -> %d",
+                    _bi + 1, _n_batches, _avail_now / 2**30,
+                    _mem_guard_bytes / 2**30, _old_njobs, medium_njobs,
+                )
+
+            # Dispatch batch
+            _br = Parallel(n_jobs=medium_njobs, backend='threading')(
+                delayed(_process_host_for_parallel)(host_order + i, rid, nds)
+                for i, (rid, nds, _) in enumerate(_batch)
             )
-        for _cal_root, _cal_nodes, _cal_sc in _calibration_hosts:
-            _rss_before = _psutil.Process().memory_info().rss
-            _cal_result = _process_host_for_parallel(host_order, _cal_root, _cal_nodes)
-            _gc.collect()
-            _rss_after = _psutil.Process().memory_info().rss
-            _delta = max(0, _rss_after - _rss_before)
-            _peak_deltas.append((_cal_sc, _delta))
-            mylog.info(
-                "AHF-FAST: calibration host %d stars -> RSS delta %.1f MB",
-                _cal_sc, _delta / 2**20,
-            )
-            # Aggregate calibration results immediately
-            if _cal_result.galaxies:
-                for node_id, grp in _cal_result.galaxies:
-                    galaxies.append(grp)
-                    galaxy_node_ids.append(int(node_id))
-            total_skipped += _cal_result.skipped_empty_payloads
-            host_order += 1
-            remaining_medium -= 1
+
+            # Aggregate results
+            _bgc = 0
+            for result in _br:
+                if result.galaxies:
+                    for node_id, grp in result.galaxies:
+                        galaxies.append(grp)
+                        galaxy_node_ids.append(int(node_id))
+                    _bgc += len(result.galaxies)
+                total_skipped += result.skipped_empty_payloads
+            host_order += len(_batch)
+            _batch_gal_total += _bgc
+
+            # Update progress
+            remaining_medium -= len(_batch)
             if host_progress is not None:
-                host_progress.update(1)
+                host_progress.update(len(_batch))
                 host_progress.set_postfix(
                     huge=remaining_huge, medium=remaining_medium,
                     tiny=remaining_tiny,
                 )
 
-        # Recalibrate concurrency from measured data
-        if _peak_deltas:
-            _max_sc, _max_delta = max(_peak_deltas, key=lambda x: x[1])
-            if _max_delta > 0 and _max_sc > 0:
-                _measured_A = _max_delta / (_max_sc ** MEM_ALPHA)
-                # Use the larger of default and measured (with 2x safety margin)
-                _effective_A = max(MEM_COEFF, _measured_A * 2.0)
-                _cal_peak = _effective_A * (_p95 ** MEM_ALPHA)
-                _avail_now = _psutil.virtual_memory().available / 2**30
-                _usable_now = _avail_now * 0.7
-                if _cal_peak > 0:
-                    _cal_max = max(1, int(_usable_now / (_cal_peak / 2**30)))
-                    _override = _os.environ.get("CAESAR_AHF_FAST_MEDIUM_NJOBS")
-                    if _override is None:
-                        medium_njobs = min(jobs, _cal_max)
-                mylog.info(
-                    "AHF-FAST: calibrated A=%.0f (measured) -> "
-                    "revised peak %.1f MB/host, available %.1f GB, "
-                    "medium n_jobs=%d",
-                    _effective_A, _cal_peak / 2**20, _avail_now,
-                    medium_njobs,
-                )
+            # Free batch results, force GC + malloc_trim to combat arena fragmentation
+            del _br
+            _gc.collect()
+            if _libc is not None:
+                try:
+                    _libc.malloc_trim(0)
+                except Exception:
+                    pass
 
-        # Process remaining medium hosts with calibrated concurrency
-        if _medium_remaining:
+            # Per-batch diagnostics (logged before next batch; survives OOM)
+            _rss_now = _psutil.Process().memory_info().rss
+            _avail_after = _psutil.virtual_memory().available
             mylog.info(
-                "AHF-FAST: processing %d remaining medium hosts "
-                "(n_jobs=%d, FOF n_jobs=1)",
-                len(_medium_remaining), medium_njobs,
+                "AHF-FAST: batch %d/%d: %d hosts, %d gals (total %d), "
+                "RSS %.1f GB, avail %.1f GB, n_jobs=%d",
+                _bi + 1, _n_batches, len(_batch), _bgc, _batch_gal_total,
+                _rss_now / 2**30, _avail_after / 2**30, medium_njobs,
             )
-            medium_results = Parallel(
-                n_jobs=medium_njobs, backend='threading'
-            )(
-                delayed(_process_host_for_parallel)(
-                    host_order + i, root_id, nodes
-                )
-                for i, (root_id, nodes, _) in enumerate(_medium_remaining)
-            )
-            _aggregate_results(medium_results)
-            host_order += len(_medium_remaining)
 
-        remaining_medium = 0
-        if host_progress is not None:
-            host_progress.update(
-                len(_medium_remaining) if _medium_remaining else 0
-            )
-            host_progress.set_postfix(huge=remaining_huge, medium=remaining_medium, tiny=remaining_tiny)
+            # Update report file per-batch (fsynced, survives OOM)
+            try:
+                _mem_report["batches_completed"] = _bi + 1
+                _mem_report["batches_total"] = _n_batches
+                _mem_report["galaxies_so_far"] = _batch_gal_total
+                _mem_report["current_rss_gb"] = round(_rss_now / 2**30, 1)
+                _mem_report["available_gb"] = round(_avail_after / 2**30, 1)
+                _mem_report["current_njobs"] = medium_njobs
+                with open(_report_path, "w") as _rf:
+                    _json.dump(_mem_report, _rf, indent=2)
+                    _rf.flush()
+                    _os.fsync(_rf.fileno())
+            except Exception:
+                pass
 
     # --- Tier 3: Huge hosts (sequential, multi-thread FOF) ---
     fof_njobs = jobs  # Full parallelism for inner FOF
