@@ -29,8 +29,11 @@ def build_galaxies_from_ahf_fast(
 
     from yt.funcs import mylog
     import os as _os
+    import json as _json
+    import time as _time
+    import threading as _threading
     from tqdm import tqdm
-    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, ALL_COMPLETED
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
     from caesar.group import create_new_group
     from caesar.group import get_group_properties as _get_group_properties
@@ -52,6 +55,89 @@ def build_galaxies_from_ahf_fast(
     from caesar.group import get_min_stars as _get_min_stars
 
     min_stars = _get_min_stars(sim, override=min_stars)
+
+    # Optional phase-wise memory tracing (survives OOM via JSONL + fsync)
+    phase_memlog_enabled = _os.environ.get("CAESAR_AHF_FAST_PHASE_MEMLOG", "0") == "1"
+    try:
+        phase_memlog_every = int(_os.environ.get("CAESAR_AHF_FAST_PHASE_MEMLOG_EVERY", "100"))
+    except Exception:
+        phase_memlog_every = 100
+    phase_memlog_every = max(1, phase_memlog_every)
+    phase_memlog_file = _os.environ.get("CAESAR_AHF_FAST_PHASE_MEMLOG_FILE")
+    if phase_memlog_enabled and not phase_memlog_file:
+        phase_memlog_file = _os.path.abspath("ahf_fast_phase_memory.jsonl")
+    phase_memlog_fsync = _os.environ.get("CAESAR_AHF_FAST_PHASE_MEMLOG_FSYNC", "1") == "1"
+    _phase_lock = _threading.Lock()
+
+    _psutil = None
+    _proc = None
+    if phase_memlog_enabled:
+        try:
+            import psutil as _ps
+            _psutil = _ps
+            _proc = _psutil.Process()
+        except Exception:
+            _psutil = None
+            _proc = None
+
+    def _snapshot_memory():
+        rss_bytes = -1
+        vms_bytes = -1
+        avail_bytes = -1
+        total_bytes = -1
+        if _psutil is not None and _proc is not None:
+            try:
+                mi = _proc.memory_info()
+                rss_bytes = int(getattr(mi, "rss", -1))
+                vms_bytes = int(getattr(mi, "vms", -1))
+            except Exception:
+                pass
+            try:
+                vm = _psutil.virtual_memory()
+                avail_bytes = int(getattr(vm, "available", -1))
+                total_bytes = int(getattr(vm, "total", -1))
+            except Exception:
+                pass
+        return rss_bytes, vms_bytes, avail_bytes, total_bytes
+
+    def _phase_memlog(phase: str, **fields) -> None:
+        if not phase_memlog_enabled:
+            return
+
+        rss_bytes, vms_bytes, avail_bytes, total_bytes = _snapshot_memory()
+        record = {
+            "ts": _time.time(),
+            "phase": str(phase),
+            "rss_gb": (rss_bytes / 2**30) if rss_bytes >= 0 else None,
+            "vms_gb": (vms_bytes / 2**30) if vms_bytes >= 0 else None,
+            "avail_gb": (avail_bytes / 2**30) if avail_bytes >= 0 else None,
+            "total_gb": (total_bytes / 2**30) if total_bytes >= 0 else None,
+            "pid": _os.getpid(),
+        }
+        if fields:
+            record.update(fields)
+
+        parts = [f"phase={record['phase']}"]
+        if record["rss_gb"] is not None:
+            parts.append(f"rss={record['rss_gb']:.2f}GB")
+        if record["avail_gb"] is not None:
+            parts.append(f"avail={record['avail_gb']:.2f}GB")
+        for key in ("order_idx", "host_id", "heavy", "galaxies", "hosts_done", "hosts_total"):
+            if key in record:
+                parts.append(f"{key}={record[key]}")
+        mylog.info("AHF-FAST mem: " + " ".join(parts))
+
+        if phase_memlog_file:
+            try:
+                line = _json.dumps(record, sort_keys=True)
+                with _phase_lock:
+                    with open(phase_memlog_file, "a") as _fh:
+                        _fh.write(line + "\n")
+                        _fh.flush()
+                        if phase_memlog_fsync:
+                            _os.fsync(_fh.fileno())
+            except Exception:
+                pass
 
     # Optional debug controls for the FAST path
     debug_fast = _os.environ.get("CAESAR_AHF_FAST_DEBUG", "0") == "1"
@@ -128,6 +214,138 @@ def build_galaxies_from_ahf_fast(
         leave=False,
     )
 
+    def _estimate_host_fof_candidates(nodes_for_host: Set[int]) -> Tuple[int, int]:
+        """Estimate host workload from AHF memberships.
+
+        Returns
+        -------
+        fof_candidates : int
+            Number of particles that can participate in galaxy FOF
+            (gas + stars + BH across all nodes in the host tree).
+        stars : int
+            Number of star particles across all nodes in the host tree.
+        """
+        if not membership_arrays:
+            return 0, 0
+
+        fof_candidates = 0
+        stars = 0
+        for node_id in nodes_for_host:
+            arr = membership_arrays.get(int(node_id))
+            if arr is None:
+                continue
+            arr = np.asarray(arr, dtype=np.int64)
+            if arr.size == 0:
+                continue
+            if arr.ndim != 2 or arr.shape[1] != 2:
+                arr = arr.reshape(-1, 2)
+            ptypes = arr[:, 1]
+            stars += int(np.sum(ptypes == 4))
+            fof_candidates += int(np.sum((ptypes == 0) | (ptypes == 4) | (ptypes == 5)))
+
+        return fof_candidates, stars
+
+    host_schedule: List[Dict] = []
+    host_workloads: List[int] = []
+    for order_idx, (root_id, nodes_for_host) in enumerate(host_to_nodes.items()):
+        fof_candidates, star_count = _estimate_host_fof_candidates(nodes_for_host)
+        host_schedule.append(
+            {
+                "order_idx": order_idx,
+                "root_id": root_id,
+                "nodes": nodes_for_host,
+                "fof_candidates": fof_candidates,
+                "star_count": star_count,
+                "is_heavy": False,
+            }
+        )
+        host_workloads.append(fof_candidates)
+
+    two_lane_enabled = jobs > 1 and (_os.environ.get("CAESAR_AHF_FAST_TWO_LANE", "1") == "1")
+    heavy_inflight_limit = 0
+    light_worker_limit = jobs
+    heavy_threshold = 0
+    heavy_count = 0
+
+    if two_lane_enabled and host_schedule:
+        try:
+            heavy_percentile = float(_os.environ.get("CAESAR_AHF_FAST_HEAVY_PERCENTILE", "90"))
+        except Exception:
+            heavy_percentile = 90.0
+        heavy_percentile = min(100.0, max(0.0, heavy_percentile))
+
+        try:
+            heavy_min = int(_os.environ.get("CAESAR_AHF_FAST_HEAVY_MIN_CANDIDATES", "50000"))
+        except Exception:
+            heavy_min = 50000
+        heavy_min = max(0, heavy_min)
+
+        percentile_cut = int(np.percentile(np.asarray(host_workloads, dtype=np.float64), heavy_percentile))
+        heavy_threshold = max(heavy_min, percentile_cut)
+
+        for item in host_schedule:
+            item["is_heavy"] = item["fof_candidates"] >= heavy_threshold
+
+        heavy_count = int(sum(1 for item in host_schedule if item["is_heavy"]))
+        if heavy_count > 0:
+            try:
+                heavy_inflight_limit = int(_os.environ.get("CAESAR_AHF_FAST_HEAVY_INFLIGHT", "1"))
+            except Exception:
+                heavy_inflight_limit = 1
+            heavy_inflight_limit = max(1, min(heavy_inflight_limit, jobs - 1))
+            light_worker_limit = max(1, jobs - heavy_inflight_limit)
+
+            heavy_examples = sorted(
+                (
+                    (int(item["fof_candidates"]), int(item["star_count"]), int(item["root_id"]))
+                    for item in host_schedule
+                    if item["is_heavy"]
+                ),
+                reverse=True,
+            )[:5]
+            mylog.info(
+                "AHF-FAST: two-lane scheduler enabled: hosts=%d heavy=%d "
+                "(threshold=%d, percentile=%.1f, min=%d), workers(light=%d, heavy=%d)",
+                len(host_schedule),
+                heavy_count,
+                heavy_threshold,
+                heavy_percentile,
+                heavy_min,
+                light_worker_limit,
+                heavy_inflight_limit,
+            )
+            mylog.info(
+                "AHF-FAST: heavy host examples (fof_candidates, stars, host_id): %s",
+                heavy_examples,
+            )
+        else:
+            two_lane_enabled = False
+
+    if not two_lane_enabled:
+        mylog.info(
+            "AHF-FAST: single-lane scheduler (workers=%d, hosts=%d)",
+            jobs,
+            len(host_schedule),
+        )
+
+    def _trace_host(order_idx: int, is_heavy: bool) -> bool:
+        if not phase_memlog_enabled:
+            return False
+        if is_heavy:
+            return True
+        return (order_idx % phase_memlog_every) == 0
+
+    _phase_memlog(
+        "host_prepare",
+        hosts_total=len(host_schedule),
+        jobs=jobs,
+        two_lane=int(two_lane_enabled),
+        heavy_hosts=heavy_count,
+        heavy_threshold=heavy_threshold,
+        light_workers=light_worker_limit,
+        heavy_workers=heavy_inflight_limit,
+    )
+
     def map_sel(pidset: Set[int], key: str) -> np.ndarray:
         lookup = pid_maps_sel.get(key)
         if lookup is None or not pidset:
@@ -169,11 +387,26 @@ def build_galaxies_from_ahf_fast(
 
     skipped_empty_payloads = 0
 
-    def process_host(order_idx: int, root_id: int, bucket: Dict[int, ParticleMembership]):
-        nonlocal skipped_empty_payloads
+    def process_host(
+        order_idx: int,
+        root_id: int,
+        bucket: Dict[int, ParticleMembership],
+        fof_candidates: int = 0,
+        is_heavy: bool = False,
+    ):
         nodes_for_host = host_to_nodes.get(root_id, set())
         if not nodes_for_host:
-            return order_idx, []
+            return order_idx, [], 0
+
+        if _trace_host(order_idx, is_heavy):
+            _phase_memlog(
+                "depth_wave_start",
+                order_idx=order_idx,
+                host_id=int(root_id),
+                heavy=int(is_heavy),
+                fof_candidates=int(fof_candidates),
+                nodes=int(len(nodes_for_host)),
+            )
 
         # Ensure every node has a membership object (possibly empty)
         for node in nodes_for_host:
@@ -227,9 +460,20 @@ def build_galaxies_from_ahf_fast(
                     carry_dm[parent].update(dm_exc_set)
 
         if not payloads:
-            return order_idx, []
+            if _trace_host(order_idx, is_heavy):
+                _phase_memlog(
+                    "depth_wave_done",
+                    order_idx=order_idx,
+                    host_id=int(root_id),
+                    heavy=int(is_heavy),
+                    fof_candidates=int(fof_candidates),
+                    payloads=0,
+                    skipped=0,
+                )
+            return order_idx, [], 0
 
         host_galaxies: List[Tuple[int, object]] = []
+        local_skipped = 0
 
         for payload in payloads:
             node_id, star_set, gas_set, bh_set, dm_exc = payload
@@ -259,8 +503,8 @@ def build_galaxies_from_ahf_fast(
             mapped_dm = len(dm_selected)
             particle_total = mapped_star + mapped_gas + mapped_bh + mapped_dm
             if particle_total == 0:
-                skipped_empty_payloads += 1
-                if skipped_empty_payloads <= 10:
+                local_skipped += 1
+                if local_skipped <= 3:
                     mylog.warning(
                         "AHF-FAST: node %d had %d star / %d gas / %d bh / %d dm particles "
                         "from AHF but none mapped into CAESAR selection",
@@ -273,82 +517,173 @@ def build_galaxies_from_ahf_fast(
                 continue
             host_galaxies.append((int(node_id), grp))
 
-        return order_idx, host_galaxies
+        if _trace_host(order_idx, is_heavy):
+            _phase_memlog(
+                "depth_wave_done",
+                order_idx=order_idx,
+                host_id=int(root_id),
+                heavy=int(is_heavy),
+                fof_candidates=int(fof_candidates),
+                payloads=int(len(payloads)),
+                galaxies=int(len(host_galaxies)),
+                skipped=int(local_skipped),
+            )
+
+        return order_idx, host_galaxies, local_skipped
 
     pending_results: Dict[int, List] = {}
+    host_meta = {int(item["order_idx"]): item for item in host_schedule}
     next_to_emit = 0
+    inflight_light = 0
+    inflight_heavy = 0
+
+    def build_bucket(nodes_for_host: Set[int]) -> Dict[int, ParticleMembership]:
+        """Build a membership bucket for one host from loader arrays."""
+        bucket: Dict[int, ParticleMembership] = {}
+        if not membership_arrays:
+            return bucket
+
+        for node_id in nodes_for_host:
+            arr = membership_arrays.get(int(node_id))
+            if arr is None:
+                continue
+            arr = np.asarray(arr, dtype=np.int64)
+            if arr.size == 0:
+                continue
+            if arr.ndim != 2 or arr.shape[1] != 2:
+                arr = arr.reshape(-1, 2)
+            pids = arr[:, 0]
+            ptypes = arr[:, 1]
+            pm = ParticleMembership(int(node_id))
+            mask0 = ptypes == 0
+            if np.any(mask0):
+                pm.parttype0 = set(int(v) for v in pids[mask0])
+            if load_dm:
+                mask1 = ptypes == 1
+                if np.any(mask1):
+                    pm.parttype1 = set(int(v) for v in pids[mask1])
+                mask2 = ptypes == 2
+                if np.any(mask2):
+                    pm.parttype2 = set(int(v) for v in pids[mask2])
+                mask3 = ptypes == 3
+                if np.any(mask3):
+                    pm.parttype3 = set(int(v) for v in pids[mask3])
+            mask4 = ptypes == 4
+            if np.any(mask4):
+                pm.parttype4 = set(int(v) for v in pids[mask4])
+            mask5 = ptypes == 5
+            if np.any(mask5):
+                pm.parttype5 = set(int(v) for v in pids[mask5])
+            bucket[int(node_id)] = pm
+        return bucket
 
     def flush_completed(futures, block: bool = False):
-        nonlocal next_to_emit
+        nonlocal next_to_emit, inflight_light, inflight_heavy, skipped_empty_payloads
         if not futures:
-            return
+            return 0
         timeout = None if block else 0
-        return_when = ALL_COMPLETED if block else FIRST_COMPLETED
-        done, _ = wait(list(futures.keys()), timeout=timeout, return_when=return_when)
+        done, _ = wait(list(futures.keys()), timeout=timeout, return_when=FIRST_COMPLETED)
         if not done:
-            return
+            return 0
         for fut in done:
-            order_idx, host_gals = fut.result()
-            futures.pop(fut, None)
+            lane, _ = futures.pop(fut, (None, None))
+            if lane == "heavy":
+                inflight_heavy = max(0, inflight_heavy - 1)
+            else:
+                inflight_light = max(0, inflight_light - 1)
+            order_idx, host_gals, local_skipped = fut.result()
+            skipped_empty_payloads += int(local_skipped)
             pending_results[order_idx] = host_gals
         while next_to_emit in pending_results:
             host_gals = pending_results.pop(next_to_emit)
+            meta = host_meta.get(next_to_emit, {})
+            host_id = int(meta.get("root_id", -1))
+            is_heavy = bool(meta.get("is_heavy", False))
             if host_gals:
                 for node_id, grp in host_gals:
                     galaxies.append(grp)
                     galaxy_node_ids.append(int(node_id))
+            if _trace_host(next_to_emit, is_heavy):
+                _phase_memlog(
+                    "materialize",
+                    order_idx=next_to_emit,
+                    host_id=host_id,
+                    heavy=int(is_heavy),
+                    galaxies=int(len(host_gals)),
+                    inflight_light=int(inflight_light),
+                    inflight_heavy=int(inflight_heavy),
+                    hosts_done=int(next_to_emit + 1),
+                    hosts_total=int(total_hosts),
+                    pending=int(len(pending_results)),
+                )
             if host_progress is not None:
                 host_progress.update(1)
             next_to_emit += 1
+        return len(done)
 
     with ThreadPoolExecutor(max_workers=jobs) as executor:
         pending_futures: Dict = {}
-        host_order = 0
+        if two_lane_enabled:
+            from collections import deque as _deque
 
-        for root_id, nodes_for_host in host_to_nodes.items():
-            # Build a membership bucket for this host from the loader arrays
-            bucket: Dict[int, ParticleMembership] = {}
-            if membership_arrays:
-                for node_id in nodes_for_host:
-                    arr = membership_arrays.get(int(node_id))
-                    if arr is None:
-                        continue
-                    arr = np.asarray(arr, dtype=np.int64)
-                    if arr.size == 0:
-                        continue
-                    if arr.ndim != 2 or arr.shape[1] != 2:
-                        arr = arr.reshape(-1, 2)
-                    pids = arr[:, 0]
-                    ptypes = arr[:, 1]
-                    pm = ParticleMembership(int(node_id))
-                    mask0 = ptypes == 0
-                    if np.any(mask0):
-                        pm.parttype0 = set(int(v) for v in pids[mask0])
-                    if load_dm:
-                        mask1 = ptypes == 1
-                        if np.any(mask1):
-                            pm.parttype1 = set(int(v) for v in pids[mask1])
-                        mask2 = ptypes == 2
-                        if np.any(mask2):
-                            pm.parttype2 = set(int(v) for v in pids[mask2])
-                        mask3 = ptypes == 3
-                        if np.any(mask3):
-                            pm.parttype3 = set(int(v) for v in pids[mask3])
-                    mask4 = ptypes == 4
-                    if np.any(mask4):
-                        pm.parttype4 = set(int(v) for v in pids[mask4])
-                    mask5 = ptypes == 5
-                    if np.any(mask5):
-                        pm.parttype5 = set(int(v) for v in pids[mask5])
-                    bucket[int(node_id)] = pm
+            heavy_queue = _deque([item for item in host_schedule if item["is_heavy"]])
+            light_queue = _deque([item for item in host_schedule if not item["is_heavy"]])
 
-            bucket_copy = dict(bucket)
-            future = executor.submit(process_host, host_order, root_id, bucket_copy)
-            pending_futures[future] = host_order
-            host_order += 1
-            flush_completed(pending_futures, block=False)
+            while heavy_queue or light_queue or pending_futures:
+                submitted = False
 
-        flush_completed(pending_futures, block=True)
+                while heavy_queue and inflight_heavy < heavy_inflight_limit:
+                    item = heavy_queue.popleft()
+                    bucket = build_bucket(item["nodes"])
+                    future = executor.submit(
+                        process_host,
+                        int(item["order_idx"]),
+                        int(item["root_id"]),
+                        bucket,
+                        int(item["fof_candidates"]),
+                        bool(item["is_heavy"]),
+                    )
+                    pending_futures[future] = ("heavy", int(item["order_idx"]))
+                    inflight_heavy += 1
+                    submitted = True
+
+                while light_queue and inflight_light < light_worker_limit:
+                    item = light_queue.popleft()
+                    bucket = build_bucket(item["nodes"])
+                    future = executor.submit(
+                        process_host,
+                        int(item["order_idx"]),
+                        int(item["root_id"]),
+                        bucket,
+                        int(item["fof_candidates"]),
+                        bool(item["is_heavy"]),
+                    )
+                    pending_futures[future] = ("light", int(item["order_idx"]))
+                    inflight_light += 1
+                    submitted = True
+
+                if pending_futures:
+                    flush_completed(pending_futures, block=(not submitted))
+
+            while pending_futures:
+                flush_completed(pending_futures, block=True)
+        else:
+            for item in host_schedule:
+                bucket = build_bucket(item["nodes"])
+                future = executor.submit(
+                    process_host,
+                    int(item["order_idx"]),
+                    int(item["root_id"]),
+                    bucket,
+                    int(item["fof_candidates"]),
+                    False,
+                )
+                pending_futures[future] = ("light", int(item["order_idx"]))
+                inflight_light += 1
+                flush_completed(pending_futures, block=False)
+
+            while pending_futures:
+                flush_completed(pending_futures, block=True)
 
     if host_progress is not None:
         host_progress.close()
@@ -362,6 +697,11 @@ def build_galaxies_from_ahf_fast(
     sim.galaxy_list = galaxies
     sim.ngalaxies = len(galaxies)
     sim.galaxies = galaxies
+    _phase_memlog(
+        "materialize_start",
+        galaxies=int(sim.ngalaxies),
+        hosts_total=int(total_hosts),
+    )
     setattr(sim, "_ahf_matched", True)
     setattr(sim, "_include_dm_in_galaxies", True)
     if sim.ngalaxies == 0:
@@ -401,6 +741,12 @@ def build_galaxies_from_ahf_fast(
 
     for gal in sim.galaxy_list:
         _refresh_global_indexes(gal)
+
+    _phase_memlog(
+        "materialize_done",
+        galaxies=int(sim.ngalaxies),
+        hosts_total=int(total_hosts),
+    )
 
     host_indices: List[int] = []
     if galaxy_node_ids and len(galaxy_node_ids) == sim.ngalaxies:
@@ -560,12 +906,23 @@ def build_galaxies_from_ahf_fast(
     prop_bar = None
     if show_progress and sim.ngalaxies > 0:
         prop_bar = tqdm(total=1, desc="Computing galaxy properties", leave=False)
+    _phase_memlog(
+        "properties_start",
+        galaxies=int(sim.ngalaxies),
+        nproc=int(getattr(ctx, "nproc", 1)),
+    )
+    _prop_t0 = _time.time()
     try:
         _get_group_properties(ctx, sim.galaxy_list)
     finally:
         if prop_bar is not None:
             prop_bar.update(1)
             prop_bar.close()
+    _phase_memlog(
+        "properties_done",
+        galaxies=int(sim.ngalaxies),
+        elapsed_s=round(_time.time() - _prop_t0, 3),
+    )
 
     try:
         if "galaxy" not in sim.group_types:
@@ -599,3 +956,9 @@ def build_galaxies_from_ahf_fast(
                 del gal.__dict__["_dm_exclusive_pids"]
         if hasattr(sim, "_exclusive_galaxy_dmlist"):
             delattr(sim, "_exclusive_galaxy_dmlist")
+
+    _phase_memlog(
+        "done",
+        galaxies=int(sim.ngalaxies),
+        halos=int(getattr(sim, "nhalos", 0)),
+    )
