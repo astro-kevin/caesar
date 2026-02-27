@@ -32,7 +32,11 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
     from caesar.fubar import get_mean_interparticle_separation
     from caesar.group import get_group_properties
     from caesar.property_manager import get_property, has_ptype, ptype_ints
-    from caesar.AHF_FAST_loader import load_ahf_hierarchy, load_ahf_particle_blocks
+    from caesar.AHF_FAST_loader import (
+        load_ahf_halos_dataframe,
+        load_ahf_hierarchy,
+        load_ahf_particle_blocks,
+    )
     from caesar.halo_matching import _update_ahf_halo_maps, _populate_hydrogen_masses
 
     if not ahf_particles_file:
@@ -46,6 +50,13 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
         debug_host = int(_h) if _h not in (None, "") else None
     except Exception:
         debug_host = None
+
+    # Cache AHF_halos catalog for reuse by the galaxy builder.
+    halos_df = load_ahf_halos_dataframe(ahf_particles_file)
+    sim._ahf_fast_halos_df = halos_df
+    mylog.info(
+        "AHF-FAST halos: loaded AHF_halos dataframe rows=%d", int(len(halos_df))
+    )
 
     # Load hierarchy and cache it on the simulation for reuse by the
     # galaxy builder.

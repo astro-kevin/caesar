@@ -268,7 +268,10 @@ def build_galaxies_from_ahf_fast(
     from caesar.group import create_new_group
     from caesar.group import get_group_properties as _get_group_properties
     from caesar.property_manager import get_property, has_ptype
-    from caesar.AHF_FAST_loader import load_ahf_particle_blocks
+    from caesar.AHF_FAST_loader import (
+        load_ahf_halos_dataframe,
+        load_ahf_particle_blocks,
+    )
     from caesar.fof6d import fof6d_halo as _fof6d_halo
     from caesar.fof6d import kernel_table as _fof6d_kernel_table
     from caesar.fubar import get_b as _get_b
@@ -448,48 +451,33 @@ def build_galaxies_from_ahf_fast(
         leave=False,
     )
 
-    def _estimate_host_fof_candidates(nodes_for_host: Set[int]) -> Tuple[int, int]:
-        """Estimate host workload from AHF memberships.
+    halos_df = getattr(sim, "_ahf_fast_halos_df", None)
+    if halos_df is None:
+        halos_df = load_ahf_halos_dataframe(ahf_particles_file)
+        sim._ahf_fast_halos_df = halos_df
+    if len(halos_df) == 0:
+        raise AssertionError("AHF-FAST invariant violated: AHF_halos dataframe is empty")
 
-        Returns
-        -------
-        fof_candidates : int
-            Number of particles that can participate in galaxy FOF
-            (gas + stars + BH across all nodes in the host tree).
-        stars : int
-            Number of star particles across all nodes in the host tree.
-        """
-        if not membership_arrays:
-            return 0, 0
-
-        fof_candidates = 0
-        stars = 0
-        for node_id in nodes_for_host:
-            arr = membership_arrays.get(int(node_id))
-            if arr is None:
-                continue
-            arr = np.asarray(arr, dtype=np.int64)
-            if arr.size == 0:
-                continue
-            if arr.ndim != 2 or arr.shape[1] != 2:
-                arr = arr.reshape(-1, 2)
-            ptypes = arr[:, 1]
-            stars += int(np.sum(ptypes == 4))
-            fof_candidates += int(np.sum((ptypes == 0) | (ptypes == 4) | (ptypes == 5)))
-
-        return fof_candidates, stars
+    node_npart = {
+        int(hid): int(npart)
+        for hid, npart in zip(halos_df["hid"].to_numpy(), halos_df["npart"].to_numpy())
+    }
 
     host_schedule: List[HostSchedState] = []
     host_workloads: List[int] = []
-    for order_idx, (root_id, nodes_for_host) in enumerate(host_to_nodes.items()):
-        fof_candidates, star_count = _estimate_host_fof_candidates(nodes_for_host)
+    host_items = sorted(host_to_nodes.items(), key=lambda kv: int(kv[0]))
+    for order_idx, (root_id, nodes_for_host) in enumerate(host_items):
+        fof_candidates = int(
+            sum(int(node_npart.get(int(node_id), 0)) for node_id in nodes_for_host)
+        )
+        fof_candidates = max(1, fof_candidates)
         host_schedule.append(
             HostSchedState(
                 order_idx=int(order_idx),
                 root_id=int(root_id),
                 nodes=set(nodes_for_host),
                 fof_candidates=int(fof_candidates),
-                star_count=int(star_count),
+                star_count=0,
             )
         )
         host_workloads.append(int(fof_candidates))
@@ -525,6 +513,10 @@ def build_galaxies_from_ahf_fast(
     # Host-atomic hybrid scheduler controls.
     work_unit = 1
     scan_window = max(8, _env_int("CAESAR_AHF_FAST_SCHED_WINDOW", 256))
+    scan_window_max = max(
+        int(scan_window),
+        _env_int("CAESAR_AHF_FAST_SCHED_WINDOW_MAX", max(2048, int(scan_window))),
+    )
     adjust_every = max(1, _env_int("CAESAR_AHF_FAST_SCHED_ADJUST_EVERY", max(2, jobs // 2)))
     adjust_interval_s = 0.75
     mem_slope_warn_gbps = max(0.1, _env_float("CAESAR_AHF_FAST_MEM_SLOPE_WARN_GBPS", 1.0))
@@ -638,6 +630,11 @@ def build_galaxies_from_ahf_fast(
             adjust_every,
         )
         mylog.info(
+            "AHF-FAST: scheduler window policy base=%d max=%d",
+            int(scan_window),
+            int(scan_window_max),
+        )
+        mylog.info(
             "AHF-FAST: tracing threshold fof_candidates >= %d (count=%d)",
             heavy_threshold,
             heavy_count,
@@ -744,11 +741,7 @@ def build_galaxies_from_ahf_fast(
     payload_warmup = max(8, _env_int("CAESAR_AHF_FAST_BIN_WARMUP", max(16, jobs * 4)))
     payload_sample_cap = max(128, _env_int("CAESAR_AHF_FAST_BIN_SAMPLE_CAP", 4096))
     payload_samples = _deque(maxlen=payload_sample_cap)
-    if positive_workloads:
-        for w in positive_workloads:
-            payload_samples.append(max(0, int(w)))
-    if not payload_samples:
-        payload_samples.append(int(max(1, min_stars)))
+    payload_samples.append(int(max(1, min_stars)))
 
     payload_cutoffs = {"tiny": int(tiny_star_threshold), "huge": int(max(2, min_stars + 1))}
     payload_lock = _threading.Lock()
@@ -777,24 +770,42 @@ def build_galaxies_from_ahf_fast(
         init_huge,
     )
 
-    def _classify_payload_size(star_particle_count: int, fof_particle_count: int) -> Tuple[str, int, int]:
+    def _snapshot_payload_cutoffs() -> Tuple[int, int]:
+        with payload_lock:
+            return int(payload_cutoffs["tiny"]), int(payload_cutoffs["huge"])
+
+    def _update_payload_samples(sample_counts: Sequence[int]) -> None:
+        if not sample_counts:
+            return
+        with payload_lock:
+            before = len(payload_samples)
+            for count in sample_counts:
+                payload_samples.append(max(0, int(count)))
+            after = len(payload_samples)
+            if after <= payload_warmup:
+                _refresh_payload_cutoffs_locked()
+                return
+            if payload_update_every <= 1:
+                _refresh_payload_cutoffs_locked()
+                return
+            prev_bucket = int(before // payload_update_every)
+            new_bucket = int(after // payload_update_every)
+            if new_bucket > prev_bucket:
+                _refresh_payload_cutoffs_locked()
+
+    def _classify_payload_size(
+        star_particle_count: int,
+        fof_particle_count: int,
+        tiny_cut: int,
+        huge_cut: int,
+    ) -> str:
         stars = max(0, int(star_particle_count))
         count = max(0, int(fof_particle_count))
-        with payload_lock:
-            if stars > int(tiny_star_threshold):
-                payload_samples.append(count)
-                n = len(payload_samples)
-                if n <= payload_warmup or (n % payload_update_every) == 0:
-                    _refresh_payload_cutoffs_locked()
-            else:
-                payload_cutoffs["tiny"] = int(tiny_star_threshold)
-            tiny_cut = int(payload_cutoffs["tiny"])
-            huge_cut = int(payload_cutoffs["huge"])
-        if stars <= tiny_cut:
-            return "tiny", tiny_cut, huge_cut
-        if count >= huge_cut:
-            return "huge", tiny_cut, huge_cut
-        return "normal", tiny_cut, huge_cut
+        if stars <= int(tiny_cut):
+            return "tiny"
+        if count >= int(huge_cut):
+            return "huge"
+        return "normal"
 
     def _dense_gas_selected(gidx: np.ndarray) -> np.ndarray:
         gidx_arr = np.asarray(gidx, dtype=np.int64)
@@ -866,52 +877,60 @@ def build_galaxies_from_ahf_fast(
         for node in nodes_for_host:
             bucket.setdefault(node, ParticleMembership(node))
 
-        exclusives = _compute_exclusive_memberships(bucket, children_of, nodes_for_host)
-
-        from collections import defaultdict as _dd
-
         payloads: List[Tuple[int, Set[int], Set[int], Set[int], Set[int]]] = []
 
-        depth_cache: Dict[int, int] = {}
+        # Fast path: a host tree with one node has no exclusive-subtraction
+        # work, so we can skip depth traversal/set carry propagation.
+        if len(nodes_for_host) == 1:
+            node = next(iter(nodes_for_host))
+            pm = bucket.get(node, ParticleMembership(node))
+            if len(pm.parttype4) >= min_stars:
+                payloads.append((node, pm.parttype4, pm.parttype0, pm.parttype5, pm.parttype1))
+        else:
+            exclusives = _compute_exclusive_memberships(bucket, children_of, nodes_for_host)
 
-        def node_depth(node: int) -> int:
-            if node in depth_cache:
-                return depth_cache[node]
-            parent = parent_of.get(node, 0)
-            if parent in (0, None):
-                depth_cache[node] = 0
-            else:
-                depth_cache[node] = node_depth(int(parent)) + 1
-            return depth_cache[node]
+            from collections import defaultdict as _dd
 
-        carry_star = _dd(set)
-        carry_gas = _dd(set)
-        carry_bh = _dd(set)
-        carry_dm = _dd(set)
+            depth_cache: Dict[int, int] = {}
 
-        nodes_sorted = sorted(nodes_for_host, key=node_depth, reverse=True)
-
-        for node in nodes_sorted:
-            extras_star = carry_star.pop(node, set())
-            extras_gas = carry_gas.pop(node, set())
-            extras_bh = carry_bh.pop(node, set())
-            extras_dm = carry_dm.pop(node, set())
-
-            ex = exclusives.get(node, ParticleMembership(node))
-            star_set = set(ex.parttype4) | extras_star
-            gas_set = set(ex.parttype0) | extras_gas
-            bh_set = set(ex.parttype5) | extras_bh
-            dm_exc_set = set(ex.parttype1) | extras_dm
-
-            if len(star_set) >= min_stars:
-                payloads.append((node, star_set, gas_set, bh_set, dm_exc_set))
-            else:
+            def node_depth(node: int) -> int:
+                if node in depth_cache:
+                    return depth_cache[node]
                 parent = parent_of.get(node, 0)
-                if parent not in (0, None):
-                    carry_star[parent].update(star_set)
-                    carry_gas[parent].update(gas_set)
-                    carry_bh[parent].update(bh_set)
-                    carry_dm[parent].update(dm_exc_set)
+                if parent in (0, None):
+                    depth_cache[node] = 0
+                else:
+                    depth_cache[node] = node_depth(int(parent)) + 1
+                return depth_cache[node]
+
+            carry_star = _dd(set)
+            carry_gas = _dd(set)
+            carry_bh = _dd(set)
+            carry_dm = _dd(set)
+
+            nodes_sorted = sorted(nodes_for_host, key=node_depth, reverse=True)
+
+            for node in nodes_sorted:
+                extras_star = carry_star.pop(node, set())
+                extras_gas = carry_gas.pop(node, set())
+                extras_bh = carry_bh.pop(node, set())
+                extras_dm = carry_dm.pop(node, set())
+
+                ex = exclusives.get(node, ParticleMembership(node))
+                star_set = set(ex.parttype4) | extras_star
+                gas_set = set(ex.parttype0) | extras_gas
+                bh_set = set(ex.parttype5) | extras_bh
+                dm_exc_set = set(ex.parttype1) | extras_dm
+
+                if len(star_set) >= min_stars:
+                    payloads.append((node, star_set, gas_set, bh_set, dm_exc_set))
+                else:
+                    parent = parent_of.get(node, 0)
+                    if parent not in (0, None):
+                        carry_star[parent].update(star_set)
+                        carry_gas[parent].update(gas_set)
+                        carry_bh[parent].update(bh_set)
+                        carry_dm[parent].update(dm_exc_set)
 
         if not payloads:
             if _trace_host(order_idx, is_heavy):
@@ -941,6 +960,9 @@ def build_galaxies_from_ahf_fast(
             "fof_fallback": 0,
         }
 
+        tiny_cut, huge_cut = _snapshot_payload_cutoffs()
+        new_payload_samples: List[int] = []
+
         for payload in payloads:
             node_id, star_set, gas_set, bh_set, dm_exc = payload
             dm_pm = bucket.get(node_id)
@@ -960,7 +982,14 @@ def build_galaxies_from_ahf_fast(
 
             star_particle_count = int(len(star_sel))
             fof_particle_count = int(star_particle_count + len(gas_sel_dense) + len(bh_sel))
-            mode, tiny_cut, huge_cut = _classify_payload_size(star_particle_count, fof_particle_count)
+            if star_particle_count > int(tiny_star_threshold):
+                new_payload_samples.append(int(fof_particle_count))
+            mode = _classify_payload_size(
+                star_particle_count,
+                fof_particle_count,
+                int(tiny_cut),
+                int(huge_cut),
+            )
             host_stats["payloads"] += 1
             host_stats[mode] += 1
 
@@ -1062,6 +1091,8 @@ def build_galaxies_from_ahf_fast(
                 continue
             host_galaxies.append((int(node_id), grp))
 
+        _update_payload_samples(new_payload_samples)
+
         if _trace_host(order_idx, is_heavy):
             _phase_memlog(
                 "depth_wave_done",
@@ -1138,6 +1169,16 @@ def build_galaxies_from_ahf_fast(
             bucket[int(node_id)] = pm
         return bucket
 
+    def process_host_task(
+        order_idx: int,
+        root_id: int,
+        nodes_for_host: Set[int],
+        fof_candidates: int = 0,
+        is_heavy: bool = False,
+    ):
+        bucket = build_bucket(nodes_for_host)
+        return process_host(order_idx, root_id, bucket, fof_candidates, is_heavy)
+
     with ThreadPoolExecutor(max_workers=jobs) as executor:
         pending_futures: Dict = {}
         pending_hosts = _deque(host_schedule)
@@ -1166,11 +1207,10 @@ def build_galaxies_from_ahf_fast(
             "anchors_found": {"small": 0, "medium": 0, "large": 0},
         }
 
-        def _refresh_pending_predictions(bin_name: Optional[str] = None) -> None:
-            for idx, host_state in enumerate(pending_hosts):
-                host_state.queue_index = int(idx)
-                if bin_name is not None and str(host_state.size_bin) != str(bin_name):
-                    continue
+        def _refresh_window_predictions(window: int) -> None:
+            limit = max(0, min(int(window), len(pending_hosts)))
+            for idx in range(limit):
+                host_state = pending_hosts[idx]
                 host_state.predicted_bytes = _ahf_fast_predict_reservation_bytes(
                     work_units=int(host_state.work_units),
                     base_unit_bytes=int(base_unit_bytes),
@@ -1179,12 +1219,12 @@ def build_galaxies_from_ahf_fast(
                     pred_min_bytes=int(resv_min_bytes),
                     pred_max_bytes=int(resv_max_bytes),
                 )
+                host_state.queue_index = int(idx)
 
         def _pop_pending_at(idx: int) -> HostSchedState:
             pending_hosts.rotate(-int(idx))
             item = pending_hosts.popleft()
             pending_hosts.rotate(int(idx))
-            _refresh_pending_predictions(bin_name=None)
             return item
 
         def _adjust_scheduler(done_count: int = 0, force: bool = False) -> None:
@@ -1292,7 +1332,6 @@ def build_galaxies_from_ahf_fast(
                             )
                             bin_multiplier[bin_name] = float(updated)
                             scheduler_counts["model_updates"] += 1
-                            _refresh_pending_predictions(bin_name=bin_name)
 
                 order_idx, host_gals, local_skipped, host_stats = fut.result()
                 skipped_empty_payloads += int(local_skipped)
@@ -1329,7 +1368,6 @@ def build_galaxies_from_ahf_fast(
                 next_to_emit += 1
             return len(done)
 
-        _refresh_pending_predictions(bin_name=None)
         _adjust_scheduler(done_count=adjust_every, force=True)
 
         completed_since_adjust = 0
@@ -1339,11 +1377,26 @@ def build_galaxies_from_ahf_fast(
 
             while pending_hosts and inflight_count < int(target_workers):
                 remaining_capacity = int(capacity_bytes) - int(reserved_bytes_total)
-                best_idx = _ahf_fast_select_best_fit_index(
-                    pending_hosts=list(pending_hosts),
-                    scan_window=int(scan_window),
-                    remaining_bytes=int(max(0, remaining_capacity)),
-                )
+                window_used = max(1, min(int(scan_window), len(pending_hosts)))
+                best_idx = -1
+                while True:
+                    _refresh_window_predictions(window=int(window_used))
+                    best_idx = _ahf_fast_select_best_fit_index(
+                        pending_hosts=pending_hosts,
+                        scan_window=int(window_used),
+                        remaining_bytes=int(max(0, remaining_capacity)),
+                    )
+                    if best_idx >= 0:
+                        break
+                    if int(window_used) >= int(len(pending_hosts)):
+                        break
+                    if int(window_used) >= int(scan_window_max):
+                        break
+                    window_used = min(
+                        int(len(pending_hosts)),
+                        int(scan_window_max),
+                        int(max(8, int(window_used) * 2)),
+                    )
                 used_borrow = False
                 if best_idx < 0:
                     scheduler_counts["fit_fail_count"] += 1
@@ -1355,8 +1408,8 @@ def build_galaxies_from_ahf_fast(
                     )
                     if allow_borrow:
                         best_idx = _ahf_fast_select_smallest_borrow_index(
-                            pending_hosts=list(pending_hosts),
-                            scan_window=int(scan_window),
+                            pending_hosts=pending_hosts,
+                            scan_window=int(window_used),
                             remaining_bytes=int(max(0, remaining_capacity)),
                             borrow_cap_bytes=int(max(0, borrow_cap_bytes)),
                         )
@@ -1366,7 +1419,7 @@ def build_galaxies_from_ahf_fast(
                     # Deadlock guard: keep one host moving even if the
                     # instantaneous capacity estimate is overly conservative.
                     best_idx = _ahf_fast_select_smallest_index(
-                        pending_hosts=list(pending_hosts),
+                        pending_hosts=pending_hosts,
                         scan_window=int(scan_window),
                     )
                 if best_idx < 0:
@@ -1375,7 +1428,6 @@ def build_galaxies_from_ahf_fast(
                 item = _pop_pending_at(int(best_idx))
                 if used_borrow:
                     scheduler_counts["borrow_count"] += 1
-                bucket = build_bucket(item.nodes)
                 started_at = _time.time()
                 submit_inflight = int(inflight_count) + 1
                 rss_submit, _, _, _ = _snapshot_memory()
@@ -1383,10 +1435,10 @@ def build_galaxies_from_ahf_fast(
                 item.submit_inflight = int(submit_inflight)
                 item.submit_rss_bytes = int(rss_submit) if rss_submit is not None else -1
                 future = executor.submit(
-                    process_host,
+                    process_host_task,
                     int(item.order_idx),
                     int(item.root_id),
-                    bucket,
+                    item.nodes,
                     int(item.fof_candidates),
                     bool(item.is_heavy),
                 )

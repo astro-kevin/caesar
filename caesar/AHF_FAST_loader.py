@@ -10,6 +10,7 @@ need to worry about file format details.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -17,7 +18,6 @@ import numpy as np
 
 from caesar.property_manager import get_property, has_ptype
 from caesar.halo_matching import (
-    _ahf_halos_path,
     _read_ahf_hierarchy,
     _iter_memberships_stream,
     ParticleMembership,
@@ -38,6 +38,46 @@ def load_ahf_hierarchy(ahf_particles_file: str) -> AHFHierarchy:
 
     parent_of, children_of = _read_ahf_hierarchy(ahf_particles_file)
     return AHFHierarchy(parent_of=parent_of, children_of=children_of)
+
+
+def load_ahf_halos_dataframe(ahf_particles_file: str):
+    """Load ``AHF_halos`` into a compact DataFrame.
+
+    The halos catalog is inferred from ``ahf_particles_file`` by replacing the
+    basename token ``particles`` -> ``halos`` in the same directory.
+    Returns columns: ``hid``, ``host_hid``, ``npart``.
+    """
+
+    try:
+        import pandas as pd
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "AHF-FAST requires pandas to load AHF_halos as a DataFrame."
+        ) from exc
+
+    particles_base = os.path.basename(ahf_particles_file)
+    if "particles" not in particles_base:
+        raise ValueError(
+            f"AHF particles filename does not contain 'particles': {ahf_particles_file}"
+        )
+
+    halos_file = os.path.join(
+        os.path.dirname(ahf_particles_file),
+        particles_base.replace("particles", "halos"),
+    )
+    if not os.path.isfile(halos_file):
+        raise FileNotFoundError(f"AHF halos file not found: {halos_file}")
+
+    df = pd.read_csv(
+        halos_file,
+        sep=r"\s+",
+        comment="#",
+        header=None,
+        usecols=[0, 1, 4],
+        names=["hid", "host_hid", "npart"],
+        dtype=np.int64,
+    )
+    return df
 
 
 def load_ahf_particle_blocks(
