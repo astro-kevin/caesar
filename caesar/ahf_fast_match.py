@@ -566,6 +566,9 @@ def build_galaxies_from_ahf_fast(
         desc="Building galaxies (AHF-FAST)",
         disable=(not show_progress or total_hosts == 0),
         leave=False,
+        mininterval=2.0,
+        miniters=32,
+        smoothing=0.0,
     )
 
     halos_df = getattr(sim, "_ahf_fast_halos_df", None)
@@ -1488,6 +1491,7 @@ def build_galaxies_from_ahf_fast(
             done, _ = wait(list(futures.keys()), timeout=timeout, return_when=FIRST_COMPLETED)
             if not done:
                 return 0
+            done_count = 0
             for fut in done:
                 fut_meta = futures.pop(fut, None)
                 reserved = int(fut_meta.get("reserved_bytes", 0)) if isinstance(fut_meta, dict) else 0
@@ -1496,8 +1500,7 @@ def build_galaxies_from_ahf_fast(
 
                 order_idx, host_gals, local_skipped, host_stats = fut.result()
                 completed_hosts += 1
-                if host_progress is not None:
-                    host_progress.update(1)
+                done_count += 1
 
                 skipped_empty_payloads += int(local_skipped)
                 if isinstance(host_stats, dict):
@@ -1559,7 +1562,9 @@ def build_galaxies_from_ahf_fast(
                         pending=int(len(pending_results)),
                     )
                 next_to_emit += 1
-            return len(done)
+            if host_progress is not None and done_count > 0:
+                host_progress.update(int(done_count))
+            return int(done_count)
 
         _adjust_scheduler(done_count=adjust_every, force=True)
 
