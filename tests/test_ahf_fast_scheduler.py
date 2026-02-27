@@ -2,6 +2,8 @@ from pathlib import Path
 import importlib.util
 import sys
 
+import numpy as np
+
 
 module_path = Path(__file__).resolve().parents[1] / "caesar" / "ahf_fast_match.py"
 spec = importlib.util.spec_from_file_location("ahf_fast_match", module_path)
@@ -15,7 +17,10 @@ HostSchedState = ahf_fast_match.HostSchedState
 _GIB = int(2**30)
 
 
-def _mk_hosts(predicted_bytes):
+def _mk_hosts(predicted_bytes, fof_candidates=None, tiny_idx=None):
+    tiny_idx = set(tiny_idx or [])
+    if fof_candidates is None:
+        fof_candidates = [max(1, int(v // (256 * 1024**2))) for v in predicted_bytes]
     hosts = []
     for i, pred in enumerate(predicted_bytes):
         hosts.append(
@@ -23,128 +28,111 @@ def _mk_hosts(predicted_bytes):
                 order_idx=i,
                 root_id=i,
                 nodes=set(),
-                fof_candidates=0,
+                fof_candidates=int(fof_candidates[i]),
                 star_count=0,
                 predicted_bytes=int(pred),
+                is_tiny_proxy=(i in tiny_idx),
             )
         )
     return hosts
 
 
-def _pack_best_fit(predictions, capacity_bytes, scan_window=256):
-    pending = _mk_hosts(predictions)
-    used = 0
-    chosen = []
-    while pending:
-        idx = ahf_fast_match._ahf_fast_select_best_fit_index(
+def test_refit_cadence_is_powers_of_two_starting_at_8():
+    target = int(2**3)
+    seq = [target]
+    for _ in range(4):
+        target = ahf_fast_match._ahf_fast_next_refit_target(current_target=target, exp_max=16)
+        seq.append(target)
+    assert seq == [8, 16, 32, 64, 128]
+
+
+def test_monotone_model_prediction_is_non_decreasing_with_size():
+    x = np.log1p(np.asarray([16, 64, 256, 1024, 4096], dtype=np.float64))
+    y = np.asarray([0.5, 1.0, 2.5, 5.0, 10.0], dtype=np.float64) * _GIB
+    w = np.ones_like(y, dtype=np.float64)
+    model = ahf_fast_match._ahf_fast_fit_mem_model(
+        sample_x=x.tolist(),
+        sample_y=y.tolist(),
+        sample_w=w.tolist(),
+        tau=0.90,
+        knots=5,
+        neighbors=5,
+    )
+    assert model is not None
+    preds = [
+        ahf_fast_match._ahf_fast_predict_reservation_bytes(
+            fof_candidates=v,
+            model=model,
+            seed_bytes=1 * _GIB,
+            pred_min_bytes=int(0.25 * _GIB),
+            pred_max_bytes=int(32 * _GIB),
+        )
+        for v in [8, 32, 128, 512, 2048, 8192]
+    ]
+    assert all(a <= b for a, b in zip(preds, preds[1:]))
+
+
+def test_phase_a_can_fill_all_worker_slots_when_capacity_permits():
+    jobs = 6
+    capacity = 1000
+    pending = _mk_hosts([20, 25, 30, 15, 10, 18, 12, 9], tiny_idx=[])
+    launched = 0
+    reserved = 0
+    while pending and launched < jobs:
+        idx = ahf_fast_match._ahf_fast_select_pair_candidate_index(
             pending_hosts=pending,
-            scan_window=scan_window,
-            remaining_bytes=max(0, int(capacity_bytes) - int(used)),
+            candidate_pool=8,
+            pair_pool=8,
+            remaining_bytes=int(capacity - reserved),
+            pair_gain=0.03,
         )
         if idx < 0:
             break
         host = pending.pop(idx)
-        used += int(host.predicted_bytes)
-        chosen.append(int(host.predicted_bytes))
-    return used, chosen
+        reserved += int(host.predicted_bytes)
+        launched += 1
+    assert launched == jobs
 
 
-def _pack_fifo(predictions, capacity_bytes):
-    used = 0
-    for pred in predictions:
-        pred_i = int(pred)
-        if used + pred_i > int(capacity_bytes):
-            break
-        used += pred_i
-    return used
-
-
-def test_best_fit_admission_packs_better_than_fifo():
-    preds = [120, 60, 40, 20]
-    best_fit_used, _ = _pack_best_fit(preds, 100)
-    fifo_used = _pack_fifo(preds, 100)
-    assert best_fit_used == 100
-    assert best_fit_used > fifo_used
-
-
-def test_no_large_cap_when_capacity_allows_multiple_large_hosts():
-    preds = [45, 44, 12]
-    used, chosen = _pack_best_fit(preds, 89)
-    assert used == 89
-    assert sum(1 for v in chosen if v >= 40) == 2
-
-
-def test_borrow_mode_gate_requires_high_mode_and_non_negative_slope():
-    assert ahf_fast_match._ahf_fast_can_borrow(
-        mode="high", slope_gbps=0.0, inflight_count=1, target_workers=4
+def test_phase_a_pair_lookahead_beats_largest_first_on_fragmented_case():
+    pending = _mk_hosts([70, 45, 40, 35], tiny_idx=[])
+    remaining = 80
+    idx = ahf_fast_match._ahf_fast_select_pair_candidate_index(
+        pending_hosts=pending,
+        candidate_pool=4,
+        pair_pool=4,
+        remaining_bytes=remaining,
+        pair_gain=0.03,
     )
-    assert not ahf_fast_match._ahf_fast_can_borrow(
-        mode="nominal", slope_gbps=0.0, inflight_count=1, target_workers=4
+    assert idx in (1, 3)
+    chosen = int(pending[idx].predicted_bytes)
+    assert chosen != 70
+
+
+def test_phase_b_backfills_with_tiny_when_phase_a_cannot_fit():
+    pending = _mk_hosts(
+        predicted_bytes=[60, 55, 4, 3],
+        fof_candidates=[6000, 5500, 20, 16],
+        tiny_idx=[2, 3],
     )
-    assert not ahf_fast_match._ahf_fast_can_borrow(
-        mode="high", slope_gbps=-0.1, inflight_count=1, target_workers=4
+    phase_a = ahf_fast_match._ahf_fast_select_pair_candidate_index(
+        pending_hosts=pending,
+        candidate_pool=4,
+        pair_pool=4,
+        remaining_bytes=10,
+        pair_gain=0.03,
     )
-    assert not ahf_fast_match._ahf_fast_can_borrow(
-        mode="high", slope_gbps=0.1, inflight_count=4, target_workers=4
+    assert phase_a == -1
+
+    phase_b = ahf_fast_match._ahf_fast_select_tiny_backfill_index(
+        pending_hosts=pending,
+        scan_window=4,
     )
+    assert phase_b in (2, 3)
+    assert pending[phase_b].is_tiny_proxy
 
 
-def test_anchor_update_policy_is_opportunistic_at_low_contention():
-    should_update, is_anchor, alpha = ahf_fast_match._ahf_fast_update_policy_for_sample(
-        submit_inflight=2,
-        anchor_max_inflight=2,
-        anchor_found=False,
-        alpha_anchor=0.35,
-        alpha_online=0.08,
-    )
-    assert should_update
-    assert is_anchor
-    assert alpha == 0.35
-
-    should_update, is_anchor, alpha = ahf_fast_match._ahf_fast_update_policy_for_sample(
-        submit_inflight=2,
-        anchor_max_inflight=2,
-        anchor_found=True,
-        alpha_anchor=0.35,
-        alpha_online=0.08,
-    )
-    assert should_update
-    assert not is_anchor
-    assert alpha == 0.08
-
-    should_update, is_anchor, alpha = ahf_fast_match._ahf_fast_update_policy_for_sample(
-        submit_inflight=3,
-        anchor_max_inflight=2,
-        anchor_found=False,
-        alpha_anchor=0.35,
-        alpha_online=0.08,
-    )
-    assert not should_update
-    assert not is_anchor
-    assert alpha == 0.08
-
-
-def test_online_multiplier_update_clamps_ratio_and_moves_directionally():
-    up, up_ratio = ahf_fast_match._ahf_fast_update_bin_multiplier(
-        current=1.0,
-        observed_bytes=400,
-        predicted_bytes=100,
-        alpha=0.5,
-    )
-    down, down_ratio = ahf_fast_match._ahf_fast_update_bin_multiplier(
-        current=1.0,
-        observed_bytes=10,
-        predicted_bytes=100,
-        alpha=0.5,
-    )
-
-    assert up_ratio == 2.0
-    assert down_ratio == 0.5
-    assert up > 1.0
-    assert down < 1.0
-
-
-def test_observed_bytes_and_smallest_fallback_helpers():
+def test_observed_bytes_and_sample_weight_helpers():
     obs1 = ahf_fast_match._ahf_fast_observed_bytes_estimate(
         submit_inflight=1,
         rss_submit_bytes=10 * _GIB,
@@ -160,11 +148,13 @@ def test_observed_bytes_and_smallest_fallback_helpers():
         rss_submit_bytes=10 * _GIB,
         rss_done_bytes=11 * _GIB,
     )
+    w1 = ahf_fast_match._ahf_fast_sample_weight(submit_inflight=1, anchor_max_inflight=2)
+    w2 = ahf_fast_match._ahf_fast_sample_weight(submit_inflight=2, anchor_max_inflight=2)
+    w3 = ahf_fast_match._ahf_fast_sample_weight(submit_inflight=3, anchor_max_inflight=2)
 
     assert obs1 == 1 * _GIB
     assert obs2 == int(0.5 * _GIB)
     assert obs3 is None
-
-    pending = _mk_hosts([7 * _GIB, 2 * _GIB, 5 * _GIB])
-    idx = ahf_fast_match._ahf_fast_select_smallest_index(pending_hosts=pending, scan_window=3)
-    assert idx == 1
+    assert w1 == 1.0
+    assert w2 == 0.5
+    assert w3 == 0.0
