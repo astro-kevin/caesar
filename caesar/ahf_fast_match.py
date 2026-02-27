@@ -9,9 +9,238 @@ source of truth lives here.
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from math import ceil
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
+
+
+_GIB = float(2**30)
+
+
+@dataclass
+class HostSchedState:
+    order_idx: int
+    root_id: int
+    nodes: Set[int]
+    fof_candidates: int
+    star_count: int
+    is_heavy: bool = False
+    work_units: int = 1
+    size_bin: str = "medium"
+    predicted_bytes: int = 0
+    queue_index: int = 0
+    submit_ts: float = 0.0
+    submit_inflight: int = 0
+    submit_rss_bytes: int = -1
+
+
+def _ahf_fast_clamp(value: float, lower: float, upper: float) -> float:
+    return min(max(float(value), float(lower)), float(upper))
+
+
+def _ahf_fast_quantile_cutoffs(
+    fof_candidates: Sequence[int],
+    small_q: float,
+    large_q: float,
+) -> Tuple[int, int]:
+    if not fof_candidates:
+        return 0, 0
+    arr = np.asarray([max(0, int(v)) for v in fof_candidates], dtype=np.float64)
+    small_q = float(_ahf_fast_clamp(small_q, 0.0, 1.0))
+    large_q = float(_ahf_fast_clamp(large_q, small_q, 1.0))
+    small_cut = int(np.percentile(arr, 100.0 * small_q))
+    large_cut = int(np.percentile(arr, 100.0 * large_q))
+    if large_cut < small_cut:
+        large_cut = small_cut
+    return small_cut, large_cut
+
+
+def _ahf_fast_assign_size_bin(fof_candidates: int, small_cut: int, large_cut: int) -> str:
+    val = int(max(0, int(fof_candidates)))
+    if val <= int(small_cut):
+        return "small"
+    if val > int(large_cut):
+        return "large"
+    return "medium"
+
+
+def _ahf_fast_predict_reservation_bytes(
+    *,
+    work_units: int,
+    base_unit_bytes: int,
+    size_bin: str,
+    bin_multiplier: Dict[str, float],
+    pred_min_bytes: int,
+    pred_max_bytes: int,
+) -> int:
+    predicted = (
+        float(max(1, int(work_units)))
+        * float(max(1, int(base_unit_bytes)))
+        * float(bin_multiplier.get(size_bin, 1.0))
+    )
+    return int(
+        round(
+            _ahf_fast_clamp(
+                predicted,
+                float(max(1, int(pred_min_bytes))),
+                float(max(int(pred_min_bytes), int(pred_max_bytes))),
+            )
+        )
+    )
+
+
+def _ahf_fast_update_bin_multiplier(
+    *,
+    current: float,
+    observed_bytes: int,
+    predicted_bytes: int,
+    alpha: float,
+) -> Tuple[float, float]:
+    if int(observed_bytes) <= 0 or int(predicted_bytes) <= 0:
+        return float(current), 1.0
+    ratio = float(observed_bytes) / float(predicted_bytes)
+    clipped_ratio = float(_ahf_fast_clamp(ratio, 0.5, 2.0))
+    alpha = float(_ahf_fast_clamp(alpha, 0.0, 1.0))
+    next_multiplier = float(current) * ((1.0 - alpha) + alpha * clipped_ratio)
+    return float(max(0.05, next_multiplier)), clipped_ratio
+
+
+def _ahf_fast_worker_target(mode: str, jobs: int) -> int:
+    j = max(1, int(jobs))
+    if mode == "critical":
+        return max(1, int(ceil(0.40 * float(j))))
+    if mode == "low":
+        return max(1, int(ceil(0.70 * float(j))))
+    return j
+
+
+def _ahf_fast_can_borrow(
+    *,
+    mode: str,
+    slope_gbps: float,
+    inflight_count: int,
+    target_workers: int,
+) -> bool:
+    return (
+        str(mode) == "high"
+        and float(slope_gbps) >= 0.0
+        and int(inflight_count) < int(target_workers)
+    )
+
+
+def _ahf_fast_mode_from_memory(
+    *,
+    avail_bytes: int,
+    safety_floor_bytes: int,
+    total_bytes: int,
+) -> str:
+    if int(avail_bytes) < 0:
+        return "nominal"
+    if int(avail_bytes) <= int(max(0, int(safety_floor_bytes))):
+        return "critical"
+    capacity = max(0, int(avail_bytes) - int(safety_floor_bytes))
+    if int(total_bytes) > 0:
+        low_cap = int(max(16.0 * _GIB, float(total_bytes) * 0.02))
+        high_cap = int(max(96.0 * _GIB, float(total_bytes) * 0.22))
+    else:
+        low_cap = int(16.0 * _GIB)
+        high_cap = int(96.0 * _GIB)
+    if capacity <= low_cap:
+        return "low"
+    if capacity >= high_cap:
+        return "high"
+    return "nominal"
+
+
+def _ahf_fast_select_best_fit_index(
+    pending_hosts: Sequence[HostSchedState],
+    scan_window: int,
+    remaining_bytes: int,
+) -> int:
+    if not pending_hosts:
+        return -1
+    limit = max(1, min(int(scan_window), len(pending_hosts)))
+    remaining = int(remaining_bytes)
+    best_idx = -1
+    best_pred = -1
+    for idx in range(limit):
+        predicted = int(max(0, int(pending_hosts[idx].predicted_bytes)))
+        if predicted <= remaining and predicted > best_pred:
+            best_idx = idx
+            best_pred = predicted
+    return int(best_idx)
+
+
+def _ahf_fast_select_smallest_borrow_index(
+    pending_hosts: Sequence[HostSchedState],
+    scan_window: int,
+    remaining_bytes: int,
+    borrow_cap_bytes: int,
+) -> int:
+    if not pending_hosts or int(borrow_cap_bytes) <= 0:
+        return -1
+    limit = max(1, min(int(scan_window), len(pending_hosts)))
+    upper = int(remaining_bytes) + int(max(0, int(borrow_cap_bytes)))
+    best_idx = -1
+    best_pred = None
+    for idx in range(limit):
+        predicted = int(max(0, int(pending_hosts[idx].predicted_bytes)))
+        if predicted > upper:
+            continue
+        if best_pred is None or predicted < best_pred:
+            best_idx = idx
+            best_pred = predicted
+    return int(best_idx)
+
+
+def _ahf_fast_select_smallest_index(
+    pending_hosts: Sequence[HostSchedState],
+    scan_window: int,
+) -> int:
+    if not pending_hosts:
+        return -1
+    limit = max(1, min(int(scan_window), len(pending_hosts)))
+    return int(
+        min(
+            range(limit),
+            key=lambda i: int(max(0, int(pending_hosts[i].predicted_bytes))),
+        )
+    )
+
+
+def _ahf_fast_observed_bytes_estimate(
+    *,
+    submit_inflight: int,
+    rss_submit_bytes: int,
+    rss_done_bytes: int,
+) -> Optional[int]:
+    if int(submit_inflight) == 1:
+        return int(max(int(round(128.0 * 1024.0**2)), int(rss_done_bytes) - int(rss_submit_bytes)))
+    if int(submit_inflight) == 2:
+        return int(
+            max(
+                int(round(128.0 * 1024.0**2)),
+                int(round(0.5 * float(int(rss_done_bytes) - int(rss_submit_bytes)))),
+            )
+        )
+    return None
+
+
+def _ahf_fast_update_policy_for_sample(
+    *,
+    submit_inflight: int,
+    anchor_max_inflight: int,
+    anchor_found: bool,
+    alpha_anchor: float,
+    alpha_online: float,
+) -> Tuple[bool, bool, float]:
+    if int(submit_inflight) > int(anchor_max_inflight):
+        return False, False, float(alpha_online)
+    if not bool(anchor_found):
+        return True, True, float(alpha_anchor)
+    return True, False, float(alpha_online)
 
 
 def build_galaxies_from_ahf_fast(
@@ -250,22 +479,20 @@ def build_galaxies_from_ahf_fast(
 
         return fof_candidates, stars
 
-    host_schedule: List[Dict] = []
+    host_schedule: List[HostSchedState] = []
     host_workloads: List[int] = []
     for order_idx, (root_id, nodes_for_host) in enumerate(host_to_nodes.items()):
         fof_candidates, star_count = _estimate_host_fof_candidates(nodes_for_host)
         host_schedule.append(
-            {
-                "order_idx": order_idx,
-                "root_id": root_id,
-                "nodes": nodes_for_host,
-                "fof_candidates": fof_candidates,
-                "star_count": star_count,
-                "is_heavy": False,
-                "work_units": 1,
-            }
+            HostSchedState(
+                order_idx=int(order_idx),
+                root_id=int(root_id),
+                nodes=set(nodes_for_host),
+                fof_candidates=int(fof_candidates),
+                star_count=int(star_count),
+            )
         )
-        host_workloads.append(fof_candidates)
+        host_workloads.append(int(fof_candidates))
 
     def _env_int(name: str, default: int) -> int:
         try:
@@ -279,33 +506,54 @@ def build_galaxies_from_ahf_fast(
         except Exception:
             return float(default)
 
-    adaptive_enabled = (_os.environ.get("CAESAR_AHF_FAST_ADAPTIVE", "1") == "1")
+    def _env_optional_float(name: str) -> Optional[float]:
+        raw = _os.environ.get(name)
+        if raw is None:
+            return None
+        txt = str(raw).strip().lower()
+        if txt in ("", "auto"):
+            return None
+        try:
+            return float(txt)
+        except Exception:
+            return None
+
     scheduler_enabled = jobs > 1 and bool(host_schedule)
     heavy_threshold = 0
     heavy_count = 0
 
-    # Adaptive scheduler controls.
+    # Host-atomic hybrid scheduler controls.
     work_unit = 1
-    scan_window = max(8, _env_int("CAESAR_AHF_FAST_SCAN_WINDOW", max(32, jobs * 4)))
-    adjust_every = max(1, _env_int("CAESAR_AHF_FAST_ADJUST_EVERY", max(2, jobs // 2)))
-    adjust_interval_s = max(0.2, _env_float("CAESAR_AHF_FAST_ADJUST_INTERVAL_S", 1.0))
-    runtime_ewma_alpha = min(0.95, max(0.05, _env_float("CAESAR_AHF_FAST_RUNTIME_EWMA_ALPHA", 0.25)))
-    mem_drop_warn_gbps = max(0.1, _env_float("CAESAR_AHF_FAST_MEM_DROP_WARN_GBPS", 1.0))
-    mem_drop_crit_gbps = max(mem_drop_warn_gbps, _env_float("CAESAR_AHF_FAST_MEM_DROP_CRIT_GBPS", 2.5))
-    mem_trend_window = max(3, _env_int("CAESAR_AHF_FAST_MEM_TREND_WINDOW", 8))
-
-    worker_scale = {
-        "critical": min(1.0, max(0.05, _env_float("CAESAR_AHF_FAST_WORKERS_CRIT_SCALE", 0.35))),
-        "low": min(1.0, max(0.10, _env_float("CAESAR_AHF_FAST_WORKERS_LOW_SCALE", 0.60))),
-        "nominal": min(1.0, max(0.20, _env_float("CAESAR_AHF_FAST_WORKERS_NOMINAL_SCALE", 1.0))),
-        "high": min(1.0, max(0.20, _env_float("CAESAR_AHF_FAST_WORKERS_HIGH_SCALE", 1.0))),
+    scan_window = max(8, _env_int("CAESAR_AHF_FAST_SCHED_WINDOW", 256))
+    adjust_every = max(1, _env_int("CAESAR_AHF_FAST_SCHED_ADJUST_EVERY", max(2, jobs // 2)))
+    adjust_interval_s = 0.75
+    mem_slope_warn_gbps = max(0.1, _env_float("CAESAR_AHF_FAST_MEM_SLOPE_WARN_GBPS", 1.0))
+    mem_slope_crit_gbps = max(mem_slope_warn_gbps, _env_float("CAESAR_AHF_FAST_MEM_SLOPE_CRIT_GBPS", 2.5))
+    mem_safety_frac = float(_ahf_fast_clamp(_env_float("CAESAR_AHF_FAST_MEM_SAFETY_FRAC", 0.18), 0.01, 0.90))
+    mem_safety_gb_min = max(1.0, _env_float("CAESAR_AHF_FAST_MEM_SAFETY_GB_MIN", 64.0))
+    mem_borrow_frac_high = float(
+        _ahf_fast_clamp(_env_float("CAESAR_AHF_FAST_MEM_BORROW_FRAC_HIGH", 0.08), 0.0, 0.5)
+    )
+    resv_base_unit_gb = _env_optional_float("CAESAR_AHF_FAST_RESV_BASE_UNIT_GB")
+    resv_min_bytes = max(1, int(round(max(0.01, _env_float("CAESAR_AHF_FAST_RESV_MIN_GB", 0.25)) * _GIB)))
+    resv_max_bytes = max(
+        resv_min_bytes,
+        int(round(max(_env_float("CAESAR_AHF_FAST_RESV_MIN_GB", 0.25), _env_float("CAESAR_AHF_FAST_RESV_MAX_GB", 32.0)) * _GIB)),
+    )
+    resv_bin_small_q = float(_ahf_fast_clamp(_env_float("CAESAR_AHF_FAST_RESV_BIN_SMALL_Q", 0.35), 0.0, 1.0))
+    resv_bin_large_q = float(_ahf_fast_clamp(_env_float("CAESAR_AHF_FAST_RESV_BIN_LARGE_Q", 0.80), resv_bin_small_q, 1.0))
+    bin_multiplier = {
+        "small": max(0.05, _env_float("CAESAR_AHF_FAST_RESV_BIN_MULT_SMALL", 0.80)),
+        "medium": max(0.05, _env_float("CAESAR_AHF_FAST_RESV_BIN_MULT_MED", 1.00)),
+        "large": max(0.05, _env_float("CAESAR_AHF_FAST_RESV_BIN_MULT_LARGE", 1.35)),
     }
-    budget_scale = {
-        "critical": max(1.0, _env_float("CAESAR_AHF_FAST_WORK_BUDGET_SCALE_CRIT", 1.0)),
-        "low": max(1.0, _env_float("CAESAR_AHF_FAST_WORK_BUDGET_SCALE_LOW", 1.25)),
-        "nominal": max(1.0, _env_float("CAESAR_AHF_FAST_WORK_BUDGET_SCALE_NOMINAL", 1.8)),
-        "high": max(1.0, _env_float("CAESAR_AHF_FAST_WORK_BUDGET_SCALE_HIGH", 2.3)),
-    }
+    alpha_anchor = float(
+        _ahf_fast_clamp(_env_float("CAESAR_AHF_FAST_RESV_UPDATE_ALPHA_ANCHOR", 0.35), 0.0, 1.0)
+    )
+    alpha_online = float(
+        _ahf_fast_clamp(_env_float("CAESAR_AHF_FAST_RESV_UPDATE_ALPHA_ONLINE", 0.08), 0.0, 1.0)
+    )
+    anchor_max_inflight = max(1, _env_int("CAESAR_AHF_FAST_RESV_ANCHOR_MAX_INFLIGHT", 2))
 
     # Obtain total memory once to set scale-aware defaults when thresholds are
     # not explicitly configured.
@@ -316,18 +564,9 @@ def build_galaxies_from_ahf_fast(
             _proc = _psutil.Process()
         except Exception:
             pass
-    _, _, _avail_b0, _total_b0 = _snapshot_memory()
-    total_gb = (_total_b0 / 2**30) if _total_b0 and _total_b0 > 0 else 0.0
-    crit_default = max(32.0, total_gb * 0.15) if total_gb > 0 else 120.0
-    low_default = max(64.0, total_gb * 0.25) if total_gb > 0 else 240.0
-    high_default = max(96.0, total_gb * 0.35) if total_gb > 0 else 340.0
-    mem_crit_gb = _env_float("CAESAR_AHF_FAST_MEM_HEADROOM_CRIT_GB", crit_default)
-    mem_low_gb = _env_float("CAESAR_AHF_FAST_MEM_HEADROOM_LOW_GB", low_default)
-    mem_high_gb = _env_float("CAESAR_AHF_FAST_MEM_HEADROOM_HIGH_GB", high_default)
-    if mem_low_gb < mem_crit_gb:
-        mem_low_gb = mem_crit_gb
-    if mem_high_gb < mem_low_gb:
-        mem_high_gb = mem_low_gb
+    _, _, _, _total_b0 = _snapshot_memory()
+    total_bytes = int(_total_b0) if _total_b0 and _total_b0 > 0 else 0
+    safety_floor_base_bytes = int(max(float(total_bytes) * float(mem_safety_frac), float(mem_safety_gb_min) * _GIB))
 
     positive_workloads = [int(w) for w in host_workloads if int(w) > 0]
     if positive_workloads:
@@ -343,37 +582,60 @@ def build_galaxies_from_ahf_fast(
     else:
         heavy_threshold = trace_heavy_min
 
+    units_for_auto = []
+    small_cut, large_cut = _ahf_fast_quantile_cutoffs(host_workloads, resv_bin_small_q, resv_bin_large_q)
     for item in host_schedule:
-        w = int(item["fof_candidates"])
-        item["is_heavy"] = bool(w >= heavy_threshold)
+        w = int(item.fof_candidates)
+        item.is_heavy = bool(w >= heavy_threshold)
         # Sub-linear work units preserve scale differences without making
         # high-work hosts effectively single-threaded.
         scaled = float(max(1, w)) / float(max(1, work_unit))
-        item["work_units"] = int(min(max(1, np.ceil(np.sqrt(max(1.0, scaled)))), max(2, jobs * 2)))
+        item.work_units = int(min(max(1, np.ceil(np.sqrt(max(1.0, scaled)))), max(2, jobs * 2)))
+        item.size_bin = _ahf_fast_assign_size_bin(w, small_cut, large_cut)
+        units_for_auto.append(max(1, int(item.work_units)))
 
-    heavy_count = int(sum(1 for item in host_schedule if item["is_heavy"]))
+    median_units = float(np.percentile(np.asarray(units_for_auto, dtype=np.float64), 50.0)) if units_for_auto else 1.0
+    if resv_base_unit_gb is not None:
+        base_unit_bytes = int(max(1, round(float(resv_base_unit_gb) * _GIB)))
+    else:
+        auto_total = float(total_bytes) if total_bytes > 0 else float(max(1, jobs) * 4.0 * _GIB)
+        auto_bytes = (0.62 * auto_total) / max(1.0, float(jobs) * max(1.0, median_units))
+        base_unit_bytes = int(round(auto_bytes))
+    base_unit_bytes = int(_ahf_fast_clamp(base_unit_bytes, resv_min_bytes, resv_max_bytes))
+
+    for item in host_schedule:
+        item.predicted_bytes = _ahf_fast_predict_reservation_bytes(
+            work_units=int(item.work_units),
+            base_unit_bytes=int(base_unit_bytes),
+            size_bin=str(item.size_bin),
+            bin_multiplier=bin_multiplier,
+            pred_min_bytes=int(resv_min_bytes),
+            pred_max_bytes=int(resv_max_bytes),
+        )
+
+    heavy_count = int(sum(1 for item in host_schedule if item.is_heavy))
     heavy_examples = sorted(
         (
             (
-                int(item["fof_candidates"]),
-                int(item["work_units"]),
-                int(item["star_count"]),
-                int(item["root_id"]),
+                int(item.fof_candidates),
+                int(item.work_units),
+                int(item.star_count),
+                int(item.root_id),
             )
             for item in host_schedule
-            if item["is_heavy"]
+            if item.is_heavy
         ),
         reverse=True,
     )[:5]
 
     if scheduler_enabled:
         mylog.info(
-            "AHF-FAST: adaptive scheduler enabled: hosts=%d workers=%d work_unit=%d scan_window=%d adaptive=%d",
+            "AHF-FAST: hybrid scheduler enabled: hosts=%d workers=%d work_unit=%d scan_window=%d adjust_every=%d",
             len(host_schedule),
             jobs,
             work_unit,
             scan_window,
-            int(adaptive_enabled),
+            adjust_every,
         )
         mylog.info(
             "AHF-FAST: tracing threshold fof_candidates >= %d (count=%d)",
@@ -384,29 +646,28 @@ def build_galaxies_from_ahf_fast(
             "AHF-FAST: largest host examples (fof_candidates, work_units, stars, host_id): %s",
             heavy_examples,
         )
-        if adaptive_enabled:
-            mylog.info(
-                "AHF-FAST: controller adjust_every=%d adjust_interval_s=%.2f ewma_alpha=%.2f "
-                "headroom_gb=(crit=%.1f,low=%.1f,high=%.1f) mem_drop_gbps=(warn=%.2f,crit=%.2f) "
-                "worker_scale=(crit=%.2f,low=%.2f,nominal=%.2f,high=%.2f) "
-                "work_budget_scale=(crit=%.2f,low=%.2f,nominal=%.2f,high=%.2f)",
-                adjust_every,
-                adjust_interval_s,
-                runtime_ewma_alpha,
-                mem_crit_gb,
-                mem_low_gb,
-                mem_high_gb,
-                mem_drop_warn_gbps,
-                mem_drop_crit_gbps,
-                worker_scale["critical"],
-                worker_scale["low"],
-                worker_scale["nominal"],
-                worker_scale["high"],
-                budget_scale["critical"],
-                budget_scale["low"],
-                budget_scale["nominal"],
-                budget_scale["high"],
-            )
+        mylog.info(
+            "AHF-FAST: reservation model safety=(frac=%.2f,min=%.1fGB,base=%.1fGB) "
+            "slope_gbps=(warn=%.2f,crit=%.2f) borrow_frac=%.2f base_unit=%.2fGB "
+            "clamp=(min=%.2fGB,max=%.2fGB) bins=(small<=q%.2f,large>q%.2f cuts=(%d,%d)) "
+            "mult=(small=%.3f,medium=%.3f,large=%.3f)",
+            mem_safety_frac,
+            mem_safety_gb_min,
+            float(safety_floor_base_bytes) / _GIB,
+            mem_slope_warn_gbps,
+            mem_slope_crit_gbps,
+            mem_borrow_frac_high,
+            float(base_unit_bytes) / _GIB,
+            float(resv_min_bytes) / _GIB,
+            float(resv_max_bytes) / _GIB,
+            resv_bin_small_q,
+            resv_bin_large_q,
+            int(small_cut),
+            int(large_cut),
+            float(bin_multiplier["small"]),
+            float(bin_multiplier["medium"]),
+            float(bin_multiplier["large"]),
+        )
     else:
         mylog.info(
             "AHF-FAST: serial scheduler (workers=%d, hosts=%d)",
@@ -425,12 +686,12 @@ def build_galaxies_from_ahf_fast(
         "host_prepare",
         hosts_total=len(host_schedule),
         jobs=jobs,
-        scheduler_mode="adaptive_global" if scheduler_enabled else "serial",
+        scheduler_mode="hybrid_host_atomic" if scheduler_enabled else "serial",
         scan_window=int(scan_window),
         work_unit=int(work_unit),
         heavy_hosts=heavy_count,
         heavy_threshold=heavy_threshold,
-        adaptive=int(adaptive_enabled),
+        reserve_base_gb=round(float(base_unit_bytes) / _GIB, 4),
     )
 
     def map_sel(pidset: Set[int], key: str) -> np.ndarray:
@@ -820,11 +1081,10 @@ def build_galaxies_from_ahf_fast(
         return order_idx, host_galaxies, local_skipped, host_stats
 
     pending_results: Dict[int, List] = {}
-    host_meta = {int(item["order_idx"]): item for item in host_schedule}
+    host_meta = {int(item.order_idx): item for item in host_schedule}
     next_to_emit = 0
     inflight_count = 0
-    inflight_work = 0
-    runtime_stats = {"done": 0, "ewma_s": 0.0, "last_s": 0.0}
+    reserved_bytes_total = 0
     fof_totals = {
         "payloads": 0,
         "tiny": 0,
@@ -878,123 +1138,58 @@ def build_galaxies_from_ahf_fast(
             bucket[int(node_id)] = pm
         return bucket
 
-    def flush_completed(futures, block: bool = False):
-        nonlocal next_to_emit, skipped_empty_payloads, inflight_count, inflight_work, fof_totals
-        if not futures:
-            return 0
-        timeout = None if block else 0
-        done, _ = wait(list(futures.keys()), timeout=timeout, return_when=FIRST_COMPLETED)
-        if not done:
-            return 0
-        for fut in done:
-            fut_meta = futures.pop(fut, None)
-            started_at = None
-            submitted_units = 0
-            if isinstance(fut_meta, dict):
-                started_at = fut_meta.get("started_at")
-                try:
-                    submitted_units = int(fut_meta.get("work_units", 0))
-                except Exception:
-                    submitted_units = 0
-            inflight_count = max(0, int(inflight_count) - 1)
-            if submitted_units > 0:
-                inflight_work = max(0, int(inflight_work) - submitted_units)
-            if started_at is not None:
-                try:
-                    elapsed_s = max(0.0, _time.time() - float(started_at))
-                    prev = float(runtime_stats.get("ewma_s", 0.0))
-                    if prev <= 0.0:
-                        runtime_stats["ewma_s"] = elapsed_s
-                    else:
-                        runtime_stats["ewma_s"] = (
-                            float(runtime_ewma_alpha) * elapsed_s
-                            + (1.0 - float(runtime_ewma_alpha)) * prev
-                        )
-                    runtime_stats["last_s"] = elapsed_s
-                    runtime_stats["done"] = int(runtime_stats.get("done", 0)) + 1
-                except Exception:
-                    pass
-            order_idx, host_gals, local_skipped, host_stats = fut.result()
-            skipped_empty_payloads += int(local_skipped)
-            if isinstance(host_stats, dict):
-                for key in fof_totals.keys():
-                    if key in host_stats:
-                        fof_totals[key] += int(host_stats[key])
-            pending_results[order_idx] = host_gals
-        while next_to_emit in pending_results:
-            host_gals = pending_results.pop(next_to_emit)
-            meta = host_meta.get(next_to_emit, {})
-            host_id = int(meta.get("root_id", -1))
-            is_heavy = bool(meta.get("is_heavy", False))
-            if host_gals:
-                for node_id, grp in host_gals:
-                    galaxies.append(grp)
-                    galaxy_node_ids.append(int(node_id))
-            if _trace_host(next_to_emit, is_heavy):
-                _phase_memlog(
-                    "materialize",
-                    order_idx=next_to_emit,
-                    host_id=host_id,
-                    heavy=int(is_heavy),
-                    galaxies=int(len(host_gals)),
-                    inflight=int(inflight_count),
-                    inflight_work=int(inflight_work),
-                    hosts_done=int(next_to_emit + 1),
-                    hosts_total=int(total_hosts),
-                    pending=int(len(pending_results)),
-                )
-            if host_progress is not None:
-                host_progress.update(1)
-            next_to_emit += 1
-        return len(done)
-
     with ThreadPoolExecutor(max_workers=jobs) as executor:
         pending_futures: Dict = {}
-
         pending_hosts = _deque(host_schedule)
-        pending_work = int(sum(int(item.get("work_units", 1)) for item in pending_hosts))
+        for idx, item in enumerate(pending_hosts):
+            item.queue_index = int(idx)
+
+        # Scheduler telemetry/state.
+        mem_samples = _deque(maxlen=max(6, int(adjust_every * 2)))
+        reserved_samples: List[int] = []
+        scheduler_mode = "nominal"
+        scheduler_slope_gbps = 0.0
+        target_workers = max(1, min(jobs, jobs if scheduler_enabled else 1))
+        safety_floor_bytes = int(safety_floor_base_bytes)
+        capacity_bytes = 0
+        borrow_cap_bytes = (
+            int(round(float(total_bytes) * float(mem_borrow_frac_high)))
+            if total_bytes > 0
+            else int(round(8.0 * _GIB))
+        )
         completed_since_adjust = 0
         last_adjust_ts = 0.0
-        target_workers = max(1, min(jobs, jobs if scheduler_enabled else 1))
-        work_budget = max(target_workers, int(round(target_workers * float(budget_scale.get("nominal", 1.8)))))
-        mem_samples = _deque(maxlen=max(3, int(mem_trend_window)))
+        scheduler_counts = {
+            "borrow_count": 0,
+            "fit_fail_count": 0,
+            "model_updates": 0,
+            "anchors_found": {"small": 0, "medium": 0, "large": 0},
+        }
 
-        def _mem_mode_from_state(avail_gb: float, slope_gbps: float) -> str:
-            mode = "nominal"
-            if avail_gb >= 0:
-                if avail_gb <= mem_crit_gb:
-                    mode = "critical"
-                elif avail_gb < mem_low_gb:
-                    mode = "low"
-                elif avail_gb >= mem_high_gb:
-                    mode = "high"
-            if slope_gbps <= -float(mem_drop_warn_gbps):
-                mode = {
-                    "high": "nominal",
-                    "nominal": "low",
-                    "low": "critical",
-                    "critical": "critical",
-                }[mode]
-            if slope_gbps <= -float(mem_drop_crit_gbps):
-                mode = {
-                    "high": "low",
-                    "nominal": "critical",
-                    "low": "critical",
-                    "critical": "critical",
-                }[mode]
-            return mode
+        def _refresh_pending_predictions(bin_name: Optional[str] = None) -> None:
+            for idx, host_state in enumerate(pending_hosts):
+                host_state.queue_index = int(idx)
+                if bin_name is not None and str(host_state.size_bin) != str(bin_name):
+                    continue
+                host_state.predicted_bytes = _ahf_fast_predict_reservation_bytes(
+                    work_units=int(host_state.work_units),
+                    base_unit_bytes=int(base_unit_bytes),
+                    size_bin=str(host_state.size_bin),
+                    bin_multiplier=bin_multiplier,
+                    pred_min_bytes=int(resv_min_bytes),
+                    pred_max_bytes=int(resv_max_bytes),
+                )
+
+        def _pop_pending_at(idx: int) -> HostSchedState:
+            pending_hosts.rotate(-int(idx))
+            item = pending_hosts.popleft()
+            pending_hosts.rotate(int(idx))
+            _refresh_pending_predictions(bin_name=None)
+            return item
 
         def _adjust_scheduler(done_count: int = 0, force: bool = False) -> None:
-            nonlocal completed_since_adjust, last_adjust_ts, target_workers, work_budget
-            if not scheduler_enabled:
-                target_workers = 1
-                work_budget = max(1, int(inflight_work))
-                return
-            if not adaptive_enabled:
-                target_workers = jobs
-                work_budget = max(target_workers, int(round(target_workers * float(budget_scale.get("nominal", 1.8)))))
-                return
-
+            nonlocal completed_since_adjust, last_adjust_ts, target_workers
+            nonlocal scheduler_mode, scheduler_slope_gbps, safety_floor_bytes, capacity_bytes
             completed_since_adjust += int(done_count)
             now = _time.time()
             if (not force) and completed_since_adjust < adjust_every and (now - last_adjust_ts) < adjust_interval_s:
@@ -1002,103 +1197,233 @@ def build_galaxies_from_ahf_fast(
             completed_since_adjust = 0
             last_adjust_ts = now
 
-            old_workers = int(target_workers)
-            old_budget = int(work_budget)
-
             _, _, avail_bytes, _ = _snapshot_memory()
-            avail_gb = (avail_bytes / 2**30) if avail_bytes is not None and avail_bytes >= 0 else -1.0
-            slope_gbps = 0.0
-            if avail_gb >= 0:
-                mem_samples.append((now, float(avail_gb)))
-                if len(mem_samples) >= 2:
-                    t0, a0 = mem_samples[0]
-                    t1, a1 = mem_samples[-1]
-                    dt = max(1.0e-6, float(t1) - float(t0))
-                    slope_gbps = float(a1 - a0) / dt
+            avail = int(avail_bytes) if avail_bytes is not None else -1
+            if avail >= 0:
+                mem_samples.append((now, avail))
+            if len(mem_samples) >= 2:
+                t0, a0 = mem_samples[0]
+                t1, a1 = mem_samples[-1]
+                dt = max(1.0e-6, float(t1) - float(t0))
+                scheduler_slope_gbps = float((float(a1) - float(a0)) / dt / _GIB)
+            else:
+                scheduler_slope_gbps = 0.0
 
-            mode = _mem_mode_from_state(float(avail_gb), float(slope_gbps))
-            worker_frac = float(worker_scale.get(mode, 1.0))
-            target_workers = max(1, min(jobs, int(round(float(jobs) * worker_frac))))
+            safety_floor_bytes = int(safety_floor_base_bytes)
+            if scheduler_slope_gbps <= -float(mem_slope_crit_gbps):
+                safety_floor_bytes += int(round(32.0 * _GIB))
+            elif scheduler_slope_gbps <= -float(mem_slope_warn_gbps):
+                safety_floor_bytes += int(round(16.0 * _GIB))
 
-            avg_pending_units = (float(pending_work) / float(len(pending_hosts))) if pending_hosts else 1.0
-            mix_boost = 1.0 + min(0.60, max(0.0, (avg_pending_units - 1.0) / 10.0))
-            budget_per_worker = float(budget_scale.get(mode, budget_scale.get("nominal", 1.8)))
-            work_budget = int(max(target_workers, round(float(target_workers) * budget_per_worker * mix_boost)))
-            if work_budget < int(inflight_work):
-                work_budget = int(inflight_work)
+            scheduler_mode = _ahf_fast_mode_from_memory(
+                avail_bytes=int(avail),
+                safety_floor_bytes=int(safety_floor_bytes),
+                total_bytes=int(total_bytes),
+            )
+            target_workers = _ahf_fast_worker_target(str(scheduler_mode), int(jobs)) if scheduler_enabled else 1
 
-            if target_workers != old_workers or work_budget != old_budget:
-                mylog.info(
-                    "AHF-FAST: scheduler update mode=%s avail=%.1fGB slope=%.3fGB/s "
-                    "pending=%d inflight=%d target_workers=%d work_budget=%d inflight_work=%d runtime_ewma_s=%.3f",
-                    mode,
-                    avail_gb,
-                    slope_gbps,
-                    int(len(pending_hosts)),
-                    int(inflight_count),
-                    int(target_workers),
-                    int(work_budget),
-                    int(inflight_work),
-                    float(runtime_stats.get("ewma_s", 0.0)),
-                )
+            if avail >= 0:
+                capacity_bytes = max(0, int(avail) - int(safety_floor_bytes))
+                avail_gb = float(avail) / _GIB
+            else:
+                fallback_total = int(total_bytes) if total_bytes > 0 else int(max(1, jobs) * max(1, resv_max_bytes))
+                capacity_bytes = max(0, fallback_total - int(safety_floor_bytes))
+                avail_gb = -1.0
 
-        def _pop_best_host(max_units: int, allow_oversize: bool = False):
-            if not pending_hosts:
-                return None
-            window = min(int(len(pending_hosts)), int(scan_window))
-            best_idx = -1
-            best_units = -1
-            for idx in range(window):
-                item = pending_hosts[idx]
-                units = int(item.get("work_units", 1))
-                if units <= int(max_units) and units > best_units:
-                    best_idx = idx
-                    best_units = units
-            if best_idx < 0:
-                if not allow_oversize:
-                    return None
-                best_idx = 0
-            pending_hosts.rotate(-best_idx)
-            item = pending_hosts.popleft()
-            pending_hosts.rotate(best_idx)
-            return item
+            reserved_samples.append(int(reserved_bytes_total))
+            mylog.info(
+                "AHF-FAST: scheduler update mode=%s avail_gb=%.1f safety_gb=%.1f "
+                "reserved_gb=%.1f capacity_gb=%.1f pending=%d inflight=%d target_workers=%d",
+                str(scheduler_mode),
+                float(avail_gb),
+                float(safety_floor_bytes) / _GIB,
+                float(reserved_bytes_total) / _GIB,
+                float(capacity_bytes) / _GIB,
+                int(len(pending_hosts)),
+                int(inflight_count),
+                int(target_workers),
+            )
 
+        def _flush_completed(futures, block: bool = False):
+            nonlocal next_to_emit, skipped_empty_payloads, inflight_count, reserved_bytes_total
+            if not futures:
+                return 0
+            timeout = None if block else 0
+            done, _ = wait(list(futures.keys()), timeout=timeout, return_when=FIRST_COMPLETED)
+            if not done:
+                return 0
+            for fut in done:
+                fut_meta = futures.pop(fut, None)
+                if isinstance(fut_meta, dict):
+                    reserved = int(fut_meta.get("predicted_bytes", 0))
+                else:
+                    reserved = 0
+                inflight_count = max(0, int(inflight_count) - 1)
+                reserved_bytes_total = max(0, int(reserved_bytes_total) - max(0, int(reserved)))
+
+                if isinstance(fut_meta, dict):
+                    submit_inflight = int(fut_meta.get("submit_inflight", 0))
+                    submit_rss = int(fut_meta.get("submit_rss_bytes", -1))
+                    bin_name = str(fut_meta.get("size_bin", "medium"))
+                    predicted = int(fut_meta.get("predicted_bytes", 0))
+                    rss_done, _, _, _ = _snapshot_memory()
+                    rss_done = int(rss_done)
+                    if submit_rss >= 0 and rss_done >= 0:
+                        should_update, is_anchor, alpha = _ahf_fast_update_policy_for_sample(
+                            submit_inflight=int(submit_inflight),
+                            anchor_max_inflight=int(anchor_max_inflight),
+                            anchor_found=bool(int(scheduler_counts["anchors_found"].get(bin_name, 0)) > 0),
+                            alpha_anchor=float(alpha_anchor),
+                            alpha_online=float(alpha_online),
+                        )
+                        observed = _ahf_fast_observed_bytes_estimate(
+                            submit_inflight=int(submit_inflight),
+                            rss_submit_bytes=int(submit_rss),
+                            rss_done_bytes=int(rss_done),
+                        )
+                        if should_update and observed is not None:
+                            if is_anchor:
+                                scheduler_counts["anchors_found"][bin_name] = 1
+                            updated, _ = _ahf_fast_update_bin_multiplier(
+                                current=float(bin_multiplier.get(bin_name, 1.0)),
+                                observed_bytes=int(observed),
+                                predicted_bytes=int(predicted),
+                                alpha=float(alpha),
+                            )
+                            bin_multiplier[bin_name] = float(updated)
+                            scheduler_counts["model_updates"] += 1
+                            _refresh_pending_predictions(bin_name=bin_name)
+
+                order_idx, host_gals, local_skipped, host_stats = fut.result()
+                skipped_empty_payloads += int(local_skipped)
+                if isinstance(host_stats, dict):
+                    for key in fof_totals.keys():
+                        if key in host_stats:
+                            fof_totals[key] += int(host_stats[key])
+                pending_results[order_idx] = host_gals
+
+            while next_to_emit in pending_results:
+                host_gals = pending_results.pop(next_to_emit)
+                meta = host_meta.get(next_to_emit)
+                host_id = int(meta.root_id) if meta is not None else -1
+                is_heavy = bool(meta.is_heavy) if meta is not None else False
+                if host_gals:
+                    for node_id, grp in host_gals:
+                        galaxies.append(grp)
+                        galaxy_node_ids.append(int(node_id))
+                if _trace_host(next_to_emit, is_heavy):
+                    _phase_memlog(
+                        "materialize",
+                        order_idx=next_to_emit,
+                        host_id=host_id,
+                        heavy=int(is_heavy),
+                        galaxies=int(len(host_gals)),
+                        inflight=int(inflight_count),
+                        reserved_gb=round(float(reserved_bytes_total) / _GIB, 4),
+                        hosts_done=int(next_to_emit + 1),
+                        hosts_total=int(total_hosts),
+                        pending=int(len(pending_results)),
+                    )
+                if host_progress is not None:
+                    host_progress.update(1)
+                next_to_emit += 1
+            return len(done)
+
+        _refresh_pending_predictions(bin_name=None)
         _adjust_scheduler(done_count=adjust_every, force=True)
 
+        completed_since_adjust = 0
         while pending_hosts or pending_futures:
             _adjust_scheduler(done_count=0, force=False)
             submitted = False
 
             while pending_hosts and inflight_count < int(target_workers):
-                remaining_budget = int(work_budget) - int(inflight_work)
-                allow_oversize = inflight_count == 0
-                item = _pop_best_host(max_units=max(0, remaining_budget), allow_oversize=allow_oversize)
-                if item is None:
+                remaining_capacity = int(capacity_bytes) - int(reserved_bytes_total)
+                best_idx = _ahf_fast_select_best_fit_index(
+                    pending_hosts=list(pending_hosts),
+                    scan_window=int(scan_window),
+                    remaining_bytes=int(max(0, remaining_capacity)),
+                )
+                used_borrow = False
+                if best_idx < 0:
+                    scheduler_counts["fit_fail_count"] += 1
+                    allow_borrow = scheduler_enabled and _ahf_fast_can_borrow(
+                        mode=str(scheduler_mode),
+                        slope_gbps=float(scheduler_slope_gbps),
+                        inflight_count=int(inflight_count),
+                        target_workers=int(target_workers),
+                    )
+                    if allow_borrow:
+                        best_idx = _ahf_fast_select_smallest_borrow_index(
+                            pending_hosts=list(pending_hosts),
+                            scan_window=int(scan_window),
+                            remaining_bytes=int(max(0, remaining_capacity)),
+                            borrow_cap_bytes=int(max(0, borrow_cap_bytes)),
+                        )
+                        if best_idx >= 0:
+                            used_borrow = True
+                if best_idx < 0 and int(inflight_count) == 0 and (not pending_futures):
+                    # Deadlock guard: keep one host moving even if the
+                    # instantaneous capacity estimate is overly conservative.
+                    best_idx = _ahf_fast_select_smallest_index(
+                        pending_hosts=list(pending_hosts),
+                        scan_window=int(scan_window),
+                    )
+                if best_idx < 0:
                     break
 
-                units_needed = int(item.get("work_units", 1))
-                pending_work = max(0, int(pending_work) - units_needed)
-                bucket = build_bucket(item["nodes"])
+                item = _pop_pending_at(int(best_idx))
+                if used_borrow:
+                    scheduler_counts["borrow_count"] += 1
+                bucket = build_bucket(item.nodes)
+                started_at = _time.time()
+                submit_inflight = int(inflight_count) + 1
+                rss_submit, _, _, _ = _snapshot_memory()
+                item.submit_ts = float(started_at)
+                item.submit_inflight = int(submit_inflight)
+                item.submit_rss_bytes = int(rss_submit) if rss_submit is not None else -1
                 future = executor.submit(
                     process_host,
-                    int(item["order_idx"]),
-                    int(item["root_id"]),
+                    int(item.order_idx),
+                    int(item.root_id),
                     bucket,
-                    int(item["fof_candidates"]),
-                    bool(item.get("is_heavy", False)),
+                    int(item.fof_candidates),
+                    bool(item.is_heavy),
                 )
                 pending_futures[future] = {
-                    "order_idx": int(item["order_idx"]),
-                    "started_at": _time.time(),
-                    "work_units": int(units_needed),
+                    "order_idx": int(item.order_idx),
+                    "started_at": float(started_at),
+                    "predicted_bytes": int(item.predicted_bytes),
+                    "size_bin": str(item.size_bin),
+                    "submit_inflight": int(submit_inflight),
+                    "submit_rss_bytes": int(item.submit_rss_bytes),
                 }
                 inflight_count += 1
-                inflight_work += int(units_needed)
+                reserved_bytes_total += int(item.predicted_bytes)
                 submitted = True
 
             if pending_futures:
-                done_now = flush_completed(pending_futures, block=(not submitted))
+                done_now = _flush_completed(pending_futures, block=(not submitted))
                 _adjust_scheduler(done_count=done_now, force=False)
+
+    avg_reserved_gb = (
+        float(sum(reserved_samples)) / float(max(1, len(reserved_samples))) / _GIB
+        if reserved_samples
+        else 0.0
+    )
+    mylog.info(
+        "AHF-FAST: scheduler summary anchors_found_per_bin=%s multipliers_final=%s "
+        "borrow_count=%d fit_fail_count=%d avg_reserved_gb=%.2f",
+        scheduler_counts["anchors_found"],
+        {
+            "small": round(float(bin_multiplier["small"]), 5),
+            "medium": round(float(bin_multiplier["medium"]), 5),
+            "large": round(float(bin_multiplier["large"]), 5),
+        },
+        int(scheduler_counts["borrow_count"]),
+        int(scheduler_counts["fit_fail_count"]),
+        float(avg_reserved_gb),
+    )
 
     if host_progress is not None:
         host_progress.close()
