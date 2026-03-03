@@ -45,7 +45,7 @@ def load_ahf_halos_dataframe(ahf_particles_file: str):
 
     The halos catalog is inferred from ``ahf_particles_file`` by replacing the
     basename token ``particles`` -> ``halos`` in the same directory.
-    Returns columns: ``hid``, ``host_hid``, ``npart``.
+    Returns columns: ``hid``, ``host_hid``, ``npart``, ``n_star``.
     """
 
     try:
@@ -73,8 +73,8 @@ def load_ahf_halos_dataframe(ahf_particles_file: str):
         sep=r"\s+",
         comment="#",
         header=None,
-        usecols=[0, 1, 4],
-        names=["hid", "host_hid", "npart"],
+        usecols=[0, 1, 4, 63],
+        names=["hid", "host_hid", "npart", "n_star"],
         dtype=np.int64,
     )
     return df

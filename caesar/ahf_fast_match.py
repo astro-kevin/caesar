@@ -577,16 +577,28 @@ def build_galaxies_from_ahf_fast(
         sim._ahf_fast_halos_df = halos_df
     if len(halos_df) == 0:
         raise AssertionError("AHF-FAST invariant violated: AHF_halos dataframe is empty")
+    if "n_star" not in halos_df.columns:
+        raise AssertionError("AHF-FAST invariant violated: AHF_halos dataframe is missing n_star")
 
     node_npart = {
         int(hid): int(npart)
         for hid, npart in zip(halos_df["hid"].to_numpy(), halos_df["npart"].to_numpy())
+    }
+    node_nstar = {
+        int(hid): max(0, int(nstar))
+        for hid, nstar in zip(halos_df["hid"].to_numpy(), halos_df["n_star"].to_numpy())
     }
 
     host_schedule: List[HostSchedState] = []
     host_workloads: List[int] = []
     host_items = sorted(host_to_nodes.items(), key=lambda kv: int(kv[0]))
     for order_idx, (root_id, nodes_for_host) in enumerate(host_items):
+        host_star_count = int(node_nstar.get(int(root_id), -1))
+        if host_star_count < 0:
+            host_star_count = int(
+                max((int(node_nstar.get(int(node_id), 0)) for node_id in nodes_for_host), default=0)
+            )
+        host_star_count = max(0, int(host_star_count))
         fof_candidates = int(
             sum(int(node_npart.get(int(node_id), 0)) for node_id in nodes_for_host)
         )
@@ -597,7 +609,7 @@ def build_galaxies_from_ahf_fast(
                 root_id=int(root_id),
                 nodes=set(nodes_for_host),
                 fof_candidates=int(fof_candidates),
-                star_count=0,
+                star_count=int(host_star_count),
             )
         )
         host_workloads.append(int(fof_candidates))
@@ -702,7 +714,7 @@ def build_galaxies_from_ahf_fast(
     for item in host_schedule:
         w = int(item.fof_candidates)
         item.is_heavy = bool(w >= heavy_threshold)
-        item.is_tiny_proxy = bool(w <= int(tiny_proxy_star_threshold))
+        item.is_tiny_proxy = bool(int(item.star_count) <= int(tiny_proxy_star_threshold))
         # Sub-linear work units preserve scale differences without making
         # high-work hosts effectively single-threaded.
         scaled = float(max(1, w)) / float(max(1, work_unit))
@@ -796,7 +808,7 @@ def build_galaxies_from_ahf_fast(
             model_drift_cooldown_s,
         )
         mylog.info(
-            "AHF-FAST: phaseA config candidate_pool=%d pair_pool=%d pair_gain=%.3f tiny_proxy_fof<=%d",
+            "AHF-FAST: phaseA config candidate_pool=%d pair_pool=%d pair_gain=%.3f tiny_proxy_stars<=%d",
             int(phasea_candidate_pool),
             int(phasea_pair_pool),
             phasea_pair_gain,
