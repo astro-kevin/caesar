@@ -9,6 +9,7 @@ source of truth lives here.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -249,49 +250,6 @@ def _ahf_fast_select_best_fit_index(
         if predicted <= remaining and predicted > best_pred:
             best_idx = idx
             best_pred = predicted
-    return int(best_idx)
-
-
-def _ahf_fast_select_pair_candidate_index(
-    pending_hosts: Sequence[HostSchedState],
-    candidate_pool: int,
-    pair_pool: int,
-    remaining_bytes: int,
-    pair_gain: float,
-) -> int:
-    if not pending_hosts:
-        return -1
-    remaining = int(remaining_bytes)
-    if remaining <= 0:
-        return -1
-    limit = max(1, min(int(candidate_pool), len(pending_hosts)))
-    pair_limit = max(1, min(int(pair_pool), len(pending_hosts)))
-    best_idx = -1
-    best_score = -1.0
-    for idx in range(limit):
-        h = pending_hosts[idx]
-        if bool(h.is_tiny_proxy):
-            continue
-        predicted = int(max(0, int(h.predicted_bytes)))
-        if predicted > remaining:
-            continue
-
-        best_pair_fill = int(predicted)
-        for jdx in range(pair_limit):
-            if jdx == idx:
-                continue
-            hj = pending_hosts[jdx]
-            if bool(hj.is_tiny_proxy):
-                continue
-            pj = int(max(0, int(hj.predicted_bytes)))
-            pair_fill = predicted + pj
-            if pair_fill <= remaining and pair_fill > best_pair_fill:
-                best_pair_fill = int(pair_fill)
-
-        score = float(best_pair_fill) + float(pair_gain) * float(predicted)
-        if score > best_score:
-            best_score = score
-            best_idx = idx
     return int(best_idx)
 
 
@@ -645,11 +603,6 @@ def build_galaxies_from_ahf_fast(
     # Host-atomic scheduler controls.
     work_unit = 1
     tiny_proxy_star_threshold = 32
-    scan_window = max(8, _env_int("CAESAR_AHF_FAST_SCHED_WINDOW", 256))
-    scan_window_max = max(
-        int(scan_window),
-        _env_int("CAESAR_AHF_FAST_SCHED_WINDOW_MAX", max(2048, int(scan_window))),
-    )
     adjust_every = max(1, _env_int("CAESAR_AHF_FAST_SCHED_ADJUST_EVERY", max(2, jobs // 2)))
     adjust_interval_s = 0.75
     mem_slope_warn_gbps = max(0.1, _env_float("CAESAR_AHF_FAST_MEM_SLOPE_WARN_GBPS", 1.0))
@@ -678,9 +631,9 @@ def build_galaxies_from_ahf_fast(
     model_drift_lo = float(_ahf_fast_clamp(_env_float("CAESAR_AHF_FAST_MODEL_DRIFT_LO", 0.70), 0.10, 1.0))
     model_drift_hi = float(max(model_drift_lo + 1.0e-6, _env_float("CAESAR_AHF_FAST_MODEL_DRIFT_HI", 1.35)))
     model_drift_cooldown_s = max(0.0, _env_float("CAESAR_AHF_FAST_MODEL_DRIFT_COOLDOWN_S", 30.0))
-    phasea_candidate_pool = max(8, _env_int("CAESAR_AHF_FAST_PHASEA_CANDIDATE_POOL", 256))
-    phasea_pair_pool = max(4, _env_int("CAESAR_AHF_FAST_PHASEA_PAIR_POOL", 64))
-    phasea_pair_gain = max(0.0, _env_float("CAESAR_AHF_FAST_PHASEA_PAIR_GAIN", 0.03))
+    model_ratio_window = max(16, _env_int("CAESAR_AHF_FAST_MODEL_RATIO_WINDOW", 256))
+    model_ratio_q = float(_ahf_fast_clamp(_env_float("CAESAR_AHF_FAST_MODEL_RATIO_Q", 0.90), 0.50, 0.99))
+    dispatch_heartbeat_ms = max(1, _env_int("CAESAR_AHF_FAST_DISPATCH_HEARTBEAT_MS", 50))
     anchor_max_inflight = max(1, _env_int("CAESAR_AHF_FAST_RESV_ANCHOR_MAX_INFLIGHT", 2))
 
     # Obtain total memory once to set scale-aware defaults when thresholds are
@@ -763,17 +716,11 @@ def build_galaxies_from_ahf_fast(
 
     if scheduler_enabled:
         mylog.info(
-            "AHF-FAST: scheduler enabled: hosts=%d workers=%d work_unit=%d scan_window=%d adjust_every=%d",
+            "AHF-FAST: scheduler enabled: hosts=%d workers=%d work_unit=%d mode=global_phaseA+tiny_saturation adjust_every=%d",
             len(host_schedule),
             jobs,
             work_unit,
-            scan_window,
             adjust_every,
-        )
-        mylog.info(
-            "AHF-FAST: scheduler window policy base=%d max=%d",
-            int(scan_window),
-            int(scan_window_max),
         )
         mylog.info(
             "AHF-FAST: tracing threshold fof_candidates >= %d (count=%d)",
@@ -797,7 +744,7 @@ def build_galaxies_from_ahf_fast(
             float(resv_max_bytes) / _GIB,
         )
         mylog.info(
-            "AHF-FAST: model config tau=%.2f knots=%d neighbors=%d refit_exp=[%d,%d] drift=[%.3f,%.3f] cooldown=%.1fs",
+            "AHF-FAST: model config tau=%.2f knots=%d neighbors=%d refit_exp=[%d,%d] drift=[%.3f,%.3f] cooldown=%.1fs ratio=(window=%d,q=%.2f)",
             model_tau,
             int(model_knots),
             int(model_neighbors),
@@ -806,14 +753,10 @@ def build_galaxies_from_ahf_fast(
             model_drift_lo,
             model_drift_hi,
             model_drift_cooldown_s,
+            int(model_ratio_window),
+            model_ratio_q,
         )
-        mylog.info(
-            "AHF-FAST: phaseA config candidate_pool=%d pair_pool=%d pair_gain=%.3f tiny_proxy_stars<=%d",
-            int(phasea_candidate_pool),
-            int(phasea_pair_pool),
-            phasea_pair_gain,
-            int(tiny_proxy_star_threshold),
-        )
+        mylog.info("AHF-FAST: tiny saturation stars<=%d", int(tiny_proxy_star_threshold))
     else:
         mylog.info(
             "AHF-FAST: serial scheduler (workers=%d, hosts=%d)",
@@ -833,7 +776,6 @@ def build_galaxies_from_ahf_fast(
         hosts_total=len(host_schedule),
         jobs=jobs,
         scheduler_mode="hybrid_host_atomic" if scheduler_enabled else "serial",
-        scan_window=int(scan_window),
         work_unit=int(work_unit),
         heavy_hosts=heavy_count,
         heavy_threshold=heavy_threshold,
@@ -1335,13 +1277,18 @@ def build_galaxies_from_ahf_fast(
 
     with ThreadPoolExecutor(max_workers=jobs) as executor:
         pending_futures: Dict = {}
-        pending_hosts = _deque(host_schedule)
-        for idx, item in enumerate(pending_hosts):
-            item.queue_index = int(idx)
+        pending_phasea: List[HostSchedState] = [item for item in host_schedule if not bool(item.is_tiny_proxy)]
+        pending_tiny = _deque(
+            sorted(
+                (item for item in host_schedule if bool(item.is_tiny_proxy)),
+                key=lambda h: (int(h.fof_candidates), int(h.root_id)),
+            )
+        )
 
         # Scheduler telemetry/state.
         mem_samples = _deque(maxlen=max(6, int(adjust_every * 2)))
         drift_samples = _deque(maxlen=512)
+        ratio_samples = _deque(maxlen=int(model_ratio_window))
         reserved_samples: List[int] = []
         scheduler_mode = "nominal"
         scheduler_slope_gbps = 0.0
@@ -1351,9 +1298,12 @@ def build_galaxies_from_ahf_fast(
         last_adjust_ts = 0.0
         model_refits = 0
         drift_refits = 0
+        phasea_fit_success_count = 0
         phasea_fit_fail_count = 0
         phaseb_backfill_count = 0
         deadlock_guard_count = 0
+        dispatch_wakeup_count = 0
+        dispatch_submit_batches = 0
         sample_x: List[float] = []
         sample_y: List[float] = []
         sample_w: List[float] = []
@@ -1362,31 +1312,56 @@ def build_galaxies_from_ahf_fast(
         next_refit_target = int(2 ** int(model_refit_exp_start))
         last_model_refit_ts = 0.0
         last_model_refit_completed = 0
+        phasea_prediction_bias = 1.0
+        phasea_index_dirty = True
+        phasea_predicted: List[int] = []
 
-        def _refresh_window_predictions(window: int) -> None:
-            limit = max(0, min(int(window), len(pending_hosts)))
-            for idx in range(limit):
-                host_state = pending_hosts[idx]
-                seed_bytes = _ahf_fast_seed_prediction_bytes(
-                    fof_candidates=int(host_state.fof_candidates),
-                    work_unit=int(work_unit),
-                    base_unit_bytes=int(base_unit_bytes),
-                    pred_min_bytes=int(resv_min_bytes),
-                    pred_max_bytes=int(resv_max_bytes),
-                )
-                host_state.predicted_bytes = _ahf_fast_predict_reservation_bytes(
-                    fof_candidates=int(host_state.fof_candidates),
-                    model=mem_model,
-                    seed_bytes=int(seed_bytes),
-                    pred_min_bytes=int(resv_min_bytes),
-                    pred_max_bytes=int(resv_max_bytes),
-                )
-                host_state.queue_index = int(idx)
+        def _predict_host_reservation_bytes(host_state: HostSchedState) -> int:
+            seed_bytes = _ahf_fast_seed_prediction_bytes(
+                fof_candidates=int(host_state.fof_candidates),
+                work_unit=int(work_unit),
+                base_unit_bytes=int(base_unit_bytes),
+                pred_min_bytes=int(resv_min_bytes),
+                pred_max_bytes=int(resv_max_bytes),
+            )
+            predicted = _ahf_fast_predict_reservation_bytes(
+                fof_candidates=int(host_state.fof_candidates),
+                model=mem_model,
+                seed_bytes=int(seed_bytes),
+                pred_min_bytes=int(resv_min_bytes),
+                pred_max_bytes=int(resv_max_bytes),
+            )
+            predicted = int(round(float(predicted) * float(phasea_prediction_bias)))
+            return int(_ahf_fast_clamp(float(predicted), float(resv_min_bytes), float(resv_max_bytes)))
 
-        def _pop_pending_at(idx: int) -> HostSchedState:
-            pending_hosts.rotate(-int(idx))
-            item = pending_hosts.popleft()
-            pending_hosts.rotate(int(idx))
+        def _rebuild_phasea_index() -> None:
+            nonlocal phasea_index_dirty, phasea_predicted
+            if not pending_phasea:
+                phasea_predicted = []
+                phasea_index_dirty = False
+                return
+            for item in pending_phasea:
+                item.predicted_bytes = int(_predict_host_reservation_bytes(item))
+            pending_phasea.sort(
+                key=lambda h: (
+                    int(h.predicted_bytes),
+                    int(h.fof_candidates),
+                    int(h.root_id),
+                )
+            )
+            phasea_predicted = [int(item.predicted_bytes) for item in pending_phasea]
+            for idx, item in enumerate(pending_phasea):
+                item.queue_index = int(idx)
+            phasea_index_dirty = False
+
+        def _mark_phasea_index_dirty() -> None:
+            nonlocal phasea_index_dirty
+            phasea_index_dirty = True
+
+        def _pop_phasea_at(idx: int) -> HostSchedState:
+            item = pending_phasea.pop(int(idx))
+            if 0 <= int(idx) < len(phasea_predicted):
+                phasea_predicted.pop(int(idx))
             return item
 
         def _maybe_refit_model(now_ts: float, force: bool = False) -> None:
@@ -1427,6 +1402,7 @@ def build_galaxies_from_ahf_fast(
 
             mem_model = fitted
             model_refits += 1
+            _mark_phasea_index_dirty()
             last_model_refit_ts = float(now_ts)
             last_model_refit_completed = int(completed_hosts)
             while int(next_refit_target) < int(max_refit_target) and int(completed_hosts) >= int(next_refit_target):
@@ -1478,21 +1454,36 @@ def build_galaxies_from_ahf_fast(
                 avail_gb = -1.0
 
             reserved_samples.append(int(reserved_bytes_total))
+            phasea_scan_size = int(len(phasea_predicted) if not phasea_index_dirty else len(pending_phasea))
             mylog.info(
                 "AHF-FAST: scheduler update mode=%s avail_gb=%.1f safety_gb=%.1f "
-                "reserved_gb=%.1f capacity_gb=%.1f pending=%d inflight=%d "
-                "completed=%d emitted=%d emit_lag=%d",
+                "reserved_gb=%.1f capacity_gb=%.1f pending=%d phasea_pending=%d phasea_scan_size=%d inflight=%d "
+                "completed=%d emitted=%d emit_lag=%d bias=%.3f",
                 str(scheduler_mode),
                 float(avail_gb),
                 float(safety_floor_bytes) / _GIB,
                 float(reserved_bytes_total) / _GIB,
                 float(capacity_bytes) / _GIB,
-                int(len(pending_hosts)),
+                int(len(pending_phasea) + len(pending_tiny)),
+                int(len(pending_phasea)),
+                int(phasea_scan_size),
                 int(inflight_count),
                 int(completed_hosts),
                 int(emitted_hosts),
                 int(max(0, int(completed_hosts) - int(emitted_hosts))),
+                float(phasea_prediction_bias),
             )
+
+        def _update_phasea_bias_from_residuals() -> None:
+            nonlocal phasea_prediction_bias
+            if not ratio_samples:
+                return
+            ratios = np.asarray(ratio_samples, dtype=np.float64)
+            new_bias = float(np.quantile(ratios, float(model_ratio_q)))
+            new_bias = float(_ahf_fast_clamp(new_bias, 0.50, 2.00))
+            if abs(float(new_bias) - float(phasea_prediction_bias)) >= 0.03:
+                phasea_prediction_bias = float(new_bias)
+                _mark_phasea_index_dirty()
 
         def _flush_completed(futures, block: bool = False):
             nonlocal next_to_emit, skipped_empty_payloads, inflight_count, reserved_bytes_total
@@ -1544,8 +1535,11 @@ def build_galaxies_from_ahf_fast(
                                 sample_y.append(float(observed))
                                 sample_w.append(float(weight))
                             if predicted > 0:
-                                drift_samples.append(float(observed) / float(predicted))
+                                ratio = float(observed) / float(predicted)
+                                drift_samples.append(float(ratio))
+                                ratio_samples.append(float(_ahf_fast_clamp(ratio, 0.25, 4.0)))
 
+            _update_phasea_bias_from_residuals()
             _maybe_refit_model(now_ts=_time.time(), force=False)
 
             while next_to_emit in pending_results:
@@ -1578,110 +1572,108 @@ def build_galaxies_from_ahf_fast(
                 host_progress.update(int(done_count))
             return int(done_count)
 
-        _adjust_scheduler(done_count=adjust_every, force=True)
+        def _submit_host(item: HostSchedState, launch_phase: str, reserved_for_item: int) -> None:
+            nonlocal inflight_count, reserved_bytes_total
+            started_at = _time.time()
+            submit_inflight = int(inflight_count) + 1
+            rss_submit, _, _, _ = _snapshot_memory()
+            item.submit_ts = float(started_at)
+            item.submit_inflight = int(submit_inflight)
+            item.submit_rss_bytes = int(rss_submit) if rss_submit is not None else -1
+            future = executor.submit(
+                process_host_task,
+                int(item.order_idx),
+                int(item.root_id),
+                item.nodes,
+                int(item.fof_candidates),
+                bool(item.is_heavy),
+            )
+            pending_futures[future] = {
+                "order_idx": int(item.order_idx),
+                "phase": str(launch_phase),
+                "started_at": float(started_at),
+                "fof_candidates": int(item.fof_candidates),
+                "predicted_bytes": int(item.predicted_bytes),
+                "reserved_bytes": int(reserved_for_item),
+                "submit_inflight": int(submit_inflight),
+                "submit_rss_bytes": int(item.submit_rss_bytes),
+            }
+            inflight_count += 1
+            reserved_bytes_total += int(reserved_for_item)
 
-        completed_since_adjust = 0
-        while pending_hosts or pending_futures:
-            _adjust_scheduler(done_count=0, force=False)
-            submitted = False
-
-            while pending_hosts and inflight_count < int(jobs):
-                if int(capacity_bytes) <= 0 and int(inflight_count) > 0:
-                    # Emergency gate: pause new launches when memory is below safety floor.
+        def _submit_until_blocked() -> int:
+            nonlocal phasea_fit_success_count, phasea_fit_fail_count
+            nonlocal phaseb_backfill_count, deadlock_guard_count, dispatch_submit_batches
+            submissions = 0
+            while int(inflight_count) < int(jobs) and (pending_phasea or pending_tiny):
+                if int(capacity_bytes) <= 0:
+                    # Emergency gate: pause all new launches when memory is at/below safety floor.
                     break
 
-                window_used = max(1, min(int(scan_window), len(pending_hosts)))
-                best_idx = -1
-                while True:
-                    _refresh_window_predictions(window=int(window_used))
-                    remaining_capacity = int(capacity_bytes) - int(reserved_bytes_total)
-                    best_idx = _ahf_fast_select_pair_candidate_index(
-                        pending_hosts=pending_hosts,
-                        candidate_pool=min(int(phasea_candidate_pool), int(window_used)),
-                        pair_pool=min(int(phasea_pair_pool), int(window_used)),
-                        remaining_bytes=int(max(0, remaining_capacity)),
-                        pair_gain=float(phasea_pair_gain),
-                    )
-                    if best_idx >= 0:
-                        break
-                    if int(window_used) >= int(len(pending_hosts)):
-                        break
-                    if int(window_used) >= int(scan_window_max):
-                        break
-                    window_used = min(
-                        int(len(pending_hosts)),
-                        int(scan_window_max),
-                        int(max(8, int(window_used) * 2)),
-                    )
+                if phasea_index_dirty:
+                    _rebuild_phasea_index()
 
-                launch_phase = "A"
-                if best_idx < 0:
-                    phasea_fit_fail_count += 1
-                    if int(capacity_bytes) > 0:
-                        best_idx = _ahf_fast_select_tiny_backfill_index(
-                            pending_hosts=pending_hosts,
-                            scan_window=int(window_used),
-                        )
-                        if best_idx >= 0:
-                            launch_phase = "B"
-                    if (
-                        best_idx < 0
-                        and int(capacity_bytes) > 0
-                        and int(inflight_count) == 0
-                        and (not pending_futures)
-                    ):
-                        # Deadlock guard for conservative predictions.
-                        best_idx = _ahf_fast_select_smallest_index(
-                            pending_hosts=pending_hosts,
-                            scan_window=min(int(window_used), int(scan_window)),
-                        )
-                        if best_idx >= 0:
-                            deadlock_guard_count += 1
-                            launch_phase = "A"
-                if best_idx < 0:
-                    break
-
-                item = _pop_pending_at(int(best_idx))
-                if launch_phase == "B":
-                    phaseb_backfill_count += 1
-                    reserved_for_item = 0
+                remaining_capacity = int(capacity_bytes) - int(reserved_bytes_total)
+                if pending_phasea and remaining_capacity > 0 and phasea_predicted:
+                    fit_idx = int(bisect_right(phasea_predicted, int(remaining_capacity))) - 1
                 else:
-                    reserved_for_item = int(max(0, int(item.predicted_bytes)))
+                    fit_idx = -1
 
-                started_at = _time.time()
-                submit_inflight = int(inflight_count) + 1
-                rss_submit, _, _, _ = _snapshot_memory()
-                item.submit_ts = float(started_at)
-                item.submit_inflight = int(submit_inflight)
-                item.submit_rss_bytes = int(rss_submit) if rss_submit is not None else -1
-                future = executor.submit(
-                    process_host_task,
-                    int(item.order_idx),
-                    int(item.root_id),
-                    item.nodes,
-                    int(item.fof_candidates),
-                    bool(item.is_heavy),
-                )
-                pending_futures[future] = {
-                    "order_idx": int(item.order_idx),
-                    "phase": str(launch_phase),
-                    "started_at": float(started_at),
-                    "fof_candidates": int(item.fof_candidates),
-                    "predicted_bytes": int(item.predicted_bytes),
-                    "reserved_bytes": int(reserved_for_item),
-                    "submit_inflight": int(submit_inflight),
-                    "submit_rss_bytes": int(item.submit_rss_bytes),
-                }
-                inflight_count += 1
-                reserved_bytes_total += int(reserved_for_item)
-                submitted = True
+                if fit_idx >= 0:
+                    item = _pop_phasea_at(int(fit_idx))
+                    reserved_for_item = int(max(0, int(item.predicted_bytes)))
+                    _submit_host(item=item, launch_phase="A", reserved_for_item=reserved_for_item)
+                    phasea_fit_success_count += 1
+                    submissions += 1
+                    continue
+
+                if pending_phasea:
+                    phasea_fit_fail_count += 1
+
+                if pending_phasea and int(inflight_count) == 0 and (not pending_futures):
+                    if phasea_index_dirty:
+                        _rebuild_phasea_index()
+                    if pending_phasea:
+                        item = _pop_phasea_at(0)
+                        reserved_for_item = int(max(0, int(item.predicted_bytes)))
+                        _submit_host(item=item, launch_phase="A", reserved_for_item=reserved_for_item)
+                        phasea_fit_success_count += 1
+                        deadlock_guard_count += 1
+                        submissions += 1
+                        continue
+
+                free_slots = int(jobs) - int(inflight_count)
+                if free_slots > 0 and pending_tiny:
+                    launch_n = min(int(free_slots), int(len(pending_tiny)))
+                    for _ in range(int(launch_n)):
+                        tiny_item = pending_tiny.popleft()
+                        _submit_host(item=tiny_item, launch_phase="B", reserved_for_item=0)
+                        phaseb_backfill_count += 1
+                        submissions += 1
+                    continue
+
+                break
+
+            if submissions > 0:
+                dispatch_submit_batches += 1
+            return int(submissions)
+
+        _adjust_scheduler(done_count=adjust_every, force=True)
+        if scheduler_enabled and pending_phasea:
+            _rebuild_phasea_index()
+
+        while pending_phasea or pending_tiny or pending_futures:
+            submitted = _submit_until_blocked()
 
             if pending_futures:
-                done_now = _flush_completed(pending_futures, block=(not submitted))
+                if submitted <= 0:
+                    dispatch_wakeup_count += 1
+                done_now = _flush_completed(pending_futures, block=(submitted <= 0))
                 _adjust_scheduler(done_count=done_now, force=False)
-            elif pending_hosts:
-                # Waiting for memory recovery (emergency gate).
-                _time.sleep(0.05)
+                continue
+
+            if pending_phasea or pending_tiny:
+                _time.sleep(float(dispatch_heartbeat_ms) / 1000.0)
                 _adjust_scheduler(done_count=0, force=True)
 
     avg_reserved_gb = (
@@ -1691,18 +1683,24 @@ def build_galaxies_from_ahf_fast(
     )
     mylog.info(
         "AHF-FAST: scheduler summary refits=%d drift_refits=%d samples=%d "
-        "phaseA_fit_fail=%d phaseB_backfill=%d deadlock_guard=%d avg_reserved_gb=%.2f "
-        "completed_hosts=%d emitted_hosts=%d emit_lag=%d next_refit_target=%d",
+        "phaseA_fit_success=%d phaseA_fit_fail=%d phaseB_tiny_launches=%d "
+        "dispatch_wakeups=%d dispatch_submit_batches=%d deadlock_guard=%d avg_reserved_gb=%.2f "
+        "completed_hosts=%d emitted_hosts=%d emit_lag=%d phasea_pending=%d tiny_pending=%d next_refit_target=%d",
         int(model_refits),
         int(drift_refits),
         int(len(sample_x)),
+        int(phasea_fit_success_count),
         int(phasea_fit_fail_count),
         int(phaseb_backfill_count),
+        int(dispatch_wakeup_count),
+        int(dispatch_submit_batches),
         int(deadlock_guard_count),
         float(avg_reserved_gb),
         int(completed_hosts),
         int(emitted_hosts),
         int(max(0, int(completed_hosts) - int(emitted_hosts))),
+        int(len(pending_phasea)),
+        int(len(pending_tiny)),
         int(next_refit_target),
     )
 

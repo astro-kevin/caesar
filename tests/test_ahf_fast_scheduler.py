@@ -79,12 +79,10 @@ def test_phase_a_can_fill_all_worker_slots_when_capacity_permits():
     launched = 0
     reserved = 0
     while pending and launched < jobs:
-        idx = ahf_fast_match._ahf_fast_select_pair_candidate_index(
+        idx = ahf_fast_match._ahf_fast_select_best_fit_index(
             pending_hosts=pending,
-            candidate_pool=8,
-            pair_pool=8,
+            scan_window=len(pending),
             remaining_bytes=int(capacity - reserved),
-            pair_gain=0.03,
         )
         if idx < 0:
             break
@@ -94,19 +92,43 @@ def test_phase_a_can_fill_all_worker_slots_when_capacity_permits():
     assert launched == jobs
 
 
-def test_phase_a_pair_lookahead_beats_largest_first_on_fragmented_case():
-    pending = _mk_hosts([70, 45, 40, 35], tiny_idx=[])
-    remaining = 80
-    idx = ahf_fast_match._ahf_fast_select_pair_candidate_index(
+def test_phase_a_global_best_fit_not_front_window_limited():
+    pending = _mk_hosts([120, 110, 95, 30, 20], tiny_idx=[])
+    idx_front = ahf_fast_match._ahf_fast_select_best_fit_index(
         pending_hosts=pending,
-        candidate_pool=4,
-        pair_pool=4,
-        remaining_bytes=remaining,
-        pair_gain=0.03,
+        scan_window=3,
+        remaining_bytes=35,
     )
-    assert idx in (1, 3)
-    chosen = int(pending[idx].predicted_bytes)
-    assert chosen != 70
+    idx_full = ahf_fast_match._ahf_fast_select_best_fit_index(
+        pending_hosts=pending,
+        scan_window=len(pending),
+        remaining_bytes=35,
+    )
+    assert idx_front == -1
+    assert idx_full >= 0
+    assert int(pending[idx_full].predicted_bytes) == 30
+
+
+def test_phase_a_choice_is_invariant_to_host_order_under_global_scan():
+    predicted = [70, 55, 42, 35, 28]
+    remaining = 50
+    base = _mk_hosts(predicted, tiny_idx=[])
+    idx = ahf_fast_match._ahf_fast_select_best_fit_index(
+        pending_hosts=base,
+        scan_window=len(base),
+        remaining_bytes=remaining,
+    )
+    assert idx >= 0
+    expected = int(base[idx].predicted_bytes)
+
+    perm = _mk_hosts([35, 70, 28, 42, 55], tiny_idx=[])
+    idx_perm = ahf_fast_match._ahf_fast_select_best_fit_index(
+        pending_hosts=perm,
+        scan_window=len(perm),
+        remaining_bytes=remaining,
+    )
+    assert idx_perm >= 0
+    assert int(perm[idx_perm].predicted_bytes) == expected
 
 
 def test_phase_b_backfills_with_tiny_when_phase_a_cannot_fit():
@@ -115,21 +137,29 @@ def test_phase_b_backfills_with_tiny_when_phase_a_cannot_fit():
         fof_candidates=[6000, 5500, 20, 16],
         tiny_idx=[2, 3],
     )
-    phase_a = ahf_fast_match._ahf_fast_select_pair_candidate_index(
+    phase_a = ahf_fast_match._ahf_fast_select_best_fit_index(
         pending_hosts=pending,
-        candidate_pool=4,
-        pair_pool=4,
+        scan_window=len(pending),
         remaining_bytes=10,
-        pair_gain=0.03,
     )
     assert phase_a == -1
 
-    phase_b = ahf_fast_match._ahf_fast_select_tiny_backfill_index(
-        pending_hosts=pending,
-        scan_window=4,
-    )
-    assert phase_b in (2, 3)
-    assert pending[phase_b].is_tiny_proxy
+    jobs = 5
+    inflight = 2
+    free_slots = jobs - inflight
+    launched_tiny = 0
+    while launched_tiny < free_slots:
+        phase_b = ahf_fast_match._ahf_fast_select_tiny_backfill_index(
+            pending_hosts=pending,
+            scan_window=len(pending),
+        )
+        if phase_b < 0:
+            break
+        assert pending[phase_b].is_tiny_proxy
+        pending.pop(phase_b)
+        launched_tiny += 1
+
+    assert launched_tiny == 2
 
 
 def test_observed_bytes_and_sample_weight_helpers():
