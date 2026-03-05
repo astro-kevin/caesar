@@ -198,6 +198,71 @@ def _ahf_fast_predict_reservation_bytes(
     )
 
 
+def _ahf_fast_seed_anchor_samples(
+    *,
+    fof_candidates: Sequence[int],
+    work_unit: int,
+    base_unit_bytes: int,
+    pred_min_bytes: int,
+    pred_max_bytes: int,
+    anchor_count: int,
+    anchor_weight: float,
+) -> Tuple[List[float], List[float], List[float]]:
+    if not fof_candidates or int(anchor_count) <= 0 or float(anchor_weight) <= 0.0:
+        return [], [], []
+
+    values = np.asarray([max(1, int(v)) for v in fof_candidates], dtype=np.float64)
+    if values.size == 0:
+        return [], [], []
+
+    quantiles = np.linspace(0.0, 1.0, max(2, int(anchor_count)))
+    anchor_candidates = np.quantile(values, quantiles)
+    anchor_candidates = np.asarray(np.maximum(1.0, np.rint(anchor_candidates)), dtype=np.int64)
+    anchor_candidates = np.unique(anchor_candidates)
+    if anchor_candidates.size < 2:
+        return [], [], []
+
+    anchor_x: List[float] = []
+    anchor_y: List[float] = []
+    anchor_w: List[float] = []
+    for fof_count in anchor_candidates.tolist():
+        anchor_x.append(float(np.log1p(max(0, int(fof_count)))))
+        anchor_y.append(
+            float(
+                _ahf_fast_seed_prediction_bytes(
+                    fof_candidates=int(fof_count),
+                    work_unit=int(work_unit),
+                    base_unit_bytes=int(base_unit_bytes),
+                    pred_min_bytes=int(pred_min_bytes),
+                    pred_max_bytes=int(pred_max_bytes),
+                )
+            )
+        )
+        anchor_w.append(float(anchor_weight))
+    return anchor_x, anchor_y, anchor_w
+
+
+def _ahf_fast_model_fit_samples(
+    *,
+    seed_anchor_x: Sequence[float],
+    seed_anchor_y: Sequence[float],
+    seed_anchor_w: Sequence[float],
+    sample_x: Sequence[float],
+    sample_y: Sequence[float],
+    sample_w: Sequence[float],
+    seed_drop_samples: int,
+) -> Tuple[List[float], List[float], List[float]]:
+    if len(sample_x) < int(seed_drop_samples):
+        fit_x = list(seed_anchor_x)
+        fit_y = list(seed_anchor_y)
+        fit_w = list(seed_anchor_w)
+        fit_x.extend(sample_x)
+        fit_y.extend(sample_y)
+        fit_w.extend(sample_w)
+        return fit_x, fit_y, fit_w
+    return list(sample_x), list(sample_y), list(sample_w)
+
+
 def _ahf_fast_next_refit_target(
     *,
     current_target: int,
@@ -631,10 +696,17 @@ def build_galaxies_from_ahf_fast(
     model_drift_lo = float(_ahf_fast_clamp(_env_float("CAESAR_AHF_FAST_MODEL_DRIFT_LO", 0.70), 0.10, 1.0))
     model_drift_hi = float(max(model_drift_lo + 1.0e-6, _env_float("CAESAR_AHF_FAST_MODEL_DRIFT_HI", 1.35)))
     model_drift_cooldown_s = max(0.0, _env_float("CAESAR_AHF_FAST_MODEL_DRIFT_COOLDOWN_S", 30.0))
-    model_ratio_window = max(16, _env_int("CAESAR_AHF_FAST_MODEL_RATIO_WINDOW", 256))
-    model_ratio_q = float(_ahf_fast_clamp(_env_float("CAESAR_AHF_FAST_MODEL_RATIO_Q", 0.90), 0.50, 0.99))
     dispatch_heartbeat_ms = max(1, _env_int("CAESAR_AHF_FAST_DISPATCH_HEARTBEAT_MS", 50))
     anchor_max_inflight = max(1, _env_int("CAESAR_AHF_FAST_RESV_ANCHOR_MAX_INFLIGHT", 2))
+    model_seed_anchor_count = max(2, min(12, int(model_knots)))
+    model_seed_anchor_weight = 0.25
+    model_seed_drop_samples = max(
+        16,
+        _env_int(
+            "CAESAR_AHF_FAST_MODEL_SEED_DROP_SAMPLES",
+            max(64, int(4 * model_seed_anchor_count)),
+        ),
+    )
 
     # Obtain total memory once to set scale-aware defaults when thresholds are
     # not explicitly configured.
@@ -683,6 +755,27 @@ def build_galaxies_from_ahf_fast(
         base_unit_bytes = int(round(auto_bytes))
     base_unit_bytes = int(_ahf_fast_clamp(base_unit_bytes, resv_min_bytes, resv_max_bytes))
 
+    phasea_fof_candidates = [
+        int(item.fof_candidates) for item in host_schedule if not bool(item.is_tiny_proxy)
+    ]
+    seed_anchor_x, seed_anchor_y, seed_anchor_w = _ahf_fast_seed_anchor_samples(
+        fof_candidates=phasea_fof_candidates,
+        work_unit=int(work_unit),
+        base_unit_bytes=int(base_unit_bytes),
+        pred_min_bytes=int(resv_min_bytes),
+        pred_max_bytes=int(resv_max_bytes),
+        anchor_count=int(model_seed_anchor_count),
+        anchor_weight=float(model_seed_anchor_weight),
+    )
+    initial_mem_model = _ahf_fast_fit_mem_model(
+        sample_x=seed_anchor_x,
+        sample_y=seed_anchor_y,
+        sample_w=seed_anchor_w,
+        tau=float(model_tau),
+        knots=max(2, min(int(model_knots), max(2, len(seed_anchor_x)))),
+        neighbors=max(2, min(int(model_neighbors), max(2, len(seed_anchor_x)))),
+    )
+
     for item in host_schedule:
         seed_bytes = _ahf_fast_seed_prediction_bytes(
             fof_candidates=int(item.fof_candidates),
@@ -693,7 +786,7 @@ def build_galaxies_from_ahf_fast(
         )
         item.predicted_bytes = _ahf_fast_predict_reservation_bytes(
             fof_candidates=int(item.fof_candidates),
-            model=None,
+            model=initial_mem_model,
             seed_bytes=int(seed_bytes),
             pred_min_bytes=int(resv_min_bytes),
             pred_max_bytes=int(resv_max_bytes),
@@ -744,7 +837,7 @@ def build_galaxies_from_ahf_fast(
             float(resv_max_bytes) / _GIB,
         )
         mylog.info(
-            "AHF-FAST: model config tau=%.2f knots=%d neighbors=%d refit_exp=[%d,%d] drift=[%.3f,%.3f] cooldown=%.1fs ratio=(window=%d,q=%.2f)",
+            "AHF-FAST: model config tau=%.2f knots=%d neighbors=%d refit_exp=[%d,%d] drift=[%.3f,%.3f] cooldown=%.1fs seed_anchors=%d seed_weight=%.2f seed_drop_samples=%d",
             model_tau,
             int(model_knots),
             int(model_neighbors),
@@ -753,8 +846,9 @@ def build_galaxies_from_ahf_fast(
             model_drift_lo,
             model_drift_hi,
             model_drift_cooldown_s,
-            int(model_ratio_window),
-            model_ratio_q,
+            int(len(seed_anchor_x)),
+            float(model_seed_anchor_weight),
+            int(model_seed_drop_samples),
         )
         mylog.info("AHF-FAST: tiny saturation stars<=%d", int(tiny_proxy_star_threshold))
     else:
@@ -1288,7 +1382,6 @@ def build_galaxies_from_ahf_fast(
         # Scheduler telemetry/state.
         mem_samples = _deque(maxlen=max(6, int(adjust_every * 2)))
         drift_samples = _deque(maxlen=512)
-        ratio_samples = _deque(maxlen=int(model_ratio_window))
         reserved_samples: List[int] = []
         scheduler_mode = "nominal"
         scheduler_slope_gbps = 0.0
@@ -1307,12 +1400,11 @@ def build_galaxies_from_ahf_fast(
         sample_x: List[float] = []
         sample_y: List[float] = []
         sample_w: List[float] = []
-        mem_model: Optional[_MemModel] = None
+        mem_model: Optional[_MemModel] = initial_mem_model
         max_refit_target = int(2 ** int(model_refit_exp_max))
         next_refit_target = int(2 ** int(model_refit_exp_start))
         last_model_refit_ts = 0.0
         last_model_refit_completed = 0
-        phasea_prediction_bias = 1.0
         phasea_index_dirty = True
         phasea_predicted: List[int] = []
 
@@ -1331,7 +1423,6 @@ def build_galaxies_from_ahf_fast(
                 pred_min_bytes=int(resv_min_bytes),
                 pred_max_bytes=int(resv_max_bytes),
             )
-            predicted = int(round(float(predicted) * float(phasea_prediction_bias)))
             return int(_ahf_fast_clamp(float(predicted), float(resv_min_bytes), float(resv_max_bytes)))
 
         def _rebuild_phasea_index() -> None:
@@ -1389,10 +1480,19 @@ def build_galaxies_from_ahf_fast(
             if not should_refit:
                 return
 
-            fitted = _ahf_fast_fit_mem_model(
+            fit_x, fit_y, fit_w = _ahf_fast_model_fit_samples(
+                seed_anchor_x=seed_anchor_x,
+                seed_anchor_y=seed_anchor_y,
+                seed_anchor_w=seed_anchor_w,
                 sample_x=sample_x,
                 sample_y=sample_y,
                 sample_w=sample_w,
+                seed_drop_samples=int(model_seed_drop_samples),
+            )
+            fitted = _ahf_fast_fit_mem_model(
+                sample_x=fit_x,
+                sample_y=fit_y,
+                sample_w=fit_w,
                 tau=float(model_tau),
                 knots=int(model_knots),
                 neighbors=int(model_neighbors),
@@ -1458,7 +1558,7 @@ def build_galaxies_from_ahf_fast(
             mylog.info(
                 "AHF-FAST: scheduler update mode=%s avail_gb=%.1f safety_gb=%.1f "
                 "reserved_gb=%.1f capacity_gb=%.1f pending=%d phasea_pending=%d phasea_scan_size=%d inflight=%d "
-                "completed=%d emitted=%d emit_lag=%d bias=%.3f",
+                "completed=%d emitted=%d emit_lag=%d",
                 str(scheduler_mode),
                 float(avail_gb),
                 float(safety_floor_bytes) / _GIB,
@@ -1471,19 +1571,7 @@ def build_galaxies_from_ahf_fast(
                 int(completed_hosts),
                 int(emitted_hosts),
                 int(max(0, int(completed_hosts) - int(emitted_hosts))),
-                float(phasea_prediction_bias),
             )
-
-        def _update_phasea_bias_from_residuals() -> None:
-            nonlocal phasea_prediction_bias
-            if not ratio_samples:
-                return
-            ratios = np.asarray(ratio_samples, dtype=np.float64)
-            new_bias = float(np.quantile(ratios, float(model_ratio_q)))
-            new_bias = float(_ahf_fast_clamp(new_bias, 0.50, 2.00))
-            if abs(float(new_bias) - float(phasea_prediction_bias)) >= 0.03:
-                phasea_prediction_bias = float(new_bias)
-                _mark_phasea_index_dirty()
 
         def _flush_completed(futures, block: bool = False):
             nonlocal next_to_emit, skipped_empty_payloads, inflight_count, reserved_bytes_total
@@ -1537,9 +1625,7 @@ def build_galaxies_from_ahf_fast(
                             if predicted > 0:
                                 ratio = float(observed) / float(predicted)
                                 drift_samples.append(float(ratio))
-                                ratio_samples.append(float(_ahf_fast_clamp(ratio, 0.25, 4.0)))
 
-            _update_phasea_bias_from_residuals()
             _maybe_refit_model(now_ts=_time.time(), force=False)
 
             while next_to_emit in pending_results:

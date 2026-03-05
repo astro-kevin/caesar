@@ -72,6 +72,83 @@ def test_monotone_model_prediction_is_non_decreasing_with_size():
     assert all(a <= b for a, b in zip(preds, preds[1:]))
 
 
+def test_seed_anchor_samples_build_monotone_initial_spline():
+    anchor_x, anchor_y, anchor_w = ahf_fast_match._ahf_fast_seed_anchor_samples(
+        fof_candidates=[64, 256, 1024, 4096, 16384, 65536],
+        work_unit=128,
+        base_unit_bytes=2 * _GIB,
+        pred_min_bytes=int(0.25 * _GIB),
+        pred_max_bytes=int(32 * _GIB),
+        anchor_count=6,
+        anchor_weight=0.25,
+    )
+    assert len(anchor_x) >= 2
+    assert len(anchor_x) == len(anchor_y) == len(anchor_w)
+    assert all(a < b for a, b in zip(anchor_x, anchor_x[1:]))
+    assert all(a <= b for a, b in zip(anchor_y, anchor_y[1:]))
+
+    model = ahf_fast_match._ahf_fast_fit_mem_model(
+        sample_x=anchor_x,
+        sample_y=anchor_y,
+        sample_w=anchor_w,
+        tau=0.90,
+        knots=6,
+        neighbors=6,
+    )
+    assert model is not None
+
+    preds = [
+        ahf_fast_match._ahf_fast_predict_reservation_bytes(
+            fof_candidates=v,
+            model=model,
+            seed_bytes=1 * _GIB,
+            pred_min_bytes=int(0.25 * _GIB),
+            pred_max_bytes=int(32 * _GIB),
+        )
+        for v in [64, 512, 4096, 32768]
+    ]
+    assert all(a <= b for a, b in zip(preds, preds[1:]))
+
+
+def test_real_samples_can_replace_seed_anchors_after_threshold():
+    anchor_x, anchor_y, anchor_w = ahf_fast_match._ahf_fast_seed_anchor_samples(
+        fof_candidates=[64, 256, 1024, 4096, 16384, 65536],
+        work_unit=128,
+        base_unit_bytes=2 * _GIB,
+        pred_min_bytes=int(0.25 * _GIB),
+        pred_max_bytes=int(32 * _GIB),
+        anchor_count=6,
+        anchor_weight=0.25,
+    )
+    real_x = np.log1p(np.asarray([128, 512, 2048, 8192, 32768, 131072], dtype=np.float64))
+    real_y = np.asarray([1.0, 1.4, 2.1, 3.8, 6.2, 11.0], dtype=np.float64) * _GIB
+    real_w = np.ones_like(real_y, dtype=np.float64)
+    fit_x_small, fit_y_small, fit_w_small = ahf_fast_match._ahf_fast_model_fit_samples(
+        seed_anchor_x=anchor_x,
+        seed_anchor_y=anchor_y,
+        seed_anchor_w=anchor_w,
+        sample_x=real_x[:3].tolist(),
+        sample_y=real_y[:3].tolist(),
+        sample_w=real_w[:3].tolist(),
+        seed_drop_samples=8,
+    )
+    assert len(fit_x_small) == len(anchor_x) + 3
+    assert fit_x_small[: len(anchor_x)] == anchor_x
+
+    fit_x_full, fit_y_full, fit_w_full = ahf_fast_match._ahf_fast_model_fit_samples(
+        seed_anchor_x=anchor_x,
+        seed_anchor_y=anchor_y,
+        seed_anchor_w=anchor_w,
+        sample_x=real_x.tolist(),
+        sample_y=real_y.tolist(),
+        sample_w=real_w.tolist(),
+        seed_drop_samples=4,
+    )
+    assert fit_x_full == real_x.tolist()
+    assert fit_y_full == real_y.tolist()
+    assert fit_w_full == real_w.tolist()
+
+
 def test_phase_a_can_fill_all_worker_slots_when_capacity_permits():
     jobs = 6
     capacity = 1000
