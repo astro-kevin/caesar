@@ -255,13 +255,37 @@ def test_observed_bytes_and_sample_weight_helpers():
         rss_submit_bytes=10 * _GIB,
         rss_done_bytes=11 * _GIB,
     )
-    w1 = ahf_fast_match._ahf_fast_sample_weight(submit_inflight=1, anchor_max_inflight=2)
-    w2 = ahf_fast_match._ahf_fast_sample_weight(submit_inflight=2, anchor_max_inflight=2)
-    w3 = ahf_fast_match._ahf_fast_sample_weight(submit_inflight=3, anchor_max_inflight=2)
+    w1 = ahf_fast_match._ahf_fast_sample_weight(
+        submit_inflight=1,
+        anchor_max_inflight=2,
+        sample_max_inflight=8,
+    )
+    w2 = ahf_fast_match._ahf_fast_sample_weight(
+        submit_inflight=2,
+        anchor_max_inflight=2,
+        sample_max_inflight=8,
+    )
+    w3 = ahf_fast_match._ahf_fast_sample_weight(
+        submit_inflight=3,
+        anchor_max_inflight=2,
+        sample_max_inflight=8,
+    )
+    w8 = ahf_fast_match._ahf_fast_sample_weight(
+        submit_inflight=8,
+        anchor_max_inflight=2,
+        sample_max_inflight=8,
+    )
+    w9 = ahf_fast_match._ahf_fast_sample_weight(
+        submit_inflight=9,
+        anchor_max_inflight=2,
+        sample_max_inflight=8,
+    )
 
     assert obs1 == 1 * _GIB
     assert obs2 == int(0.5 * _GIB)
-    assert obs3 is None
+    assert obs3 == int(round((1 * _GIB) / 3.0))
     assert w1 == 1.0
     assert w2 == 0.5
-    assert w3 == 0.0
+    assert abs(w3 - (1.0 / 3.0)) < 1.0e-12
+    assert w8 == 0.125
+    assert w9 == 0.0

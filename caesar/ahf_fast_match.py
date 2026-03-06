@@ -242,6 +242,19 @@ def _ahf_fast_seed_anchor_samples(
     return anchor_x, anchor_y, anchor_w
 
 
+def _ahf_fast_probe_fof_candidates(
+    fof_candidates: Sequence[int],
+    probe_count: int,
+) -> List[int]:
+    if not fof_candidates or int(probe_count) <= 0:
+        return []
+    values = np.asarray([max(1, int(v)) for v in fof_candidates], dtype=np.float64)
+    quantiles = np.linspace(0.0, 1.0, max(2, int(probe_count)))
+    probes = np.quantile(values, quantiles)
+    probes = np.asarray(np.maximum(1.0, np.rint(probes)), dtype=np.int64)
+    return [int(v) for v in np.unique(probes)]
+
+
 def _ahf_fast_model_fit_samples(
     *,
     seed_anchor_x: Sequence[float],
@@ -340,23 +353,29 @@ def _ahf_fast_observed_bytes_estimate(
     rss_done_bytes: int,
 ) -> Optional[int]:
     delta = int(rss_done_bytes) - int(rss_submit_bytes)
-    if int(submit_inflight) == 1:
-        return int(max(int(round(128.0 * 1024.0**2)), delta))
-    if int(submit_inflight) == 2:
-        return int(max(int(round(128.0 * 1024.0**2)), int(round(0.5 * float(delta)))))
-    return None
+    inflight = max(1, int(submit_inflight))
+    return int(
+        max(
+            int(round(128.0 * 1024.0**2)),
+            int(round(float(delta) / float(inflight))),
+        )
+    )
 
 
 def _ahf_fast_sample_weight(
     *,
     submit_inflight: int,
     anchor_max_inflight: int,
+    sample_max_inflight: int,
 ) -> float:
+    inflight = max(1, int(submit_inflight))
+    if inflight > int(sample_max_inflight):
+        return 0.0
     if int(submit_inflight) <= 1:
         return 1.0
     if int(submit_inflight) <= int(anchor_max_inflight):
         return 0.5
-    return 0.0
+    return float(1.0 / float(inflight))
 
 
 def _ahf_fast_select_tiny_backfill_index(
@@ -433,6 +452,15 @@ def build_galaxies_from_ahf_fast(
 
     min_stars = _get_min_stars(sim, override=min_stars)
 
+    # Optional debug controls for the FAST path
+    debug_fast = _os.environ.get("CAESAR_AHF_FAST_DEBUG", "0") == "1"
+    debug_host: Optional[int]
+    try:
+        _h = _os.environ.get("CAESAR_AHF_FAST_DEBUG_HOST")
+        debug_host = int(_h) if _h not in (None, "") else None
+    except Exception:
+        debug_host = None
+
     # Optional phase-wise memory tracing (survives OOM via JSONL + fsync)
     phase_memlog_enabled = _os.environ.get("CAESAR_AHF_FAST_PHASE_MEMLOG", "0") == "1"
     try:
@@ -444,6 +472,15 @@ def build_galaxies_from_ahf_fast(
     if phase_memlog_enabled and not phase_memlog_file:
         phase_memlog_file = _os.path.abspath("ahf_fast_phase_memory.jsonl")
     phase_memlog_fsync = _os.environ.get("CAESAR_AHF_FAST_PHASE_MEMLOG_FSYNC", "1") == "1"
+    model_debug_file = _os.environ.get("CAESAR_AHF_FAST_MODEL_DEBUG_FILE")
+    if debug_fast and not model_debug_file:
+        if phase_memlog_file:
+            if phase_memlog_file.endswith(".jsonl"):
+                model_debug_file = phase_memlog_file[:-6] + ".model.jsonl"
+            else:
+                model_debug_file = phase_memlog_file + ".model.jsonl"
+        else:
+            model_debug_file = _os.path.abspath("ahf_fast_model_debug.jsonl")
     _phase_lock = _threading.Lock()
 
     _psutil = None
@@ -516,14 +553,26 @@ def build_galaxies_from_ahf_fast(
             except Exception:
                 pass
 
-    # Optional debug controls for the FAST path
-    debug_fast = _os.environ.get("CAESAR_AHF_FAST_DEBUG", "0") == "1"
-    debug_host: Optional[int]
-    try:
-        _h = _os.environ.get("CAESAR_AHF_FAST_DEBUG_HOST")
-        debug_host = int(_h) if _h not in (None, "") else None
-    except Exception:
-        debug_host = None
+    def _model_debuglog(event: str, **fields) -> None:
+        if not model_debug_file:
+            return
+        record = {
+            "ts": _time.time(),
+            "event": str(event),
+            "pid": _os.getpid(),
+        }
+        if fields:
+            record.update(fields)
+        try:
+            line = _json.dumps(record, sort_keys=True)
+            with _phase_lock:
+                with open(model_debug_file, "a") as _fh:
+                    _fh.write(line + "\n")
+                    _fh.flush()
+                    if phase_memlog_fsync:
+                        _os.fsync(_fh.fileno())
+        except Exception:
+            pass
 
     pid_maps_sel = _build_selected_pid_maps(sim)
     dm_pid_lookup = pid_maps_sel.get("dm")
@@ -696,8 +745,12 @@ def build_galaxies_from_ahf_fast(
     model_drift_lo = float(_ahf_fast_clamp(_env_float("CAESAR_AHF_FAST_MODEL_DRIFT_LO", 0.70), 0.10, 1.0))
     model_drift_hi = float(max(model_drift_lo + 1.0e-6, _env_float("CAESAR_AHF_FAST_MODEL_DRIFT_HI", 1.35)))
     model_drift_cooldown_s = max(0.0, _env_float("CAESAR_AHF_FAST_MODEL_DRIFT_COOLDOWN_S", 30.0))
-    dispatch_heartbeat_ms = max(1, _env_int("CAESAR_AHF_FAST_DISPATCH_HEARTBEAT_MS", 50))
     anchor_max_inflight = max(1, _env_int("CAESAR_AHF_FAST_RESV_ANCHOR_MAX_INFLIGHT", 2))
+    model_sample_max_inflight = max(
+        int(anchor_max_inflight),
+        _env_int("CAESAR_AHF_FAST_MODEL_SAMPLE_MAX_INFLIGHT", 8),
+    )
+    dispatch_heartbeat_ms = max(1, _env_int("CAESAR_AHF_FAST_DISPATCH_HEARTBEAT_MS", 50))
     model_seed_anchor_count = max(2, min(12, int(model_knots)))
     model_seed_anchor_weight = 0.25
     model_seed_drop_samples = max(
@@ -747,17 +800,30 @@ def build_galaxies_from_ahf_fast(
         units_for_auto.append(max(1, int(item.work_units)))
 
     median_units = float(np.percentile(np.asarray(units_for_auto, dtype=np.float64), 50.0)) if units_for_auto else 1.0
+    phasea_units_for_auto = [
+        max(1, int(item.work_units)) for item in host_schedule if not bool(item.is_tiny_proxy)
+    ]
+    phasea_units_scale = (
+        float(np.percentile(np.asarray(phasea_units_for_auto, dtype=np.float64), 75.0))
+        if phasea_units_for_auto
+        else float(max(1.0, median_units))
+    )
     if resv_base_unit_gb is not None:
         base_unit_bytes = int(max(1, round(float(resv_base_unit_gb) * _GIB)))
     else:
         auto_total = float(total_bytes) if total_bytes > 0 else float(max(1, jobs) * 4.0 * _GIB)
-        auto_bytes = (0.62 * auto_total) / max(1.0, float(jobs) * max(1.0, median_units))
+        worker_scale = float(max(32, min(int(jobs), 128)))
+        auto_bytes = (0.45 * auto_total) / max(1.0, worker_scale * max(1.0, phasea_units_scale))
         base_unit_bytes = int(round(auto_bytes))
     base_unit_bytes = int(_ahf_fast_clamp(base_unit_bytes, resv_min_bytes, resv_max_bytes))
 
     phasea_fof_candidates = [
         int(item.fof_candidates) for item in host_schedule if not bool(item.is_tiny_proxy)
     ]
+    model_probe_candidates = _ahf_fast_probe_fof_candidates(
+        fof_candidates=phasea_fof_candidates,
+        probe_count=12,
+    )
     seed_anchor_x, seed_anchor_y, seed_anchor_w = _ahf_fast_seed_anchor_samples(
         fof_candidates=phasea_fof_candidates,
         work_unit=int(work_unit),
@@ -774,7 +840,7 @@ def build_galaxies_from_ahf_fast(
         tau=float(model_tau),
         knots=max(2, min(int(model_knots), max(2, len(seed_anchor_x)))),
         neighbors=max(2, min(int(model_neighbors), max(2, len(seed_anchor_x)))),
-    )
+        )
 
     for item in host_schedule:
         seed_bytes = _ahf_fast_seed_prediction_bytes(
@@ -826,18 +892,19 @@ def build_galaxies_from_ahf_fast(
         )
         mylog.info(
             "AHF-FAST: reservation model safety=(frac=%.2f,min=%.1fGB,base=%.1fGB) "
-            "slope_gbps=(warn=%.2f,crit=%.2f) base_unit=%.2fGB clamp=(min=%.2fGB,max=%.2fGB)",
+            "slope_gbps=(warn=%.2f,crit=%.2f) base_unit=%.2fGB phasea_units_scale=%.2f clamp=(min=%.2fGB,max=%.2fGB)",
             mem_safety_frac,
             mem_safety_gb_min,
             float(safety_floor_base_bytes) / _GIB,
             mem_slope_warn_gbps,
             mem_slope_crit_gbps,
             float(base_unit_bytes) / _GIB,
+            float(phasea_units_scale),
             float(resv_min_bytes) / _GIB,
             float(resv_max_bytes) / _GIB,
         )
         mylog.info(
-            "AHF-FAST: model config tau=%.2f knots=%d neighbors=%d refit_exp=[%d,%d] drift=[%.3f,%.3f] cooldown=%.1fs seed_anchors=%d seed_weight=%.2f seed_drop_samples=%d",
+            "AHF-FAST: model config tau=%.2f knots=%d neighbors=%d refit_exp=[%d,%d] drift=[%.3f,%.3f] cooldown=%.1fs sample_max_inflight=%d seed_anchors=%d seed_weight=%.2f seed_drop_samples=%d",
             model_tau,
             int(model_knots),
             int(model_neighbors),
@@ -846,9 +913,40 @@ def build_galaxies_from_ahf_fast(
             model_drift_lo,
             model_drift_hi,
             model_drift_cooldown_s,
+            int(model_sample_max_inflight),
             int(len(seed_anchor_x)),
             float(model_seed_anchor_weight),
             int(model_seed_drop_samples),
+        )
+        _model_debuglog(
+            "model_initial",
+            sample_count=0,
+            using_seed_anchors=True,
+            seed_anchor_count=int(len(seed_anchor_x)),
+            seed_drop_samples=int(model_seed_drop_samples),
+            probe_fof_candidates=model_probe_candidates,
+            probe_pred_gb=[
+                round(
+                    float(
+                        _ahf_fast_predict_reservation_bytes(
+                            fof_candidates=int(v),
+                            model=initial_mem_model,
+                            seed_bytes=_ahf_fast_seed_prediction_bytes(
+                                fof_candidates=int(v),
+                                work_unit=int(work_unit),
+                                base_unit_bytes=int(base_unit_bytes),
+                                pred_min_bytes=int(resv_min_bytes),
+                                pred_max_bytes=int(resv_max_bytes),
+                            ),
+                            pred_min_bytes=int(resv_min_bytes),
+                            pred_max_bytes=int(resv_max_bytes),
+                        )
+                    )
+                    / _GIB,
+                    4,
+                )
+                for v in model_probe_candidates
+            ],
         )
         mylog.info("AHF-FAST: tiny saturation stars<=%d", int(tiny_proxy_star_threshold))
     else:
@@ -1405,6 +1503,7 @@ def build_galaxies_from_ahf_fast(
         next_refit_target = int(2 ** int(model_refit_exp_start))
         last_model_refit_ts = 0.0
         last_model_refit_completed = 0
+        latest_model_sample: Optional[Dict[str, float]] = None
         phasea_index_dirty = True
         phasea_predicted: List[int] = []
 
@@ -1503,6 +1602,38 @@ def build_galaxies_from_ahf_fast(
             mem_model = fitted
             model_refits += 1
             _mark_phasea_index_dirty()
+            _model_debuglog(
+                "model_refit",
+                sample_count=int(len(sample_x)),
+                using_seed_anchors=bool(len(sample_x) < int(model_seed_drop_samples)),
+                seed_anchor_count=int(len(seed_anchor_x)),
+                seed_drop_samples=int(model_seed_drop_samples),
+                refits=int(model_refits),
+                latest_sample=latest_model_sample,
+                probe_fof_candidates=model_probe_candidates,
+                probe_pred_gb=[
+                    round(
+                        float(
+                            _ahf_fast_predict_reservation_bytes(
+                                fof_candidates=int(v),
+                                model=fitted,
+                                seed_bytes=_ahf_fast_seed_prediction_bytes(
+                                    fof_candidates=int(v),
+                                    work_unit=int(work_unit),
+                                    base_unit_bytes=int(base_unit_bytes),
+                                    pred_min_bytes=int(resv_min_bytes),
+                                    pred_max_bytes=int(resv_max_bytes),
+                                ),
+                                pred_min_bytes=int(resv_min_bytes),
+                                pred_max_bytes=int(resv_max_bytes),
+                            )
+                        )
+                        / _GIB,
+                        4,
+                    )
+                    for v in model_probe_candidates
+                ],
+            )
             last_model_refit_ts = float(now_ts)
             last_model_refit_completed = int(completed_hosts)
             while int(next_refit_target) < int(max_refit_target) and int(completed_hosts) >= int(next_refit_target):
@@ -1576,6 +1707,7 @@ def build_galaxies_from_ahf_fast(
         def _flush_completed(futures, block: bool = False):
             nonlocal next_to_emit, skipped_empty_payloads, inflight_count, reserved_bytes_total
             nonlocal completed_hosts, emitted_hosts
+            nonlocal latest_model_sample
             if not futures:
                 return 0
             timeout = None if block else 0
@@ -1617,11 +1749,19 @@ def build_galaxies_from_ahf_fast(
                             weight = _ahf_fast_sample_weight(
                                 submit_inflight=int(submit_inflight),
                                 anchor_max_inflight=int(anchor_max_inflight),
+                                sample_max_inflight=int(model_sample_max_inflight),
                             )
                             if weight > 0.0:
                                 sample_x.append(float(np.log1p(max(0, int(fof_candidates_i)))))
                                 sample_y.append(float(observed))
                                 sample_w.append(float(weight))
+                                latest_model_sample = {
+                                    "fof_candidates": int(fof_candidates_i),
+                                    "observed_gb": round(float(observed) / _GIB, 6),
+                                    "predicted_gb": round(float(predicted) / _GIB, 6),
+                                    "sample_weight": float(weight),
+                                    "submit_inflight": int(submit_inflight),
+                                }
                             if predicted > 0:
                                 ratio = float(observed) / float(predicted)
                                 drift_samples.append(float(ratio))
