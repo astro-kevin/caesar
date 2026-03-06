@@ -154,6 +154,55 @@ def _ahf_fast_fit_mem_model(
     return _MemModel(knots_x=knots_x, knots_y=knots_y, interp=interp)
 
 
+def _ahf_fast_fit_direct_monotone_model(
+    *,
+    sample_x: Sequence[float],
+    sample_y: Sequence[float],
+    sample_w: Sequence[float],
+) -> Optional[_MemModel]:
+    if not sample_x or not sample_y:
+        return None
+    x = np.asarray(sample_x, dtype=np.float64)
+    y = np.asarray(sample_y, dtype=np.float64)
+    w = np.asarray(sample_w, dtype=np.float64)
+    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(w) & (y > 0.0)
+    if np.count_nonzero(valid) < 2:
+        return None
+    x = x[valid]
+    y = y[valid]
+    w = np.where(w[valid] > 0.0, w[valid], 1.0)
+
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+    w = w[order]
+
+    knots_x: List[float] = []
+    knots_y: List[float] = []
+    start = 0
+    while start < x.size:
+        end = start + 1
+        while end < x.size and x[end] == x[start]:
+            end += 1
+        weights = w[start:end]
+        values = y[start:end]
+        denom = float(np.sum(weights))
+        if denom <= 0.0:
+            y_val = float(np.mean(values))
+        else:
+            y_val = float(np.sum(values * weights) / denom)
+        knots_x.append(float(x[start]))
+        knots_y.append(y_val)
+        start = end
+
+    if len(knots_x) < 2:
+        return None
+    knots_x_arr = np.asarray(knots_x, dtype=np.float64)
+    knots_y_arr = np.maximum.accumulate(np.asarray(knots_y, dtype=np.float64))
+    interp = PchipInterpolator(knots_x_arr, knots_y_arr, extrapolate=True)
+    return _MemModel(knots_x=knots_x_arr, knots_y=knots_y_arr, interp=interp)
+
+
 def _ahf_fast_seed_prediction_bytes(
     *,
     fof_candidates: int,
@@ -253,6 +302,17 @@ def _ahf_fast_probe_fof_candidates(
     probes = np.quantile(values, quantiles)
     probes = np.asarray(np.maximum(1.0, np.rint(probes)), dtype=np.int64)
     return [int(v) for v in np.unique(probes)]
+
+
+def _ahf_fast_select_bootstrap_hosts(
+    pending_hosts: Sequence[HostSchedState],
+    count: int,
+) -> List[HostSchedState]:
+    if int(count) <= 0:
+        return []
+    hosts = [host for host in pending_hosts if not bool(host.is_tiny_proxy)]
+    hosts.sort(key=lambda h: (int(-h.fof_candidates), int(h.root_id)))
+    return list(hosts[: max(0, int(count))])
 
 
 def _ahf_fast_model_fit_samples(
@@ -750,6 +810,17 @@ def build_galaxies_from_ahf_fast(
         int(anchor_max_inflight),
         _env_int("CAESAR_AHF_FAST_MODEL_SAMPLE_MAX_INFLIGHT", 8),
     )
+    model_bootstrap_large_hosts = max(
+        0,
+        _env_int("CAESAR_AHF_FAST_MODEL_BOOTSTRAP_LARGE_HOSTS", 4),
+    )
+    model_bootstrap_max_inflight = max(
+        1,
+        min(
+            int(model_sample_max_inflight),
+            _env_int("CAESAR_AHF_FAST_MODEL_BOOTSTRAP_MAX_INFLIGHT", int(anchor_max_inflight)),
+        ),
+    )
     dispatch_heartbeat_ms = max(1, _env_int("CAESAR_AHF_FAST_DISPATCH_HEARTBEAT_MS", 50))
     model_seed_anchor_count = max(2, min(12, int(model_knots)))
     model_seed_anchor_weight = 0.25
@@ -833,14 +904,11 @@ def build_galaxies_from_ahf_fast(
         anchor_count=int(model_seed_anchor_count),
         anchor_weight=float(model_seed_anchor_weight),
     )
-    initial_mem_model = _ahf_fast_fit_mem_model(
+    initial_mem_model = _ahf_fast_fit_direct_monotone_model(
         sample_x=seed_anchor_x,
         sample_y=seed_anchor_y,
         sample_w=seed_anchor_w,
-        tau=float(model_tau),
-        knots=max(2, min(int(model_knots), max(2, len(seed_anchor_x)))),
-        neighbors=max(2, min(int(model_neighbors), max(2, len(seed_anchor_x)))),
-        )
+    )
 
     for item in host_schedule:
         seed_bytes = _ahf_fast_seed_prediction_bytes(
@@ -904,7 +972,7 @@ def build_galaxies_from_ahf_fast(
             float(resv_max_bytes) / _GIB,
         )
         mylog.info(
-            "AHF-FAST: model config tau=%.2f knots=%d neighbors=%d refit_exp=[%d,%d] drift=[%.3f,%.3f] cooldown=%.1fs sample_max_inflight=%d seed_anchors=%d seed_weight=%.2f seed_drop_samples=%d",
+            "AHF-FAST: model config tau=%.2f knots=%d neighbors=%d refit_exp=[%d,%d] drift=[%.3f,%.3f] cooldown=%.1fs sample_max_inflight=%d bootstrap_large_hosts=%d bootstrap_max_inflight=%d seed_anchors=%d seed_weight=%.2f seed_drop_samples=%d",
             model_tau,
             int(model_knots),
             int(model_neighbors),
@@ -914,6 +982,8 @@ def build_galaxies_from_ahf_fast(
             model_drift_hi,
             model_drift_cooldown_s,
             int(model_sample_max_inflight),
+            int(model_bootstrap_large_hosts),
+            int(model_bootstrap_max_inflight),
             int(len(seed_anchor_x)),
             float(model_seed_anchor_weight),
             int(model_seed_drop_samples),
@@ -1469,7 +1539,18 @@ def build_galaxies_from_ahf_fast(
 
     with ThreadPoolExecutor(max_workers=jobs) as executor:
         pending_futures: Dict = {}
-        pending_phasea: List[HostSchedState] = [item for item in host_schedule if not bool(item.is_tiny_proxy)]
+        bootstrap_phasea = _deque(
+            _ahf_fast_select_bootstrap_hosts(
+                [item for item in host_schedule if not bool(item.is_tiny_proxy)],
+                count=int(model_bootstrap_large_hosts),
+            )
+        )
+        bootstrap_phasea_ids = {int(item.order_idx) for item in bootstrap_phasea}
+        pending_phasea: List[HostSchedState] = [
+            item
+            for item in host_schedule
+            if (not bool(item.is_tiny_proxy)) and (int(item.order_idx) not in bootstrap_phasea_ids)
+        ]
         pending_tiny = _deque(
             sorted(
                 (item for item in host_schedule if bool(item.is_tiny_proxy)),
@@ -1504,6 +1585,7 @@ def build_galaxies_from_ahf_fast(
         last_model_refit_ts = 0.0
         last_model_refit_completed = 0
         latest_model_sample: Optional[Dict[str, float]] = None
+        bootstrap_inflight_count = 0
         phasea_index_dirty = True
         phasea_predicted: List[int] = []
 
@@ -1588,14 +1670,21 @@ def build_galaxies_from_ahf_fast(
                 sample_w=sample_w,
                 seed_drop_samples=int(model_seed_drop_samples),
             )
-            fitted = _ahf_fast_fit_mem_model(
-                sample_x=fit_x,
-                sample_y=fit_y,
-                sample_w=fit_w,
-                tau=float(model_tau),
-                knots=int(model_knots),
-                neighbors=int(model_neighbors),
-            )
+            if len(sample_x) < int(model_seed_drop_samples):
+                fitted = _ahf_fast_fit_direct_monotone_model(
+                    sample_x=fit_x,
+                    sample_y=fit_y,
+                    sample_w=fit_w,
+                )
+            else:
+                fitted = _ahf_fast_fit_mem_model(
+                    sample_x=fit_x,
+                    sample_y=fit_y,
+                    sample_w=fit_w,
+                    tau=float(model_tau),
+                    knots=int(model_knots),
+                    neighbors=int(model_neighbors),
+                )
             if fitted is None:
                 return
 
@@ -1695,9 +1784,9 @@ def build_galaxies_from_ahf_fast(
                 float(safety_floor_bytes) / _GIB,
                 float(reserved_bytes_total) / _GIB,
                 float(capacity_bytes) / _GIB,
-                int(len(pending_phasea) + len(pending_tiny)),
-                int(len(pending_phasea)),
-                int(phasea_scan_size),
+                int(len(bootstrap_phasea) + len(pending_phasea) + len(pending_tiny)),
+                int(len(bootstrap_phasea) + len(pending_phasea)),
+                int(len(bootstrap_phasea) + phasea_scan_size),
                 int(inflight_count),
                 int(completed_hosts),
                 int(emitted_hosts),
@@ -1708,6 +1797,7 @@ def build_galaxies_from_ahf_fast(
             nonlocal next_to_emit, skipped_empty_payloads, inflight_count, reserved_bytes_total
             nonlocal completed_hosts, emitted_hosts
             nonlocal latest_model_sample
+            nonlocal bootstrap_inflight_count
             if not futures:
                 return 0
             timeout = None if block else 0
@@ -1718,6 +1808,8 @@ def build_galaxies_from_ahf_fast(
             for fut in done:
                 fut_meta = futures.pop(fut, None)
                 reserved = int(fut_meta.get("reserved_bytes", 0)) if isinstance(fut_meta, dict) else 0
+                if isinstance(fut_meta, dict) and bool(fut_meta.get("bootstrap", False)):
+                    bootstrap_inflight_count = max(0, int(bootstrap_inflight_count) - 1)
                 inflight_count = max(0, int(inflight_count) - 1)
                 reserved_bytes_total = max(0, int(reserved_bytes_total) - max(0, int(reserved)))
 
@@ -1798,8 +1890,8 @@ def build_galaxies_from_ahf_fast(
                 host_progress.update(int(done_count))
             return int(done_count)
 
-        def _submit_host(item: HostSchedState, launch_phase: str, reserved_for_item: int) -> None:
-            nonlocal inflight_count, reserved_bytes_total
+        def _submit_host(item: HostSchedState, launch_phase: str, reserved_for_item: int, bootstrap: bool = False) -> None:
+            nonlocal inflight_count, reserved_bytes_total, bootstrap_inflight_count
             started_at = _time.time()
             submit_inflight = int(inflight_count) + 1
             rss_submit, _, _, _ = _snapshot_memory()
@@ -1823,17 +1915,42 @@ def build_galaxies_from_ahf_fast(
                 "reserved_bytes": int(reserved_for_item),
                 "submit_inflight": int(submit_inflight),
                 "submit_rss_bytes": int(item.submit_rss_bytes),
+                "bootstrap": bool(bootstrap),
             }
             inflight_count += 1
             reserved_bytes_total += int(reserved_for_item)
+            if bool(bootstrap):
+                bootstrap_inflight_count += 1
 
         def _submit_until_blocked() -> int:
             nonlocal phasea_fit_success_count, phasea_fit_fail_count
             nonlocal phaseb_backfill_count, deadlock_guard_count, dispatch_submit_batches
             submissions = 0
-            while int(inflight_count) < int(jobs) and (pending_phasea or pending_tiny):
+            while int(inflight_count) < int(jobs) and (bootstrap_phasea or pending_phasea or pending_tiny):
                 if int(capacity_bytes) <= 0:
                     # Emergency gate: pause all new launches when memory is at/below safety floor.
+                    break
+
+                if bootstrap_phasea or int(bootstrap_inflight_count) > 0:
+                    if int(inflight_count) >= int(model_bootstrap_max_inflight):
+                        break
+                    if not bootstrap_phasea:
+                        break
+                    bootstrap_item = bootstrap_phasea[0]
+                    bootstrap_item.predicted_bytes = int(_predict_host_reservation_bytes(bootstrap_item))
+                    remaining_capacity = int(capacity_bytes) - int(reserved_bytes_total)
+                    if int(bootstrap_item.predicted_bytes) <= int(max(0, remaining_capacity)) or int(inflight_count) == 0:
+                        bootstrap_phasea.popleft()
+                        reserved_for_item = int(max(0, int(bootstrap_item.predicted_bytes)))
+                        _submit_host(
+                            item=bootstrap_item,
+                            launch_phase="A",
+                            reserved_for_item=reserved_for_item,
+                            bootstrap=True,
+                        )
+                        phasea_fit_success_count += 1
+                        submissions += 1
+                        continue
                     break
 
                 if phasea_index_dirty:
@@ -1888,7 +2005,7 @@ def build_galaxies_from_ahf_fast(
         if scheduler_enabled and pending_phasea:
             _rebuild_phasea_index()
 
-        while pending_phasea or pending_tiny or pending_futures:
+        while bootstrap_phasea or bootstrap_inflight_count or pending_phasea or pending_tiny or pending_futures:
             submitted = _submit_until_blocked()
 
             if pending_futures:
@@ -1898,7 +2015,7 @@ def build_galaxies_from_ahf_fast(
                 _adjust_scheduler(done_count=done_now, force=False)
                 continue
 
-            if pending_phasea or pending_tiny:
+            if bootstrap_phasea or bootstrap_inflight_count or pending_phasea or pending_tiny:
                 _time.sleep(float(dispatch_heartbeat_ms) / 1000.0)
                 _adjust_scheduler(done_count=0, force=True)
 
@@ -1925,7 +2042,7 @@ def build_galaxies_from_ahf_fast(
         int(completed_hosts),
         int(emitted_hosts),
         int(max(0, int(completed_hosts) - int(emitted_hosts))),
-        int(len(pending_phasea)),
+        int(len(bootstrap_phasea) + len(pending_phasea)),
         int(len(pending_tiny)),
         int(next_refit_target),
     )

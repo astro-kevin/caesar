@@ -110,6 +110,31 @@ def test_seed_anchor_samples_build_monotone_initial_spline():
     assert all(a <= b for a, b in zip(preds, preds[1:]))
 
 
+def test_direct_monotone_model_preserves_anchor_shape():
+    sample_x = np.log1p(np.asarray([64, 512, 4096, 32768], dtype=np.float64))
+    sample_y = np.asarray([0.25, 0.5, 2.0, 16.0], dtype=np.float64) * _GIB
+    sample_w = np.ones_like(sample_y, dtype=np.float64)
+    model = ahf_fast_match._ahf_fast_fit_direct_monotone_model(
+        sample_x=sample_x.tolist(),
+        sample_y=sample_y.tolist(),
+        sample_w=sample_w.tolist(),
+    )
+    assert model is not None
+    preds = [
+        ahf_fast_match._ahf_fast_predict_reservation_bytes(
+            fof_candidates=v,
+            model=model,
+            seed_bytes=1 * _GIB,
+            pred_min_bytes=int(0.25 * _GIB),
+            pred_max_bytes=int(32 * _GIB),
+        )
+        for v in [64, 512, 4096, 32768]
+    ]
+    assert preds[0] <= int(0.3 * _GIB)
+    assert preds[-1] >= int(15.0 * _GIB)
+    assert all(a <= b for a, b in zip(preds, preds[1:]))
+
+
 def test_real_samples_can_replace_seed_anchors_after_threshold():
     anchor_x, anchor_y, anchor_w = ahf_fast_match._ahf_fast_seed_anchor_samples(
         fof_candidates=[64, 256, 1024, 4096, 16384, 65536],
@@ -147,6 +172,17 @@ def test_real_samples_can_replace_seed_anchors_after_threshold():
     assert fit_x_full == real_x.tolist()
     assert fit_y_full == real_y.tolist()
     assert fit_w_full == real_w.tolist()
+
+
+def test_bootstrap_host_selection_prefers_largest_non_tiny_hosts():
+    hosts = _mk_hosts(
+        predicted_bytes=[5, 8, 2, 9, 1],
+        fof_candidates=[500, 3000, 200, 2500, 100],
+        tiny_idx=[2, 4],
+    )
+    selected = ahf_fast_match._ahf_fast_select_bootstrap_hosts(hosts, count=2)
+    assert [int(h.fof_candidates) for h in selected] == [3000, 2500]
+    assert all(not h.is_tiny_proxy for h in selected)
 
 
 def test_phase_a_can_fill_all_worker_slots_when_capacity_permits():
