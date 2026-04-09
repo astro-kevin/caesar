@@ -1479,9 +1479,7 @@ def build_galaxies_from_ahf_fast(
 
         return order_idx, host_galaxies, local_skipped, host_stats
 
-    pending_results: Dict[int, List] = {}
     host_meta = {int(item.order_idx): item for item in host_schedule}
-    next_to_emit = 0
     completed_hosts = 0
     emitted_hosts = 0
     inflight_count = 0
@@ -1806,7 +1804,7 @@ def build_galaxies_from_ahf_fast(
             )
 
         def _flush_completed(futures, block: bool = False):
-            nonlocal next_to_emit, skipped_empty_payloads, inflight_count, reserved_bytes_total
+            nonlocal skipped_empty_payloads, inflight_count, reserved_bytes_total
             nonlocal completed_hosts, emitted_hosts
             nonlocal latest_model_sample
             nonlocal bootstrap_inflight_count
@@ -1834,7 +1832,30 @@ def build_galaxies_from_ahf_fast(
                     for key in fof_totals.keys():
                         if key in host_stats:
                             fof_totals[key] += int(host_stats[key])
-                pending_results[order_idx] = host_gals
+
+                meta = host_meta.get(order_idx)
+                host_id = int(meta.root_id) if meta is not None else -1
+                is_heavy = bool(meta.is_heavy) if meta is not None else False
+                if host_gals:
+                    for node_id, grp in host_gals:
+                        galaxies.append(grp)
+                        galaxy_node_ids.append(int(node_id))
+                emitted_hosts += 1
+                if _trace_host(order_idx, is_heavy):
+                    _phase_memlog(
+                        "materialize",
+                        order_idx=order_idx,
+                        host_id=host_id,
+                        heavy=int(is_heavy),
+                        galaxies=int(len(host_gals)),
+                        inflight=int(inflight_count),
+                        reserved_gb=round(float(reserved_bytes_total) / _GIB, 4),
+                        completed_hosts=int(completed_hosts),
+                        emitted_hosts=int(emitted_hosts),
+                        emit_lag=int(max(0, int(completed_hosts) - int(emitted_hosts))),
+                        hosts_total=int(total_hosts),
+                        pending=int(len(futures)),
+                    )
 
                 if isinstance(fut_meta, dict):
                     submit_inflight = int(fut_meta.get("submit_inflight", 0))
@@ -1871,33 +1892,6 @@ def build_galaxies_from_ahf_fast(
                                 drift_samples.append(float(ratio))
 
             _maybe_refit_model(now_ts=_time.time(), force=False)
-
-            while next_to_emit in pending_results:
-                host_gals = pending_results.pop(next_to_emit)
-                meta = host_meta.get(next_to_emit)
-                host_id = int(meta.root_id) if meta is not None else -1
-                is_heavy = bool(meta.is_heavy) if meta is not None else False
-                if host_gals:
-                    for node_id, grp in host_gals:
-                        galaxies.append(grp)
-                        galaxy_node_ids.append(int(node_id))
-                emitted_hosts += 1
-                if _trace_host(next_to_emit, is_heavy):
-                    _phase_memlog(
-                        "materialize",
-                        order_idx=next_to_emit,
-                        host_id=host_id,
-                        heavy=int(is_heavy),
-                        galaxies=int(len(host_gals)),
-                        inflight=int(inflight_count),
-                        reserved_gb=round(float(reserved_bytes_total) / _GIB, 4),
-                        completed_hosts=int(completed_hosts),
-                        emitted_hosts=int(emitted_hosts),
-                        emit_lag=int(max(0, int(completed_hosts) - int(emitted_hosts))),
-                        hosts_total=int(total_hosts),
-                        pending=int(len(pending_results)),
-                    )
-                next_to_emit += 1
             if host_progress is not None and done_count > 0:
                 host_progress.update(int(done_count))
             return int(done_count)
