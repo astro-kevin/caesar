@@ -1194,15 +1194,18 @@ def build_galaxies_from_ahf_fast(
         bh_sel: np.ndarray,
         dm_selected: np.ndarray,
         dm_exc: Optional[Set[int]] = None,
+        top_halo_id: Optional[int] = None,
     ):
         grp = create_new_group(sim, "galaxy")
         grp.AHF_haloID = int(node_id)
+        grp.AHF_top_haloID = int(top_halo_id if top_halo_id is not None else node_id)
         grp.slist = np.asarray(star_sel, dtype=np.int32)
         grp.glist = np.asarray(gas_sel_dense, dtype=np.int32)
         if "bh" in pid_maps_sel:
             grp.bhlist = np.asarray(bh_sel, dtype=np.int32)
         grp.dmlist = np.asarray(dm_selected, dtype=np.int32)
         grp.global_indexes = np.array([], dtype=np.int64)
+        grp._ahf_host_halo_index = -1
         grp.__dict__["_dm_exclusive_pids"] = set(dm_exc) if dm_exc else set()
         return grp
 
@@ -1408,6 +1411,7 @@ def build_galaxies_from_ahf_fast(
                                 bsub,
                                 dm_selected if allow_dm else np.empty(0, dtype=np.int32),
                                 dm_exc if allow_dm else None,
+                                top_halo_id=int(root_id),
                             )
                             host_galaxies.append((int(node_id), grp))
                             built_local += 1
@@ -1426,7 +1430,15 @@ def build_galaxies_from_ahf_fast(
             if mode == "tiny":
                 host_stats["tiny_skips"] += 1
 
-            grp = _make_group(int(node_id), star_sel, gas_sel_dense, bh_sel, dm_selected, dm_exc)
+            grp = _make_group(
+                int(node_id),
+                star_sel,
+                gas_sel_dense,
+                bh_sel,
+                dm_selected,
+                dm_exc,
+                top_halo_id=int(root_id),
+            )
             mapped_star = len(grp.slist) if hasattr(grp, "slist") else 0
             mapped_gas = len(grp.glist) if hasattr(grp, "glist") else 0
             mapped_bh = len(grp.bhlist) if hasattr(grp, "bhlist") else 0
@@ -2247,6 +2259,7 @@ def build_galaxies_from_ahf_fast(
 
     for gi, host_idx in enumerate(host_indices):
         idx = int(host_idx) if host_idx is not None else -1
+        sim.galaxy_list[gi]._ahf_host_halo_index = idx
         sim.galaxy_list[gi].parent_halo_index = idx
         if idx >= 0 and idx < len(sim.halo_list):
             sim.halo_list[idx].galaxy_index_list.append(gi)

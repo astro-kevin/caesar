@@ -61,7 +61,14 @@ def assign_galaxies_to_halos(obj):
 
     mylog.info('Assigning galaxies to halos')
 
-    override_hosts = getattr(obj, '_ahf_galaxy_hosts', None)
+    override_hosts = None
+    override_hosts_by_galaxy = [
+        getattr(galaxy, '_ahf_host_halo_index', None) for galaxy in obj.galaxies
+    ]
+    if any(host is not None for host in override_hosts_by_galaxy):
+        override_hosts = override_hosts_by_galaxy
+    else:
+        override_hosts = getattr(obj, '_ahf_galaxy_hosts', None)
 
     if override_hosts is not None and len(override_hosts) == obj.ngalaxies:
         for halo in obj.halos:
@@ -94,6 +101,25 @@ def assign_galaxies_to_halos(obj):
                     parent_index = np.bincount(combined).argmax()
                     galaxy.parent_halo_index = parent_index
                     obj.halos[parent_index].galaxy_index_list.append(gi)
+
+        obj._ahf_galaxy_hosts = []
+        for galaxy in obj.galaxies:
+            host_index = int(getattr(galaxy, 'parent_halo_index', -1))
+            galaxy._ahf_host_halo_index = host_index
+            obj._ahf_galaxy_hosts.append(host_index)
+
+        obj._ahf_galaxy_ahf_ids = [
+            int(getattr(galaxy, 'AHF_haloID', -1)) for galaxy in obj.galaxies
+        ]
+        obj._ahf_galaxy_top_ahf_ids = [
+            int(getattr(galaxy, 'AHF_top_haloID', -1)) for galaxy in obj.galaxies
+        ]
+        try:
+            from caesar.halo_matching import _update_ahf_galaxy_maps
+
+            _update_ahf_galaxy_maps(obj, obj._ahf_galaxy_ahf_ids)
+        except Exception:
+            pass
 
         return
 

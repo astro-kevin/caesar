@@ -380,7 +380,10 @@ def _prune_halos_after_galaxies(sim) -> None:
 
     for gal in getattr(sim, 'galaxy_list', []):
         old_host = getattr(gal, 'parent_halo_index', -1)
-        gal.parent_halo_index = old_to_new.get(old_host, -1)
+        new_host = old_to_new.get(old_host, -1)
+        gal.parent_halo_index = new_host
+        if hasattr(gal, '_ahf_host_halo_index'):
+            gal._ahf_host_halo_index = new_host
 
     for new_idx, halo in enumerate(keep):
         halo.GroupID = new_idx
