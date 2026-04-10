@@ -9,6 +9,9 @@ from yt.funcs import mylog
 
 from caesar.pipeline_utils import reset_global_particle_IDs, load_global_lists
 
+MINIMUM_DM_PER_TOPLEVEL_AHF_HALO = 64
+MINIMUM_DM_PER_AHF_SUBHALO = 24
+
 
 @dataclass(frozen=True)
 class AHFSubhaloTask:
@@ -101,6 +104,19 @@ def _available_gpu_device_ids() -> List[int]:
     return list(range(max(0, ndev)))
 
 
+def _build_node_dm_counts(membership_arrays: Dict[int, np.ndarray]) -> Dict[int, int]:
+    node_ndm: Dict[int, int] = {}
+    for node_id, arr in membership_arrays.items():
+        block = np.asarray(arr, dtype=np.int64)
+        if block.size == 0:
+            node_ndm[int(node_id)] = 0
+            continue
+        if block.ndim != 2 or block.shape[1] != 2:
+            block = block.reshape(-1, 2)
+        node_ndm[int(node_id)] = int(np.count_nonzero(block[:, 1] == 1))
+    return node_ndm
+
+
 def _build_tiny_batches(
     tasks: Sequence[AHFSubhaloTask],
     *,
@@ -149,6 +165,7 @@ def _build_task_manifest(
     host_to_nodes: Dict[int, Set[int]],
     node_npart: Dict[int, int],
     node_nstar: Dict[int, int],
+    node_ndm: Optional[Dict[int, int]] = None,
     min_stars: int,
 ) -> Tuple[List[AHFSubhaloTask], Dict[int, List[AHFSubhaloTask]]]:
     tasks: List[AHFSubhaloTask] = []
@@ -161,6 +178,15 @@ def _build_task_manifest(
             star_count = int(node_nstar.get(int(node_id), 0))
             if star_count < int(min_stars):
                 continue
+            if node_ndm is not None:
+                dm_count = int(node_ndm.get(int(node_id), 0))
+                min_dm = (
+                    int(MINIMUM_DM_PER_TOPLEVEL_AHF_HALO)
+                    if int(parent_of.get(int(node_id), 0) or 0) <= 0
+                    else int(MINIMUM_DM_PER_AHF_SUBHALO)
+                )
+                if dm_count < int(min_dm):
+                    continue
             fof_candidates = int(node_npart.get(int(node_id), 0))
             task = AHFSubhaloTask(
                 node_id=int(node_id),
@@ -1598,6 +1624,7 @@ def build_galaxies_from_ahf_subhalo(
         int(hid): max(0, int(nstar))
         for hid, nstar in zip(halos_df["hid"].to_numpy(), halos_df["n_star"].to_numpy())
     }
+    node_ndm = _build_node_dm_counts(membership_arrays)
 
     host_to_nodes, _ = _group_nodes_by_root(parent_of)
     tasks, tasks_by_root = _build_task_manifest(
@@ -1605,6 +1632,7 @@ def build_galaxies_from_ahf_subhalo(
         host_to_nodes=host_to_nodes,
         node_npart=node_npart,
         node_nstar=node_nstar,
+        node_ndm=node_ndm,
         min_stars=int(min_stars),
     )
 

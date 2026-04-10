@@ -84,6 +84,30 @@ def test_ancestor_chain_and_task_manifest():
     assert set(t.node_id for t in tasks_by_root[20]) == {21}
 
 
+def test_task_manifest_applies_distinct_dm_thresholds_to_halos_and_subhalos():
+    parent_of = {10: 0, 11: 10, 12: 10, 20: 0, 21: 20}
+    host_to_nodes = {10: {10, 11, 12}, 20: {20, 21}}
+    node_npart = {10: 100, 11: 40, 12: 40, 20: 100, 21: 40}
+    node_nstar = {10: 20, 11: 20, 12: 20, 20: 20, 21: 20}
+    node_ndm = {10: 63, 11: 23, 12: 24, 20: 64, 21: 24}
+
+    tasks, tasks_by_root = subhalo_mod._build_task_manifest(
+        parent_of=parent_of,
+        host_to_nodes=host_to_nodes,
+        node_npart=node_npart,
+        node_nstar=node_nstar,
+        node_ndm=node_ndm,
+        min_stars=16,
+    )
+
+    ids = {t.node_id for t in tasks}
+    assert ids == {12, 20, 21}
+    assert 10 not in ids
+    assert 11 not in ids
+    assert set(t.node_id for t in tasks_by_root[10]) == {12}
+    assert set(t.node_id for t in tasks_by_root[20]) == {20, 21}
+
+
 def test_graph_6d_max_groups_close_particles():
     pos = np.array(
         [

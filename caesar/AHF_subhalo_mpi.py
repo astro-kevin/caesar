@@ -23,6 +23,7 @@ from caesar.AHF_subhalo import (
     AHFSubhaloBatch,
     AHFSubhaloTask,
     _available_gpu_device_ids,
+    _build_node_dm_counts,
     _build_task_input_payload,
     _build_task_manifest,
     _build_tiny_batches,
@@ -175,6 +176,7 @@ def _stage2_shard_payload(galaxies: Sequence) -> List[dict]:
 def _prepare_manifest(
     *,
     ahf_particles_file: str,
+    node_ndm: Optional[Dict[int, int]] = None,
     min_stars: int,
 ) -> Tuple[List[AHFSubhaloTask], Dict[int, List[AHFSubhaloTask]], Dict[int, int], Dict[int, int]]:
     hier = load_ahf_hierarchy(ahf_particles_file)
@@ -194,6 +196,7 @@ def _prepare_manifest(
         host_to_nodes=host_to_nodes,
         node_npart=node_npart,
         node_nstar=node_nstar,
+        node_ndm=node_ndm,
         min_stars=int(min_stars),
     )
     return tasks, tasks_by_root, node_npart, node_nstar
@@ -374,9 +377,11 @@ def _rank0_prepare_stage12(
         ahf_particles_file,
         nproc=int(nproc),
     )
+    membership_arrays = getattr(sim, "_ahf_fast_memberships")
     ms = get_min_stars(sim, override=min_stars)
     tasks, tasks_by_root, _, _ = _prepare_manifest(
         ahf_particles_file=ahf_particles_file,
+        node_ndm=_build_node_dm_counts(membership_arrays),
         min_stars=int(ms),
     )
 
@@ -395,7 +400,6 @@ def _rank0_prepare_stage12(
         }
         tasks_by_root = {int(root): root_tasks for root, root_tasks in tasks_by_root.items() if root_tasks}
 
-    membership_arrays = getattr(sim, "_ahf_fast_memberships")
     fof_nHlim = _env_float("CAESAR_AHF_FAST_FOF_NHLIM", 0.13)
     fof_Tlim = _env_float("CAESAR_AHF_FAST_FOF_TLIM", 1.0e5)
     fof_use_sfr_gate = os.environ.get("CAESAR_AHF_FAST_FOF_USE_SFR", "1") == "1"
