@@ -24,6 +24,8 @@ from caesar.AHF_subhalo import (
     AHFSubhaloTask,
     _available_gpu_device_ids,
     _build_node_dm_counts,
+    _build_stage3_property_payload,
+    _build_stage3_property_runtime,
     _build_task_input_payload,
     _build_task_manifest,
     _build_tiny_batches,
@@ -588,26 +590,30 @@ def _stage3_halo_work_payload(halos: Sequence) -> List[int]:
 
 def _worker_run_stage3(
     *,
-    sim,
     item: Dict,
     shard_dir: Path,
+    nproc: int,
 ) -> Dict:
-    group_type = str(item["group_type"])
-    if group_type == "halo":
-        wanted = set(int(v) for v in item["halo_ids"])
-        groups = [halo for halo in sim.halo_list if int(getattr(halo, "AHF_haloID", -1)) in wanted]
-        _compute_group_properties_subset(sim, group_type="halo", groups=groups)
-        payload = [_serialize_group_state(group, id_key="AHF_haloID") for group in groups]
-    elif group_type == "galaxy":
-        groups = [_deserialize_candidate_group(sim, rec) for rec in item["galaxies"]]
-        _compute_group_properties_subset(sim, group_type="galaxy", groups=groups)
-        payload = [_serialize_group_state(group, id_key="_merge_id") for group in groups]
-    else:
-        raise RuntimeError(f"Unknown stage3 group_type: {group_type}")
+    payload = _load_pickle(Path(item["payload_path"]))
+    sim = _build_stage3_property_runtime(payload, nproc=int(nproc))
 
-    shard_path = shard_dir / f"stage3_rank{os.getpid()}_{group_type}_{abs(hash(str(item)[:128]))}.pkl"
-    _dump_pickle(shard_path, {"group_type": group_type, "payload": payload})
-    return {"stage": "stage3", "group_type": group_type, "shard_path": str(shard_path), "count": int(len(payload))}
+    _compute_group_properties_subset(sim, group_type="halo", groups=list(sim.halo_list))
+    _compute_group_properties_subset(sim, group_type="galaxy", groups=list(sim.galaxy_list))
+
+    shard_path = shard_dir / f"stage3_rank{os.getpid()}_{abs(hash(str(item.get('payload_path'))))}.pkl"
+    _dump_pickle(
+        shard_path,
+        {
+            "halos": [_serialize_group_state(group, id_key="AHF_haloID") for group in sim.halo_list],
+            "galaxies": [_serialize_group_state(group, id_key="_merge_id") for group in sim.galaxy_list],
+        },
+    )
+    return {
+        "stage": "stage3",
+        "shard_path": str(shard_path),
+        "count_halos": int(len(sim.halo_list)),
+        "count_galaxies": int(len(sim.galaxy_list)),
+    }
 
 
 def _rank0_build_final_sim(
@@ -649,6 +655,7 @@ def _rank0_run_stage3_and_save(
     output_file: str,
     final_shards: Sequence[str],
     nproc: int,
+    shard_root: Path,
 ):
     sim = _rank0_build_final_sim(
         snapshot_file=snapshot_file,
@@ -662,15 +669,12 @@ def _rank0_run_stage3_and_save(
     for idx, gal in enumerate(sim.galaxy_list):
         gal._merge_id = int(idx)
 
-    galaxy_workers = max(1, len(worker_caps))
-    halo_batches = [batch for batch in _split_even(list(sim.halo_list), len(worker_caps)) if batch]
-    galaxy_batches = [batch for batch in _split_even(list(sim.galaxy_list), galaxy_workers) if batch]
-
     stage3_cpu_items = []
-    for batch in halo_batches:
-        stage3_cpu_items.append({"group_type": "halo", "halo_ids": _stage3_halo_work_payload(batch)})
-    for batch in galaxy_batches:
-        stage3_cpu_items.append({"group_type": "galaxy", "galaxies": _stage3_galaxy_work_payload(batch)})
+    halo_batches = [batch for batch in _split_even(list(sim.halo_list), len(worker_caps)) if batch]
+    for ibatch, batch in enumerate(halo_batches):
+        payload_path = shard_root / f"stage3_input_{ibatch:05d}.pkl"
+        _dump_pickle(payload_path, _build_stage3_property_payload(sim, batch))
+        stage3_cpu_items.append({"payload_path": str(payload_path)})
 
     stage3_results = _dispatch_stage(
         comm,
@@ -685,26 +689,15 @@ def _rank0_run_stage3_and_save(
 
     for result in stage3_results:
         shard = _load_pickle(Path(result["shard_path"]))
-        group_type = str(shard["group_type"])
-        payload = shard["payload"]
-        if group_type == "halo":
-            for state in payload:
-                halo = halo_by_id[int(state["id"])]
-                _apply_group_state(halo, state)
-        elif group_type == "galaxy":
-            for state in payload:
-                gal = gal_by_id[int(state["id"])]
-                _apply_group_state(gal, state)
-        else:
-            raise RuntimeError(f"Unexpected stage3 shard group_type: {group_type}")
+        for state in shard.get("halos", []):
+            halo = halo_by_id[int(state["id"])]
+            _apply_group_state(halo, state)
+        for state in shard.get("galaxies", []):
+            gal = gal_by_id[int(state["id"])]
+            _apply_group_state(gal, state)
 
     _complete_finalization_after_properties(sim)
     sim.save(output_file)
-
-
-def _property_worker_init_runtime(snapshot_file: str, ahf_particles_file: str, *, nproc: int):
-    sim, _, _, _ = _rank0_init_runtime(snapshot_file, ahf_particles_file, nproc=int(nproc))
-    return sim
 
 
 def _stage3_manifest_path(shard_root: Path) -> Path:
@@ -964,6 +957,7 @@ def run_mpi(
             output_file=str(manifest.get("output_file", output_file)),
             final_shards=[str(v) for v in manifest.get("final_shards", [])],
             nproc=int(nproc),
+            shard_root=shard_root,
         )
         _stop_workers(comm, worker_caps=worker_caps)
         return
@@ -975,7 +969,6 @@ def run_mpi(
         world_layout=world_layout,
     )
     comm.send(cap.__dict__, dest=coordinator_rank, tag=MSG_REGISTER)
-    sim = _property_worker_init_runtime(snapshot_file, ahf_particles_file, nproc=int(cap.threads))
 
     while True:
         status = MPI.Status()
@@ -986,7 +979,7 @@ def run_mpi(
             raise RuntimeError(f"Unexpected MPI message: {msg}")
         if str(msg["stage"]) != "stage3":
             raise RuntimeError(f"Unexpected property-stage MPI message: {msg}")
-        result = _worker_run_stage3(sim=sim, item=msg["item"], shard_dir=shard_root)
+        result = _worker_run_stage3(item=msg["item"], shard_dir=shard_root, nproc=int(cap.threads))
         comm.send(result, dest=coordinator_rank, tag=MSG_RESULT)
 
 

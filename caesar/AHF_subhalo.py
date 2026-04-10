@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
@@ -102,6 +103,25 @@ def _available_gpu_device_ids() -> List[int]:
     except Exception:
         return []
     return list(range(max(0, ndev)))
+
+
+def _preferred_cc_backend(requested: str, *, backend: str) -> str:
+    req = str(requested).lower()
+    bkd = str(backend).lower()
+    if req != "auto":
+        return req
+    if bkd in {"cpu", "numpy"}:
+        return "cpu"
+    if bkd in {"gpu", "cupy"}:
+        try:
+            from caesar.fof6d_graph import _try_import_cugraph
+
+            if _try_import_cugraph() is not None:
+                return "cugraph"
+        except Exception:
+            pass
+        return "gpu"
+    return "auto"
 
 
 def _build_node_dm_counts(membership_arrays: Dict[int, np.ndarray]) -> Dict[int, int]:
@@ -405,6 +425,298 @@ def _apply_group_state(group, state: Dict) -> None:
         setattr(group, key, value)
 
 
+def _remap_index_array(values, mapping: Dict[int, int], *, dtype=np.int64) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.int64)
+    if arr.size == 0:
+        return np.empty(0, dtype=dtype)
+    return np.asarray([mapping[int(v)] for v in arr.tolist()], dtype=dtype)
+
+
+def _concat_unique_index_arrays(values: Iterable[np.ndarray]) -> np.ndarray:
+    arrays = [np.asarray(v, dtype=np.int64) for v in values if v is not None and np.asarray(v).size > 0]
+    if not arrays:
+        return np.empty(0, dtype=np.int64)
+    return np.unique(np.concatenate(arrays).astype(np.int64, copy=False))
+
+
+class _ShardYTUnitHelper:
+    def quan(self, value, unit):
+        from unyt import unyt_quantity
+
+        u = "dimensionless" if unit in (None, "") else unit
+        return unyt_quantity(value, u)
+
+    def arr(self, value, unit):
+        from unyt import unyt_array
+
+        u = "dimensionless" if unit in (None, "") else unit
+        return unyt_array(value, u)
+
+
+class _ShardDatasetType:
+    def __init__(self, *, ptypes: Sequence[str], data_manager_attrs: Set[str]):
+        self._ptypes = {str(p) for p in ptypes}
+        self._attrs = set(str(v) for v in data_manager_attrs)
+
+    def has_ptype(self, requested_ptype):
+        return str(requested_ptype).lower() in self._ptypes
+
+    def has_property(self, requested_ptype, requested_prop):
+        ptype = str(requested_ptype).lower()
+        prop = str(requested_prop).lower()
+        mapping = {
+            ("gas", "fh2"): "gfH2",
+            ("gas", "nh"): "gfHI",
+            ("gas", "rho"): "gnh",
+            ("bh", "bhmdot"): "bhmdot",
+            ("bh", "bhmass"): "bhmass",
+            ("gas", "dustmass"): "dustmass",
+        }
+        attr = mapping.get((ptype, prop))
+        return attr in self._attrs if attr is not None else False
+
+
+def _serialize_stage3_group_input(group, *, galaxy_index_map: Optional[Dict[int, int]] = None) -> Dict:
+    payload = {
+        "AHF_haloID": int(getattr(group, "AHF_haloID", -1)),
+        "AHF_parent_haloID": int(getattr(group, "AHF_parent_haloID", -1)) if hasattr(group, "AHF_parent_haloID") else -1,
+        "AHF_top_haloID": int(getattr(group, "AHF_top_haloID", -1)) if hasattr(group, "AHF_top_haloID") else -1,
+        "AHF_depth": int(getattr(group, "AHF_depth", 0)) if hasattr(group, "AHF_depth") else 0,
+        "AHF_ancestor_haloIDs": np.asarray(getattr(group, "AHF_ancestor_haloIDs", []), dtype=np.int64),
+        "global_indexes": np.asarray(getattr(group, "global_indexes", []), dtype=np.int64),
+        "glist": np.asarray(getattr(group, "glist", []), dtype=np.int64),
+        "slist": np.asarray(getattr(group, "slist", []), dtype=np.int64),
+        "dmlist": np.asarray(getattr(group, "dmlist", []), dtype=np.int64),
+        "bhlist": np.asarray(getattr(group, "bhlist", []), dtype=np.int64),
+        "dlist": np.asarray(getattr(group, "dlist", []), dtype=np.int64),
+    }
+    if hasattr(group, "_merge_id"):
+        payload["_merge_id"] = int(getattr(group, "_merge_id"))
+    if hasattr(group, "parent_halo_index"):
+        payload["parent_halo_index"] = int(getattr(group, "parent_halo_index"))
+    if hasattr(group, "_ahf_host_halo_index"):
+        payload["_ahf_host_halo_index"] = int(getattr(group, "_ahf_host_halo_index"))
+    if galaxy_index_map is not None and hasattr(group, "galaxy_index_list"):
+        payload["galaxy_index_list"] = np.asarray(
+            [galaxy_index_map[int(v)] for v in np.asarray(getattr(group, "galaxy_index_list", []), dtype=np.int64).tolist()],
+            dtype=np.int32,
+        )
+    return payload
+
+
+def _build_stage3_property_payload(sim, halos: Sequence) -> Dict[str, object]:
+    halos = list(halos)
+    halo_index_map = {int(getattr(halo, "AHF_haloID", -1)): int(i) for i, halo in enumerate(halos)}
+
+    galaxy_list = []
+    seen_galaxy_index = set()
+    galaxy_index_map: Dict[int, int] = {}
+    for halo in halos:
+        for gi in np.asarray(getattr(halo, "galaxy_index_list", []), dtype=np.int64).tolist():
+            old_idx = int(gi)
+            if old_idx in seen_galaxy_index:
+                continue
+            seen_galaxy_index.add(old_idx)
+            galaxy_index_map[old_idx] = len(galaxy_list)
+            gal = sim.galaxy_list[old_idx]
+            galaxy_list.append(gal)
+
+    global_ids = _concat_unique_index_arrays(
+        [getattr(halo, "global_indexes", np.empty(0, dtype=np.int64)) for halo in halos]
+        + [getattr(gal, "global_indexes", np.empty(0, dtype=np.int64)) for gal in galaxy_list]
+    )
+    gas_ids = _concat_unique_index_arrays(
+        [getattr(halo, "glist", np.empty(0, dtype=np.int64)) for halo in halos]
+        + [getattr(gal, "glist", np.empty(0, dtype=np.int64)) for gal in galaxy_list]
+    )
+    star_ids = _concat_unique_index_arrays(
+        [getattr(halo, "slist", np.empty(0, dtype=np.int64)) for halo in halos]
+        + [getattr(gal, "slist", np.empty(0, dtype=np.int64)) for gal in galaxy_list]
+    )
+    dm_ids = _concat_unique_index_arrays(
+        [getattr(halo, "dmlist", np.empty(0, dtype=np.int64)) for halo in halos]
+        + [getattr(gal, "dmlist", np.empty(0, dtype=np.int64)) for gal in galaxy_list]
+    )
+    bh_ids = _concat_unique_index_arrays(
+        [getattr(halo, "bhlist", np.empty(0, dtype=np.int64)) for halo in halos]
+        + [getattr(gal, "bhlist", np.empty(0, dtype=np.int64)) for gal in galaxy_list]
+    )
+    dust_ids = _concat_unique_index_arrays(
+        [getattr(halo, "dlist", np.empty(0, dtype=np.int64)) for halo in halos]
+        + [getattr(gal, "dlist", np.empty(0, dtype=np.int64)) for gal in galaxy_list]
+    )
+
+    global_map = {int(v): i for i, v in enumerate(global_ids.tolist())}
+    gas_map = {int(v): i for i, v in enumerate(gas_ids.tolist())}
+    star_map = {int(v): i for i, v in enumerate(star_ids.tolist())}
+    dm_map = {int(v): i for i, v in enumerate(dm_ids.tolist())}
+    bh_map = {int(v): i for i, v in enumerate(bh_ids.tolist())}
+    dust_map = {int(v): i for i, v in enumerate(dust_ids.tolist())}
+
+    dmgr = sim.data_manager
+    payload_dm: Dict[str, object] = {
+        "pos": np.asarray(dmgr.pos[global_ids]),
+        "vel": np.asarray(dmgr.vel[global_ids]),
+        "mass": np.asarray(dmgr.mass[global_ids]),
+        "ptype": np.asarray(dmgr.ptype[global_ids]),
+        "pot": np.asarray(dmgr.pot[global_ids]) if hasattr(dmgr, "pot") else np.zeros(len(global_ids), dtype=np.float32),
+    }
+
+    ptypes_local: List[str] = []
+    if gas_ids.size > 0:
+        payload_dm["glist"] = _remap_index_array(np.asarray(dmgr.glist[gas_ids], dtype=np.int64), global_map, dtype=np.int64)
+        for attr in ("gnh", "gsfr", "gZ", "gT", "gfH2", "gfHI", "dustmass"):
+            if hasattr(dmgr, attr):
+                payload_dm[attr] = np.asarray(getattr(dmgr, attr)[gas_ids])
+        ptypes_local.append("gas")
+    if star_ids.size > 0:
+        payload_dm["slist"] = _remap_index_array(np.asarray(dmgr.slist[star_ids], dtype=np.int64), global_map, dtype=np.int64)
+        for attr in ("sZ", "age"):
+            if hasattr(dmgr, attr):
+                payload_dm[attr] = np.asarray(getattr(dmgr, attr)[star_ids])
+        ptypes_local.append("star")
+    if dm_ids.size > 0:
+        payload_dm["dmlist"] = _remap_index_array(np.asarray(dmgr.dmlist[dm_ids], dtype=np.int64), global_map, dtype=np.int64)
+        ptypes_local.append("dm")
+    if bh_ids.size > 0:
+        payload_dm["bhlist"] = _remap_index_array(np.asarray(dmgr.bhlist[bh_ids], dtype=np.int64), global_map, dtype=np.int64)
+        for attr in ("bhmass", "bhmdot"):
+            if hasattr(dmgr, attr):
+                payload_dm[attr] = np.asarray(getattr(dmgr, attr)[bh_ids])
+        ptypes_local.append("bh")
+    if dust_ids.size > 0 and hasattr(dmgr, "dlist"):
+        payload_dm["dlist"] = _remap_index_array(np.asarray(dmgr.dlist[dust_ids], dtype=np.int64), global_map, dtype=np.int64)
+        ptypes_local.append("dust")
+
+    halo_payloads = []
+    for halo in halos:
+        rec = _serialize_stage3_group_input(halo, galaxy_index_map=galaxy_index_map)
+        rec["global_indexes"] = _remap_index_array(rec["global_indexes"], global_map, dtype=np.int64)
+        rec["glist"] = _remap_index_array(rec["glist"], gas_map, dtype=np.int64)
+        rec["slist"] = _remap_index_array(rec["slist"], star_map, dtype=np.int64)
+        rec["dmlist"] = _remap_index_array(rec["dmlist"], dm_map, dtype=np.int64)
+        rec["bhlist"] = _remap_index_array(rec["bhlist"], bh_map, dtype=np.int64)
+        rec["dlist"] = _remap_index_array(rec["dlist"], dust_map, dtype=np.int64)
+        halo_payloads.append(rec)
+
+    galaxy_payloads = []
+    for gal in galaxy_list:
+        rec = _serialize_stage3_group_input(gal)
+        rec["global_indexes"] = _remap_index_array(rec["global_indexes"], global_map, dtype=np.int64)
+        rec["glist"] = _remap_index_array(rec["glist"], gas_map, dtype=np.int64)
+        rec["slist"] = _remap_index_array(rec["slist"], star_map, dtype=np.int64)
+        rec["dmlist"] = _remap_index_array(rec["dmlist"], dm_map, dtype=np.int64)
+        rec["bhlist"] = _remap_index_array(rec["bhlist"], bh_map, dtype=np.int64)
+        rec["dlist"] = _remap_index_array(rec["dlist"], dust_map, dtype=np.int64)
+        old_parent_hid = int(getattr(sim.halo_list[int(rec["parent_halo_index"])], "AHF_haloID", -1))
+        rec["parent_halo_index"] = int(halo_index_map.get(old_parent_hid, -1))
+        rec["_ahf_host_halo_index"] = int(rec["parent_halo_index"])
+        galaxy_payloads.append(rec)
+
+    boxsize_val = getattr(getattr(sim.simulation, "boxsize", None), "d", getattr(sim.simulation, "boxsize", 0.0))
+    simulation_payload = {
+        "XH": float(getattr(sim.simulation, "XH", 0.76)),
+        "redshift": float(getattr(sim.simulation, "redshift", 0.0)),
+        "omega_baryon": float(getattr(sim.simulation, "omega_baryon", 0.0)),
+        "omega_matter": float(getattr(sim.simulation, "omega_matter", 0.0)),
+        "boxsize": float(boxsize_val),
+        "ngas": int(gas_ids.size),
+        "nstar": int(star_ids.size),
+        "ntot": int(global_ids.size),
+    }
+
+    return {
+        "units": dict(getattr(sim, "units", {})),
+        "kwargs": dict(getattr(sim, "_kwargs", {})),
+        "load_pot": bool(getattr(sim, "load_pot", True)),
+        "ptypes": list(ptypes_local),
+        "blackholes": bool(getattr(dmgr, "blackholes", False) and bh_ids.size > 0),
+        "simulation": simulation_payload,
+        "data_manager": payload_dm,
+        "halos": halo_payloads,
+        "galaxies": galaxy_payloads,
+    }
+
+
+def _build_stage3_property_runtime(payload: Dict[str, object], *, nproc: int):
+    from caesar.group import create_new_group
+
+    sim = SimpleNamespace()
+    sim._kwargs = dict(payload.get("kwargs", {}))
+    sim.units = dict(payload.get("units", {}))
+    sim.load_pot = bool(payload.get("load_pot", True))
+    sim.nproc = int(max(1, nproc))
+    sim.yt_dataset = _ShardYTUnitHelper()
+
+    sim_payload = dict(payload.get("simulation", {}))
+    sim.simulation = SimpleNamespace(
+        XH=float(sim_payload.get("XH", 0.76)),
+        redshift=float(sim_payload.get("redshift", 0.0)),
+        omega_baryon=float(sim_payload.get("omega_baryon", 0.0)),
+        omega_matter=float(sim_payload.get("omega_matter", 0.0)),
+        boxsize=SimpleNamespace(d=float(sim_payload.get("boxsize", 0.0))),
+        ngas=int(sim_payload.get("ngas", 0)),
+        nstar=int(sim_payload.get("nstar", 0)),
+        ntot=int(sim_payload.get("ntot", 0)),
+    )
+
+    dm_payload = dict(payload.get("data_manager", {}))
+    dm = SimpleNamespace()
+    dm.ptypes = list(payload.get("ptypes", []))
+    dm.blackholes = bool(payload.get("blackholes", False))
+    for key, value in dm_payload.items():
+        setattr(dm, key, np.asarray(value))
+    sim.data_manager = dm
+    sim._ds_type = _ShardDatasetType(ptypes=dm.ptypes, data_manager_attrs=set(dm_payload.keys()))
+
+    halo_list = []
+    for rec in payload.get("halos", []):
+        halo = create_new_group(sim, "halo")
+        halo.AHF_haloID = int(rec["AHF_haloID"])
+        halo.global_indexes = np.asarray(rec["global_indexes"], dtype=np.int64)
+        halo.glist = np.asarray(rec["glist"], dtype=np.int64)
+        halo.slist = np.asarray(rec["slist"], dtype=np.int64)
+        halo.dmlist = np.asarray(rec["dmlist"], dtype=np.int64)
+        halo.bhlist = np.asarray(rec["bhlist"], dtype=np.int64)
+        halo.dlist = np.asarray(rec["dlist"], dtype=np.int64)
+        halo.galaxy_index_list = np.asarray(rec.get("galaxy_index_list", []), dtype=np.int32)
+        halo_list.append(halo)
+
+    galaxy_list = []
+    for rec in payload.get("galaxies", []):
+        gal = create_new_group(sim, "galaxy")
+        gal.AHF_haloID = int(rec["AHF_haloID"])
+        gal.AHF_parent_haloID = int(rec.get("AHF_parent_haloID", -1))
+        gal.AHF_top_haloID = int(rec.get("AHF_top_haloID", -1))
+        gal.AHF_depth = int(rec.get("AHF_depth", 0))
+        gal.AHF_ancestor_haloIDs = np.asarray(rec.get("AHF_ancestor_haloIDs", []), dtype=np.int64)
+        gal.global_indexes = np.asarray(rec["global_indexes"], dtype=np.int64)
+        gal.glist = np.asarray(rec["glist"], dtype=np.int64)
+        gal.slist = np.asarray(rec["slist"], dtype=np.int64)
+        gal.dmlist = np.asarray(rec["dmlist"], dtype=np.int64)
+        gal.bhlist = np.asarray(rec["bhlist"], dtype=np.int64)
+        gal.dlist = np.asarray(rec["dlist"], dtype=np.int64)
+        gal.parent_halo_index = int(rec.get("parent_halo_index", -1))
+        gal._ahf_host_halo_index = int(rec.get("_ahf_host_halo_index", gal.parent_halo_index))
+        if "_merge_id" in rec:
+            gal._merge_id = int(rec["_merge_id"])
+        galaxy_list.append(gal)
+
+    sim.halo_list = halo_list
+    sim.halos = halo_list
+    sim.nhalos = len(halo_list)
+    sim.galaxy_list = galaxy_list
+    sim.galaxies = galaxy_list
+    sim.ngalaxies = len(galaxy_list)
+
+    for gal in galaxy_list:
+        idx = int(getattr(gal, "parent_halo_index", -1))
+        if 0 <= idx < len(halo_list):
+            gal.halo = halo_list[idx]
+
+    return sim
+
+
 def _compute_group_properties_subset(sim, *, group_type: str, groups: Sequence) -> None:
     if not groups:
         return
@@ -689,7 +1001,7 @@ def _fof_for_task(
         periodic=False,
         kernel="caesar_table",
         backend="auto" if backend == "auto" else backend,
-        cc_backend="auto" if cc_backend == "auto" else cc_backend,
+        cc_backend=_preferred_cc_backend(cc_backend, backend=backend),
         max_pairs_per_batch=int(max_pairs_per_batch),
     )
 
@@ -777,7 +1089,7 @@ def _fof_on_task_payload(
         periodic=False,
         kernel="caesar_table",
         backend=resolved_backend,
-        cc_backend="auto" if cc_backend == "auto" else cc_backend,
+        cc_backend=_preferred_cc_backend(cc_backend, backend=resolved_backend),
         max_pairs_per_batch=int(max_pairs_per_batch),
     )
 
@@ -904,7 +1216,7 @@ def _fof_for_batch(
         periodic=False,
         kernel="caesar_table",
         backend=resolved_backend,
-        cc_backend="auto" if cc_backend == "auto" else cc_backend,
+        cc_backend=_preferred_cc_backend(cc_backend, backend=resolved_backend),
         max_pairs_per_batch=int(max_pairs_per_batch),
     )
     tags = np.asarray(tags, dtype=np.int64)
@@ -1045,7 +1357,7 @@ def _fof_on_batch_payload(
         periodic=False,
         kernel="caesar_table",
         backend=resolved_backend,
-        cc_backend="auto" if cc_backend == "auto" else cc_backend,
+        cc_backend=_preferred_cc_backend(cc_backend, backend=resolved_backend),
         max_pairs_per_batch=int(max_pairs_per_batch),
     )
     tags = np.asarray(tags, dtype=np.int64)

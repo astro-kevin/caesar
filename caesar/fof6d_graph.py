@@ -312,45 +312,79 @@ def _kernel_lookup_caesar(r_over_h, ktab, *, xp):
 
 
 def _connected_components_from_edges(u, v, n_nodes: int, *, xp):
+    if int(u.size) == 0:
+        labels = xp.arange(n_nodes, dtype=xp.int64)
+        return int(n_nodes), labels
+
+    # Prefer int32 indices when possible to reduce sparse-graph memory use.
+    if n_nodes <= int(np.iinfo(np.int32).max):
+        idx_dtype = xp.int32
+    else:
+        idx_dtype = xp.int64
+
+    u = u.astype(idx_dtype, copy=False)
+    v = v.astype(idx_dtype, copy=False)
+
+    # For directed=False, one stored direction per undirected edge is sufficient.
+    row = u
+    col = v
+    data = xp.ones(row.shape[0], dtype=xp.float32)
+
     if xp is np:
         from scipy.sparse import coo_matrix  # type: ignore
         from scipy.sparse.csgraph import connected_components  # type: ignore
     else:
         from cupyx.scipy.sparse import coo_matrix  # type: ignore
         from cupyx.scipy.sparse.csgraph import connected_components  # type: ignore
-
-    if int(u.size) == 0:
-        labels = xp.arange(n_nodes, dtype=xp.int64)
-        return int(n_nodes), labels
-
-    row = xp.concatenate((u, v))
-    col = xp.concatenate((v, u))
-    data = xp.ones(row.shape[0], dtype=xp.int8)
     graph = coo_matrix((data, (row, col)), shape=(n_nodes, n_nodes))
     n_comp, labels = connected_components(graph, directed=False, return_labels=True)
+    labels = labels.astype(xp.int64, copy=False)
     return int(n_comp), labels
 
 
 def _connected_components_from_edges_cugraph(u, v, n_nodes: int, *, xp):
     if xp is np:
         raise ValueError("cugraph connected components requires a CuPy/CUDA backend")
+    if int(u.size) == 0:
+        labels = xp.arange(n_nodes, dtype=xp.int64)
+        return int(n_nodes), labels
+
     mods = _try_import_cugraph()
     if mods is None:
         raise RuntimeError("cc_backend='cugraph' requested but cudf/cugraph are not installed")
     cudf, cugraph = mods
-    idx_dtype = xp.int32 if n_nodes <= int(np.iinfo(np.int32).max) else xp.int64
-    edges = cudf.DataFrame(
-        {
-            "src": xp.asnumpy(u.astype(idx_dtype, copy=False)),
-            "dst": xp.asnumpy(v.astype(idx_dtype, copy=False)),
-        }
-    )
+
+    if n_nodes <= int(np.iinfo(np.int32).max):
+        idx_dtype = xp.int32
+    else:
+        idx_dtype = xp.int64
+
+    u = u.astype(idx_dtype, copy=False)
+    v = v.astype(idx_dtype, copy=False)
+
+    edges = cudf.DataFrame({"src": u, "dst": v})
     graph = cugraph.Graph(directed=False)
     graph.from_cudf_edgelist(edges, source="src", destination="dst", renumber=False)
+    try:
+        graph.add_nodes_from(cudf.Series(xp.arange(n_nodes, dtype=idx_dtype)))
+    except Exception:
+        pass
+
     labels_df = cugraph.connected_components(graph, connection="weak")
-    labels_np = labels_df.sort_values("vertex")["labels"].to_numpy()
-    labels = xp.asarray(labels_np, dtype=xp.int64)
-    return int(labels_df["labels"].nunique()), labels
+    vertices = xp.asarray(labels_df["vertex"].values).astype(xp.int64, copy=False)
+    labels_found = xp.asarray(labels_df["labels"].values).astype(xp.int64, copy=False)
+
+    labels = xp.full(n_nodes, -1, dtype=xp.int64)
+    labels[vertices] = labels_found
+
+    missing = labels < 0
+    if bool(xp.any(missing)):
+        base = int(labels_found.max().item()) + 1 if int(labels_found.size) > 0 else 0
+        n_missing = int(missing.sum().item())
+        labels[missing] = xp.arange(base, base + n_missing, dtype=xp.int64)
+
+    n_comp = int(labels.max().item()) + 1 if n_nodes > 0 else 0
+    return int(n_comp), labels
 
 
 def fof6d_on_pool_graph(

@@ -1,6 +1,7 @@
 from pathlib import Path
 import importlib.util
 import sys
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -147,6 +148,19 @@ def test_tiny_batch_builder_respects_ancestor_exclusion():
     members = [set(task.node_id for task in batch.tasks) for batch in batches]
     assert {10, 11} not in members
     assert any(m == {10, 20} or m == {11, 20} for m in members)
+
+
+def test_preferred_cc_backend_prefers_cugraph_for_gpu_auto(monkeypatch):
+    import caesar.fof6d_graph as graph_pkg
+
+    monkeypatch.setattr(graph_pkg, "_try_import_cugraph", lambda: object())
+    assert subhalo_mod._preferred_cc_backend("auto", backend="cupy") == "cugraph"
+    assert subhalo_mod._preferred_cc_backend("auto", backend="gpu") == "cugraph"
+
+    monkeypatch.setattr(graph_pkg, "_try_import_cugraph", lambda: None)
+    assert subhalo_mod._preferred_cc_backend("auto", backend="cupy") == "gpu"
+    assert subhalo_mod._preferred_cc_backend("auto", backend="numpy") == "cpu"
+    assert subhalo_mod._preferred_cc_backend("cugraph", backend="cupy") == "cugraph"
 
 
 def test_batched_fof_returns_per_task_candidates_and_asserts_cross_task_components():
@@ -502,3 +516,84 @@ def test_stage3_manifest_roundtrip(tmp_path):
     assert payload["ahf_particles_file"] == "ahf_particles"
     assert payload["output_file"] == "out.hdf5"
     assert payload["final_shards"] == ["a.pkl", "b.pkl"]
+
+
+def test_stage3_property_payload_roundtrip():
+    from caesar.group import create_new_group
+
+    sim = SimpleNamespace()
+    sim.units = {
+        "mass": "Msun",
+        "length": "kpccm",
+        "velocity": "km/s",
+        "time": "yr",
+        "temperature": "K",
+    }
+    sim._kwargs = {}
+    sim.load_pot = True
+    sim.simulation = SimpleNamespace(
+        XH=0.76,
+        redshift=0.0,
+        omega_baryon=0.05,
+        omega_matter=0.3,
+        boxsize=SimpleNamespace(d=100.0),
+    )
+    sim.data_manager = SimpleNamespace(
+        ptypes=["gas", "star", "dm"],
+        blackholes=False,
+        pos=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float32),
+        vel=np.zeros((3, 3), dtype=np.float32),
+        mass=np.asarray([10.0, 5.0, 20.0], dtype=np.float32),
+        pot=np.zeros(3, dtype=np.float32),
+        ptype=np.asarray([0, 4, 1], dtype=np.int32),
+        glist=np.asarray([0], dtype=np.int64),
+        slist=np.asarray([1], dtype=np.int64),
+        dmlist=np.asarray([2], dtype=np.int64),
+        gnh=np.asarray([1.0], dtype=np.float32),
+        gsfr=np.asarray([0.0], dtype=np.float32),
+        gZ=np.asarray([0.01], dtype=np.float32),
+        gT=np.asarray([1.0e4], dtype=np.float32),
+        gfH2=np.asarray([0.2], dtype=np.float32),
+        gfHI=np.asarray([0.7], dtype=np.float32),
+        dustmass=np.asarray([0.0], dtype=np.float32),
+        sZ=np.asarray([0.02], dtype=np.float32),
+        age=np.asarray([1.0], dtype=np.float32),
+    )
+
+    halo = create_new_group(sim, "halo")
+    halo.AHF_haloID = 100
+    halo.global_indexes = np.asarray([0, 1, 2], dtype=np.int64)
+    halo.glist = np.asarray([0], dtype=np.int64)
+    halo.slist = np.asarray([0], dtype=np.int64)
+    halo.dmlist = np.asarray([0], dtype=np.int64)
+    halo.bhlist = np.asarray([], dtype=np.int64)
+    halo.galaxy_index_list = np.asarray([0], dtype=np.int32)
+
+    gal = create_new_group(sim, "galaxy")
+    gal.AHF_haloID = 101
+    gal.AHF_parent_haloID = 100
+    gal.AHF_top_haloID = 100
+    gal.AHF_depth = 1
+    gal.AHF_ancestor_haloIDs = np.asarray([100], dtype=np.int64)
+    gal.global_indexes = np.asarray([0, 1], dtype=np.int64)
+    gal.glist = np.asarray([0], dtype=np.int64)
+    gal.slist = np.asarray([0], dtype=np.int64)
+    gal.dmlist = np.asarray([], dtype=np.int64)
+    gal.bhlist = np.asarray([], dtype=np.int64)
+    gal.parent_halo_index = 0
+    gal._ahf_host_halo_index = 0
+    gal._merge_id = 7
+
+    sim.halo_list = [halo]
+    sim.galaxy_list = [gal]
+
+    payload = subhalo_mod._build_stage3_property_payload(sim, [halo])
+    local_sim = subhalo_mod._build_stage3_property_runtime(payload, nproc=2)
+
+    assert local_sim.nproc == 2
+    assert len(local_sim.halo_list) == 1
+    assert len(local_sim.galaxy_list) == 1
+    assert np.array_equal(local_sim.data_manager.glist, np.asarray([0], dtype=np.int64))
+    assert np.array_equal(local_sim.data_manager.slist, np.asarray([1], dtype=np.int64))
+    assert local_sim.galaxy_list[0].parent_halo_index == 0
+    assert local_sim._ds_type.has_property("gas", "fh2")
