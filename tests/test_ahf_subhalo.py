@@ -253,6 +253,116 @@ def test_candidate_serialization_roundtrip():
     assert np.array_equal(gal2.slist, np.array([1, 3], dtype=np.int32))
 
 
+def test_task_input_payload_and_stateless_task_fof():
+    sim = DummySim(
+        pos=[
+            [0.0, 0.0, 0.0],
+            [0.05, 0.0, 0.0],
+        ],
+        vel=np.zeros((2, 3), dtype=np.float64),
+    )
+    pid_maps = {"star": DummyLookup()}
+    membership_arrays = {10: np.asarray([[0, 4], [1, 4]], dtype=np.int64)}
+    task = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 2, 2)
+
+    task_payload = subhalo_mod._build_task_input_payload(
+        sim,
+        task=task,
+        membership_arrays=membership_arrays,
+        pid_maps_sel=pid_maps,
+        fof_nHlim=0.13,
+        fof_Tlim=1.0e5,
+        fof_use_sfr_gate=True,
+    )
+    assert task_payload is not None
+    out = subhalo_mod._fof_on_task_payload(
+        task_payload=task_payload,
+        min_stars=2,
+        fof_ll=0.1,
+        fof_vel_ll=1.0,
+        backend="numpy",
+        cc_backend="cpu",
+        max_pairs_per_batch=1000,
+    )
+    assert len(out) == 1
+    assert int(out[0]["AHF_haloID"]) == 10
+    assert np.array_equal(out[0]["slist"], np.array([0, 1], dtype=np.int32))
+
+
+def test_stateless_batch_fof_and_reconcile_root_payload():
+    task_parent = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 4, 4)
+    task_child = subhalo_mod.AHFSubhaloTask(11, 10, 10, 1, (10,), 2, 2)
+
+    batch_payload = {
+        "task_payloads": [
+            {
+                "task": subhalo_mod._serialize_task(task_parent),
+                "gas_sel": np.array([], dtype=np.int32),
+                "star_sel": np.array([0, 1], dtype=np.int32),
+                "bh_sel": np.array([], dtype=np.int32),
+                "dm_sel": np.array([], dtype=np.int32),
+                "ng": 0,
+                "ns": 2,
+                "nb": 0,
+                "eligible_pos": np.array([[0.0, 0.0, 0.0], [0.05, 0.0, 0.0]], dtype=np.float64),
+                "eligible_vel": np.zeros((2, 3), dtype=np.float64),
+            },
+            {
+                "task": subhalo_mod._serialize_task(task_child),
+                "gas_sel": np.array([], dtype=np.int32),
+                "star_sel": np.array([10, 11], dtype=np.int32),
+                "bh_sel": np.array([], dtype=np.int32),
+                "dm_sel": np.array([], dtype=np.int32),
+                "ng": 0,
+                "ns": 2,
+                "nb": 0,
+                "eligible_pos": np.array([[10.0, 0.0, 0.0], [10.05, 0.0, 0.0]], dtype=np.float64),
+                "eligible_vel": np.zeros((2, 3), dtype=np.float64),
+            },
+        ]
+    }
+    batch_out = subhalo_mod._fof_on_batch_payload(
+        batch_payload=batch_payload,
+        min_stars=2,
+        fof_ll=0.1,
+        fof_vel_ll=1.0,
+        backend="numpy",
+        cc_backend="cpu",
+        max_pairs_per_batch=1000,
+    )
+    assert len(batch_out[10]) == 1
+    assert len(batch_out[11]) == 1
+
+    root_out = subhalo_mod._reconcile_root_payload(
+        tasks=[task_parent, task_child],
+        initial_candidates_by_node={10: batch_out[10], 11: batch_out[11]},
+        task_payloads_by_node={
+            10: {
+                "task": subhalo_mod._serialize_task(task_parent),
+                "gas_sel": np.array([], dtype=np.int32),
+                "star_sel": np.array([10, 11], dtype=np.int32),
+                "bh_sel": np.array([], dtype=np.int32),
+                "dm_sel": np.array([], dtype=np.int32),
+                "ng": 0,
+                "ns": 2,
+                "nb": 0,
+                "eligible_pos": np.array([[0.0, 0.0, 0.0], [0.05, 0.0, 0.0]], dtype=np.float64),
+                "eligible_vel": np.zeros((2, 3), dtype=np.float64),
+            },
+            11: batch_payload["task_payloads"][1],
+        },
+        min_stars=2,
+        fof_ll=0.1,
+        fof_vel_ll=1.0,
+        backend="numpy",
+        cc_backend="cpu",
+        max_pairs_per_batch=1000,
+    )
+    assert len(root_out) == 1
+    assert int(root_out[0]["AHF_haloID"]) == 11
+    assert np.array_equal(root_out[0]["slist"], np.array([10, 11], dtype=np.int32))
+
+
 def test_stage1_batch_classification_prefers_gpu_for_large_regular_tasks():
     t_small = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 64, 1000)
     t_large = subhalo_mod.AHFSubhaloTask(20, 0, 20, 0, tuple(), 64, 100000)
@@ -337,3 +447,19 @@ def test_stage3_payload_helpers():
     assert halo_payload == [101, 202]
     assert len(gal_payload) == 1
     assert int(gal_payload[0]["_merge_id"]) == 3
+
+
+def test_stage3_manifest_roundtrip(tmp_path):
+    path = mpi_mod._write_stage3_manifest(
+        shard_root=tmp_path,
+        snapshot_file="snap.hdf5",
+        ahf_particles_file="ahf_particles",
+        output_file="out.hdf5",
+        final_shards=["a.pkl", "b.pkl"],
+    )
+    assert path.is_file()
+    payload = mpi_mod._load_stage3_manifest(tmp_path)
+    assert payload["snapshot_file"] == "snap.hdf5"
+    assert payload["ahf_particles_file"] == "ahf_particles"
+    assert payload["output_file"] == "out.hdf5"
+    assert payload["final_shards"] == ["a.pkl", "b.pkl"]

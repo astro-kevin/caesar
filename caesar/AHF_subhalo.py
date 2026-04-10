@@ -30,6 +30,30 @@ class AHFSubhaloBatch:
     estimated_cost: int = 0
 
 
+def _serialize_task(task: AHFSubhaloTask) -> Dict[str, int | Tuple[int, ...]]:
+    return {
+        "node_id": int(task.node_id),
+        "parent_id": int(task.parent_id),
+        "top_id": int(task.top_id),
+        "depth": int(task.depth),
+        "ancestors": tuple(int(v) for v in task.ancestors),
+        "star_count": int(task.star_count),
+        "fof_candidates": int(task.fof_candidates),
+    }
+
+
+def _deserialize_task(payload: Dict[str, int | Tuple[int, ...]]) -> AHFSubhaloTask:
+    return AHFSubhaloTask(
+        node_id=int(payload["node_id"]),
+        parent_id=int(payload["parent_id"]),
+        top_id=int(payload["top_id"]),
+        depth=int(payload["depth"]),
+        ancestors=tuple(int(v) for v in payload["ancestors"]),
+        star_count=int(payload["star_count"]),
+        fof_candidates=int(payload["fof_candidates"]),
+    )
+
+
 def _ancestor_chain(parent_of: Dict[int, int], node_id: int) -> Tuple[int, ...]:
     chain: List[int] = []
     cur = int(node_id)
@@ -262,6 +286,33 @@ def _build_candidate_group(
     return grp
 
 
+def _candidate_payload(
+    *,
+    task: AHFSubhaloTask,
+    star_sel: np.ndarray,
+    gas_sel: np.ndarray,
+    bh_sel: np.ndarray,
+    dm_sel: np.ndarray,
+    merge_id: Optional[int] = None,
+    ahf_host_halo_index: int = -1,
+) -> Dict[str, np.ndarray | int]:
+    payload: Dict[str, np.ndarray | int] = {
+        "AHF_haloID": int(task.node_id),
+        "AHF_parent_haloID": int(task.parent_id),
+        "AHF_top_haloID": int(task.top_id),
+        "AHF_depth": int(task.depth),
+        "AHF_ancestor_haloIDs": np.asarray(task.ancestors, dtype=np.int64),
+        "slist": np.asarray(star_sel, dtype=np.int32),
+        "glist": np.asarray(gas_sel, dtype=np.int32),
+        "bhlist": np.asarray(bh_sel, dtype=np.int32),
+        "dmlist": np.asarray(dm_sel, dtype=np.int32),
+        "_ahf_host_halo_index": int(ahf_host_halo_index),
+    }
+    if merge_id is not None:
+        payload["_merge_id"] = int(merge_id)
+    return payload
+
+
 def _serialize_candidate_group(gal) -> Dict[str, np.ndarray | int]:
     payload = {
         "AHF_haloID": int(getattr(gal, "AHF_haloID", -1)),
@@ -455,6 +506,108 @@ def _resolve_node_membership(
     return gas_sel_dense, star_sel, bh_sel, dm_sel
 
 
+def _build_task_input_payload(
+    sim,
+    *,
+    task: AHFSubhaloTask,
+    membership_arrays: Dict[int, np.ndarray],
+    pid_maps_sel,
+    fof_nHlim: float,
+    fof_Tlim: float,
+    fof_use_sfr_gate: bool,
+) -> Optional[Dict[str, object]]:
+    gas_sel_dense, star_sel, bh_sel, dm_sel = _resolve_node_membership(
+        node_id=int(task.node_id),
+        membership_arrays=membership_arrays,
+        pid_maps_sel=pid_maps_sel,
+        sim=sim,
+        fof_nHlim=float(fof_nHlim),
+        fof_Tlim=float(fof_Tlim),
+        fof_use_sfr_gate=bool(fof_use_sfr_gate),
+    )
+
+    gas_concat = sim.data_manager.selected_to_concat("gas", np.asarray(gas_sel_dense, dtype=np.int64))
+    star_concat = sim.data_manager.selected_to_concat("star", np.asarray(star_sel, dtype=np.int64))
+    if bh_sel.size > 0:
+        bh_concat = sim.data_manager.selected_to_concat("bh", np.asarray(bh_sel, dtype=np.int64))
+    else:
+        bh_concat = np.empty(0, dtype=np.int64)
+
+    eligible_concat = np.concatenate((gas_concat, star_concat, bh_concat), axis=None).astype(np.int64, copy=False)
+    if eligible_concat.size == 0:
+        return None
+
+    return {
+        "task": _serialize_task(task),
+        "gas_sel": np.asarray(gas_sel_dense, dtype=np.int32),
+        "star_sel": np.asarray(star_sel, dtype=np.int32),
+        "bh_sel": np.asarray(bh_sel, dtype=np.int32),
+        "dm_sel": np.asarray(dm_sel, dtype=np.int32),
+        "ng": int(gas_sel_dense.size),
+        "ns": int(star_sel.size),
+        "nb": int(bh_sel.size),
+        "eligible_pos": np.asarray(sim.data_manager.pos[eligible_concat]),
+        "eligible_vel": np.asarray(sim.data_manager.vel[eligible_concat]),
+    }
+
+
+def _task_pool_from_payload(
+    task_payload: Dict[str, object],
+    *,
+    blocked_star_idx: Optional[np.ndarray] = None,
+) -> Optional[Dict[str, object]]:
+    task = _deserialize_task(task_payload["task"])
+    gas_sel = np.asarray(task_payload["gas_sel"], dtype=np.int32)
+    star_sel = np.asarray(task_payload["star_sel"], dtype=np.int32)
+    bh_sel = np.asarray(task_payload["bh_sel"], dtype=np.int32)
+    dm_sel = np.asarray(task_payload["dm_sel"], dtype=np.int32)
+    pos = np.asarray(task_payload["eligible_pos"])
+    vel = np.asarray(task_payload["eligible_vel"])
+    ng = int(task_payload["ng"])
+    ns = int(task_payload["ns"])
+    nb = int(task_payload["nb"])
+
+    gas_pos = pos[:ng]
+    gas_vel = vel[:ng]
+    star_pos = pos[ng:ng + ns]
+    star_vel = vel[ng:ng + ns]
+    bh_pos = pos[ng + ns:ng + ns + nb]
+    bh_vel = vel[ng + ns:ng + ns + nb]
+
+    if blocked_star_idx is not None and np.asarray(blocked_star_idx).size > 0 and star_sel.size > 0:
+        keep = ~np.isin(star_sel.astype(np.int64, copy=False), np.asarray(blocked_star_idx, dtype=np.int64))
+        star_sel = star_sel[keep]
+        star_pos = star_pos[keep]
+        star_vel = star_vel[keep]
+
+    out_pos_blocks = []
+    out_vel_blocks = []
+    if gas_pos.size > 0:
+        out_pos_blocks.append(gas_pos)
+        out_vel_blocks.append(gas_vel)
+    if star_pos.size > 0:
+        out_pos_blocks.append(star_pos)
+        out_vel_blocks.append(star_vel)
+    if bh_pos.size > 0:
+        out_pos_blocks.append(bh_pos)
+        out_vel_blocks.append(bh_vel)
+    if not out_pos_blocks:
+        return None
+
+    return {
+        "task": task,
+        "gas_sel": gas_sel,
+        "star_sel": star_sel,
+        "bh_sel": bh_sel,
+        "dm_sel": dm_sel,
+        "ng": int(gas_sel.size),
+        "ns": int(star_sel.size),
+        "nb": int(bh_sel.size),
+        "eligible_pos": np.concatenate(out_pos_blocks, axis=0),
+        "eligible_vel": np.concatenate(out_vel_blocks, axis=0),
+    }
+
+
 def _fof_for_task(
     sim,
     *,
@@ -540,6 +693,91 @@ def _fof_for_task(
             dm_sel=dm_sel if allow_dm else np.empty(0, dtype=np.int32),
         )
         out.append(grp)
+    return out
+
+
+def _fof_on_task_payload(
+    *,
+    task_payload: Dict[str, object],
+    min_stars: int,
+    fof_ll: float,
+    fof_vel_ll: Optional[float],
+    backend: str,
+    cc_backend: str,
+    max_pairs_per_batch: int,
+    blocked_star_idx: Optional[np.ndarray] = None,
+    device_id: Optional[int] = None,
+) -> List[Dict[str, np.ndarray | int]]:
+    from caesar.fof6d_graph import fof6d_on_pool_graph
+
+    resolved_backend = str(backend).lower()
+    if resolved_backend == "cpu":
+        resolved_backend = "numpy"
+    elif resolved_backend == "gpu":
+        resolved_backend = "cupy"
+
+    if resolved_backend == "cupy" and device_id is not None:
+        from caesar.fof6d_graph import _try_import_cupy
+
+        cp = _try_import_cupy()
+        if cp is None:
+            raise RuntimeError("GPU payload task requested but CuPy/CUDA is unavailable")
+        cp.cuda.Device(int(device_id)).use()
+
+    pool = _task_pool_from_payload(task_payload, blocked_star_idx=blocked_star_idx)
+    if pool is None:
+        return []
+
+    task = pool["task"]
+    gas_sel = np.asarray(pool["gas_sel"], dtype=np.int32)
+    star_sel = np.asarray(pool["star_sel"], dtype=np.int32)
+    bh_sel = np.asarray(pool["bh_sel"], dtype=np.int32)
+    dm_sel = np.asarray(pool["dm_sel"], dtype=np.int32)
+    eligible_pos = np.asarray(pool["eligible_pos"])
+    eligible_vel = np.asarray(pool["eligible_vel"])
+    ng = int(pool["ng"])
+    ns = int(pool["ns"])
+    nb = int(pool["nb"])
+
+    if int(star_sel.size) < int(min_stars) or eligible_pos.shape[0] < int(min_stars):
+        return []
+
+    tags, _ = fof6d_on_pool_graph(
+        eligible_pos,
+        eligible_vel,
+        fof_ll=float(fof_ll),
+        vel_ll=fof_vel_ll,
+        mingrp=int(min_stars),
+        periodic=False,
+        kernel="caesar_table",
+        backend=resolved_backend,
+        cc_backend="auto" if cc_backend == "auto" else cc_backend,
+        max_pairs_per_batch=int(max_pairs_per_batch),
+    )
+
+    tags = np.asarray(tags, dtype=np.int64)
+    valid_tags = np.unique(tags[tags >= 0])
+    if valid_tags.size == 0:
+        return []
+
+    allow_dm = bool(valid_tags.size == 1)
+    out: List[Dict[str, np.ndarray | int]] = []
+    for gid in valid_tags:
+        mask = tags == int(gid)
+        gsub = gas_sel[mask[:ng]] if ng > 0 else np.empty(0, dtype=np.int32)
+        ssub = star_sel[mask[ng:ng + ns]] if ns > 0 else np.empty(0, dtype=np.int32)
+        bsub = bh_sel[mask[ng + ns:ng + ns + nb]] if nb > 0 else np.empty(0, dtype=np.int32)
+        if int(ssub.size) < int(min_stars):
+            continue
+        out.append(
+            _candidate_payload(
+                task=task,
+                star_sel=ssub,
+                gas_sel=gsub,
+                bh_sel=bsub,
+                dm_sel=dm_sel if allow_dm else np.empty(0, dtype=np.int32),
+            )
+        )
     return out
 
 
@@ -701,6 +939,144 @@ def _fof_for_batch(
     return out
 
 
+def _fof_on_batch_payload(
+    *,
+    batch_payload: Dict[str, object],
+    min_stars: int,
+    fof_ll: float,
+    fof_vel_ll: Optional[float],
+    backend: str,
+    cc_backend: str,
+    max_pairs_per_batch: int,
+    device_id: Optional[int] = None,
+) -> Dict[int, List[Dict[str, np.ndarray | int]]]:
+    from caesar.fof6d_graph import fof6d_on_pool_graph
+
+    resolved_backend = str(backend).lower()
+    if resolved_backend == "cpu":
+        resolved_backend = "numpy"
+    elif resolved_backend == "gpu":
+        resolved_backend = "cupy"
+
+    if resolved_backend == "cupy" and device_id is not None:
+        from caesar.fof6d_graph import _try_import_cupy
+
+        cp = _try_import_cupy()
+        if cp is None:
+            raise RuntimeError("GPU payload batch requested but CuPy/CUDA is unavailable")
+        cp.cuda.Device(int(device_id)).use()
+
+    task_payloads = list(batch_payload.get("task_payloads", []))
+    out: Dict[int, List[Dict[str, np.ndarray | int]]] = {}
+    entry_data = []
+    concat_pos_blocks = []
+    concat_vel_blocks = []
+    owner_blocks = []
+
+    for owner_idx, task_payload in enumerate(task_payloads):
+        pool = _task_pool_from_payload(task_payload)
+        task = pool["task"] if pool is not None else _deserialize_task(task_payload["task"])
+        out[int(task.node_id)] = []
+        if pool is None:
+            continue
+        star_sel = np.asarray(pool["star_sel"], dtype=np.int32)
+        eligible_pos = np.asarray(pool["eligible_pos"])
+        eligible_vel = np.asarray(pool["eligible_vel"])
+        if int(star_sel.size) < int(min_stars) or eligible_pos.shape[0] < int(min_stars):
+            continue
+
+        entry = {
+            "task": task,
+            "gas_sel": np.asarray(pool["gas_sel"], dtype=np.int32),
+            "star_sel": star_sel,
+            "bh_sel": np.asarray(pool["bh_sel"], dtype=np.int32),
+            "dm_sel": np.asarray(pool["dm_sel"], dtype=np.int32),
+            "ng": int(pool["ng"]),
+            "ns": int(pool["ns"]),
+            "nb": int(pool["nb"]),
+            "offset": int(sum(block.shape[0] for block in concat_pos_blocks)),
+            "size": int(eligible_pos.shape[0]),
+            "owner_idx": int(owner_idx),
+        }
+        entry_data.append(entry)
+        concat_pos_blocks.append(eligible_pos)
+        concat_vel_blocks.append(eligible_vel)
+        owner_blocks.append(np.full(int(eligible_pos.shape[0]), int(owner_idx), dtype=np.int32))
+
+    if not concat_pos_blocks:
+        return out
+
+    combined_pos = np.concatenate(concat_pos_blocks, axis=0)
+    combined_vel = np.concatenate(concat_vel_blocks, axis=0)
+    combined_owner = np.concatenate(owner_blocks, axis=0)
+
+    tags, _ = fof6d_on_pool_graph(
+        combined_pos,
+        combined_vel,
+        fof_ll=float(fof_ll),
+        vel_ll=fof_vel_ll,
+        mingrp=int(min_stars),
+        periodic=False,
+        kernel="caesar_table",
+        backend=resolved_backend,
+        cc_backend="auto" if cc_backend == "auto" else cc_backend,
+        max_pairs_per_batch=int(max_pairs_per_batch),
+    )
+    tags = np.asarray(tags, dtype=np.int64)
+    valid_tags = np.unique(tags[tags >= 0])
+    if valid_tags.size == 0:
+        return out
+
+    comps_by_owner: Dict[int, List[int]] = {}
+    for comp in valid_tags:
+        comp_mask = tags == int(comp)
+        owners = np.unique(combined_owner[comp_mask])
+        if owners.size != 1:
+            comp_task_ids = [int(_deserialize_task(task_payloads[int(i)]["task"]).node_id) for i in owners.tolist()]
+            raise AssertionError(
+                "AHF-subhalo invariant violated: graph component spans multiple batched halos "
+                f"{comp_task_ids}"
+            )
+        owner_idx = int(owners[0])
+        comps_by_owner.setdefault(owner_idx, []).append(int(comp))
+
+    for entry in entry_data:
+        owner_idx = int(entry["owner_idx"])
+        comps = comps_by_owner.get(owner_idx, [])
+        if not comps:
+            continue
+        offset = int(entry["offset"])
+        size = int(entry["size"])
+        ng = int(entry["ng"])
+        ns = int(entry["ns"])
+        nb = int(entry["nb"])
+        task = entry["task"]
+        gas_sel = np.asarray(entry["gas_sel"], dtype=np.int32)
+        star_sel = np.asarray(entry["star_sel"], dtype=np.int32)
+        bh_sel = np.asarray(entry["bh_sel"], dtype=np.int32)
+        dm_sel = np.asarray(entry["dm_sel"], dtype=np.int32)
+        allow_dm = len(comps) == 1
+
+        local_tags = tags[offset:offset + size]
+        for comp in comps:
+            local_mask = local_tags == int(comp)
+            gsub = gas_sel[local_mask[:ng]] if ng > 0 else np.empty(0, dtype=np.int32)
+            ssub = star_sel[local_mask[ng:ng + ns]] if ns > 0 else np.empty(0, dtype=np.int32)
+            bsub = bh_sel[local_mask[ng + ns:ng + ns + nb]] if nb > 0 else np.empty(0, dtype=np.int32)
+            if int(ssub.size) < int(min_stars):
+                continue
+            out[int(task.node_id)].append(
+                _candidate_payload(
+                    task=task,
+                    star_sel=ssub,
+                    gas_sel=gsub,
+                    bh_sel=bsub,
+                    dm_sel=dm_sel if allow_dm else np.empty(0, dtype=np.int32),
+                )
+            )
+    return out
+
+
 def _assign_batches_to_resources(
     *,
     tiny_batches: Sequence[AHFSubhaloBatch],
@@ -806,6 +1182,58 @@ def _reconcile_root(
         node_claimed = np.asarray(descendant_claimed, dtype=np.int64)
         for gal in node_candidates:
             node_claimed = _array_union(node_claimed, np.asarray(gal.slist, dtype=np.int64))
+            final_candidates.append(gal)
+
+        parent_id = int(task.parent_id)
+        if parent_id > 0 and node_claimed.size > 0:
+            carry_claimed[parent_id] = _array_union(
+                np.asarray(carry_claimed.get(parent_id, np.empty(0, dtype=np.int64)), dtype=np.int64),
+                node_claimed,
+            )
+
+    return final_candidates
+
+
+def _reconcile_root_payload(
+    *,
+    tasks: Sequence[AHFSubhaloTask],
+    initial_candidates_by_node: Dict[int, List[Dict[str, np.ndarray | int]]],
+    task_payloads_by_node: Dict[int, Dict[str, object]],
+    min_stars: int,
+    fof_ll: float,
+    fof_vel_ll: Optional[float],
+    backend: str,
+    cc_backend: str,
+    max_pairs_per_batch: int,
+    device_id: Optional[int] = None,
+) -> List[Dict[str, np.ndarray | int]]:
+    tasks_desc = sorted(tasks, key=lambda t: (int(t.depth), int(t.node_id)), reverse=True)
+    carry_claimed: Dict[int, np.ndarray] = {}
+    final_candidates: List[Dict[str, np.ndarray | int]] = []
+
+    for task in tasks_desc:
+        descendant_claimed = np.asarray(
+            carry_claimed.pop(int(task.node_id), np.empty(0, dtype=np.int64)),
+            dtype=np.int64,
+        )
+        if descendant_claimed.size == 0:
+            node_candidates = list(initial_candidates_by_node.get(int(task.node_id), []))
+        else:
+            node_candidates = _fof_on_task_payload(
+                task_payload=task_payloads_by_node[int(task.node_id)],
+                min_stars=int(min_stars),
+                fof_ll=float(fof_ll),
+                fof_vel_ll=fof_vel_ll,
+                backend=backend,
+                cc_backend=cc_backend,
+                max_pairs_per_batch=int(max_pairs_per_batch),
+                blocked_star_idx=descendant_claimed,
+                device_id=device_id,
+            )
+
+        node_claimed = np.asarray(descendant_claimed, dtype=np.int64)
+        for gal in node_candidates:
+            node_claimed = _array_union(node_claimed, np.asarray(gal["slist"], dtype=np.int64))
             final_candidates.append(gal)
 
         parent_id = int(task.parent_id)
