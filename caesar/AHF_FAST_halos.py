@@ -16,7 +16,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 import numpy as np
 
 
-def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
+def build_halos_from_ahf_fast(sim, ahf_particles_file: str, *, compute_properties: bool = True):
     """Populate ``sim.halo_list`` from AHF for the AHF-FAST path.
 
     Halos are built from *top-level* AHF hosts (hostID == 0) by mapping
@@ -269,21 +269,23 @@ def build_halos_from_ahf_fast(sim, ahf_particles_file: str):
         mylog.warning("AHF-FAST: no valid halos found; aborting member search")
         return None
 
-    get_group_properties(halos, sim.halo_list)
+    halo_masses = {}
+    if compute_properties:
+        get_group_properties(halos, sim.halo_list)
 
-    computed_hydrogen, halo_masses = _populate_hydrogen_masses(sim, sim.halo_list)
-
-    if not computed_hydrogen:
-        mylog.info("HI/H2 fractions unavailable; running hydrogen_mass_calc() for halos")
-        import caesar.hydrogen_mass_calc as hydrogen_mass_calc
-
-        hydrogen_mass_calc.hydrogen_mass_calc(sim)
         computed_hydrogen, halo_masses = _populate_hydrogen_masses(sim, sim.halo_list)
+
         if not computed_hydrogen:
-            mylog.warning(
-                "hydrogen_mass_calc() did not produce HI/H2 masses; setting to zero (check snapshot)"
-            )
-            halo_masses = {}
+            mylog.info("HI/H2 fractions unavailable; running hydrogen_mass_calc() for halos")
+            import caesar.hydrogen_mass_calc as hydrogen_mass_calc
+
+            hydrogen_mass_calc.hydrogen_mass_calc(sim)
+            computed_hydrogen, halo_masses = _populate_hydrogen_masses(sim, sim.halo_list)
+            if not computed_hydrogen:
+                mylog.warning(
+                    "hydrogen_mass_calc() did not produce HI/H2 masses; setting to zero (check snapshot)"
+                )
+                halo_masses = {}
 
     setattr(sim, "_ahf_halo_hydrogen_masses", halo_masses)
 
