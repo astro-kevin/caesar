@@ -288,6 +288,8 @@ def save(obj, filename='test.hdf5'):
 
         # gather
         index_lists = ['glist', 'slist','cloud_index_list']
+        if hasattr(obj.galaxies[0], 'AHF_ancestor_haloIDs'):
+            index_lists.append('AHF_ancestor_haloIDs')
         if obj.data_manager.blackholes:
             index_lists.append('bhlist')
         if obj.data_manager.dust:

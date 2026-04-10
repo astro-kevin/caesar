@@ -337,6 +337,10 @@ class CAESAR(object):
                 from caesar import AHF_FAST
 
                 AHF_FAST.run(self)
+            case Mode.AHF_SUBHALO:
+                from caesar import AHF_subhalo
+
+                AHF_subhalo.run(self)
             case Mode.AHF:
                 from caesar import AHF
 

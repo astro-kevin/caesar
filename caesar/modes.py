@@ -16,6 +16,7 @@ class Mode(Enum):
     FOF_SNAP = "fof_snap"
     AHF = "ahf"
     AHF_FAST = "ahf_fast"
+    AHF_SUBHALO = "ahf_subhalo"
 
 
 def resolve_mode(kwargs: Dict[str, Any]) -> Mode:
@@ -43,6 +44,8 @@ def resolve_mode(kwargs: Dict[str, Any]) -> Mode:
                 return Mode.AHF
             if flag == "AHF-FAST":
                 return Mode.AHF_FAST
+            if flag == "AHF-SUBHALO":
+                return Mode.AHF_SUBHALO
 
     # For 'fof', 'snap', None, or anything else we fall back to the
     # standard FOF/SNAP-driven pipeline.

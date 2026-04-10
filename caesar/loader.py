@@ -205,6 +205,7 @@ class CAESAR:
         self._galaxy_glist = LazyDataset(self, 'galaxy_data/lists/glist')
         self._galaxy_bhlist = LazyDataset(self, 'galaxy_data/lists/bhlist')
         self._galaxy_dlist = LazyDataset(self, 'galaxy_data/lists/dlist')
+        self._galaxy_AHF_ancestor_haloIDs = None
 
         self._cloud_glist = LazyDataset(self, 'cloud_data/lists/glist')
         self._cloud_dlist = LazyDataset(self, 'cloud_data/lists/dlist')
@@ -295,6 +296,10 @@ class CAESAR:
                 self.galaxies = LazyList(self.ngalaxies,
                                          lambda i: Galaxy(self, i))
                 mylog.info('Found {} galaxies'.format(len(self.galaxies)))
+                if 'galaxy_data/lists/AHF_ancestor_haloIDs' in hd:
+                    self._galaxy_AHF_ancestor_haloIDs = LazyDataset(
+                        self, 'galaxy_data/lists/AHF_ancestor_haloIDs'
+                    )
 
             self._cloud_data = {}
             self._cloud_dicts = defaultdict(dict)
@@ -622,6 +627,13 @@ class Galaxy(Group):
     def cloud_index_list(self):
         return self.obj._cloud_index_list[self.cloud_index_list_start:self.
                                           cloud_index_list_end]
+
+    @property
+    def AHF_ancestor_haloIDs(self):
+        data = getattr(self.obj, '_galaxy_AHF_ancestor_haloIDs', None)
+        if data is None:
+            return np.empty(0, dtype=np.int64)
+        return data[self.AHF_ancestor_haloIDs_start:self.AHF_ancestor_haloIDs_end]
 
     def _init_clouds(self):
         self._clouds = []
