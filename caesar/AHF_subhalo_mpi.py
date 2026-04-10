@@ -342,6 +342,7 @@ def _rank0_init_runtime(snapshot_file: str, ahf_particles_file: str, *, nproc: i
     ds = yt.load(snapshot_file)
     sim = caesar.CAESAR(ds)
     sim.nproc = int(nproc)
+    sim.load_haloid = False
     build_halos_from_ahf_fast(sim, ahf_particles_file, compute_properties=False)
     pid_maps_sel = _build_selected_pid_maps(sim)
     fof_mis = float(_get_mean_interparticle_separation(sim).d)
