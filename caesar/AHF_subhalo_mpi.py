@@ -95,19 +95,49 @@ def _local_rank() -> int:
     return 0
 
 
-def _worker_capability(rank: int, *, role: str, threads: int, comm) -> WorkerCapability:
+def _gpu_device_for_rank(
+    *,
+    rank: int,
+    role: str,
+    world_layout: Sequence[Dict[str, object]],
+) -> Optional[int]:
+    if str(role) != "gpu_worker":
+        return None
+    devices = _available_gpu_device_ids()
+    if not devices:
+        return None
+
+    mine = next((entry for entry in world_layout if int(entry["rank"]) == int(rank)), None)
+    if mine is None:
+        return None
+    hostname = str(mine["hostname"])
+    gpu_workers = [
+        entry
+        for entry in world_layout
+        if str(entry["role"]) == "gpu_worker" and str(entry["hostname"]) == hostname
+    ]
+    gpu_workers.sort(key=lambda entry: (int(entry["local_rank"]), int(entry["rank"])))
+    gpu_index = next(
+        (idx for idx, entry in enumerate(gpu_workers) if int(entry["rank"]) == int(rank)),
+        None,
+    )
+    if gpu_index is None:
+        return None
+    if 0 <= int(gpu_index) < len(devices):
+        return int(devices[int(gpu_index)])
+    return None
+
+
+def _worker_capability(
+    rank: int,
+    *,
+    role: str,
+    threads: int,
+    world_layout: Sequence[Dict[str, object]],
+) -> WorkerCapability:
     hostname = os.uname().nodename
     local_rank = _local_rank()
-    gpu_device = None
-    if str(role) == "gpu_worker":
-        devices = _available_gpu_device_ids()
-        try:
-            node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED, key=rank)
-            gpu_index = int(node_comm.Get_rank())
-        except Exception:
-            gpu_index = int(local_rank)
-        if 0 <= gpu_index < len(devices):
-            gpu_device = int(devices[gpu_index])
+    gpu_device = _gpu_device_for_rank(rank=rank, role=role, world_layout=world_layout)
     return WorkerCapability(
         rank=int(rank),
         role=str(role),
@@ -756,6 +786,15 @@ def run_mpi(
         else:
             effective_role = "prop_worker"
 
+    world_layout = comm.allgather(
+        {
+            "rank": int(rank),
+            "role": str(effective_role),
+            "hostname": os.uname().nodename,
+            "local_rank": int(_local_rank()),
+        }
+    )
+
     shard_root = Path(shard_dir) if shard_dir else Path(tempfile.mkdtemp(prefix="ahf_subhalo_mpi_"))
     if int(rank) == int(coordinator_rank):
         shard_root.mkdir(parents=True, exist_ok=True)
@@ -867,7 +906,12 @@ def run_mpi(
             )
             return
 
-        cap = _worker_capability(rank, role=effective_role, threads=int(nproc), comm=comm)
+        cap = _worker_capability(
+            rank,
+            role=effective_role,
+            threads=int(nproc),
+            world_layout=world_layout,
+        )
         comm.send(cap.__dict__, dest=coordinator_rank, tag=MSG_REGISTER)
 
         while True:
@@ -919,7 +963,12 @@ def run_mpi(
         _stop_workers(comm, worker_caps=worker_caps)
         return
 
-    cap = _worker_capability(rank, role=effective_role, threads=int(nproc), comm=comm)
+    cap = _worker_capability(
+        rank,
+        role=effective_role,
+        threads=int(nproc),
+        world_layout=world_layout,
+    )
     comm.send(cap.__dict__, dest=coordinator_rank, tag=MSG_REGISTER)
     sim = _property_worker_init_runtime(snapshot_file, ahf_particles_file, nproc=int(cap.threads))
 

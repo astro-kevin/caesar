@@ -375,6 +375,21 @@ def test_stage1_batch_classification_prefers_gpu_for_large_regular_tasks():
     assert any(int(item.tasks[0].node_id) == 10 for item in cpu_items)
 
 
+def test_gpu_device_assignment_uses_gpu_worker_order_within_host(monkeypatch):
+    monkeypatch.setattr(mpi_mod, "_available_gpu_device_ids", lambda: [0, 1, 2, 3])
+    layout = [
+        {"rank": 0, "role": "coordinator", "hostname": "nodeA", "local_rank": 0},
+        {"rank": 1, "role": "gpu_worker", "hostname": "nodeA", "local_rank": 1},
+        {"rank": 2, "role": "gpu_worker", "hostname": "nodeA", "local_rank": 2},
+        {"rank": 3, "role": "cpu_worker", "hostname": "nodeA", "local_rank": 3},
+        {"rank": 4, "role": "gpu_worker", "hostname": "nodeA", "local_rank": 4},
+    ]
+    assert mpi_mod._gpu_device_for_rank(rank=1, role="gpu_worker", world_layout=layout) == 0
+    assert mpi_mod._gpu_device_for_rank(rank=2, role="gpu_worker", world_layout=layout) == 1
+    assert mpi_mod._gpu_device_for_rank(rank=4, role="gpu_worker", world_layout=layout) == 2
+    assert mpi_mod._gpu_device_for_rank(rank=3, role="cpu_worker", world_layout=layout) is None
+
+
 def test_stage1_shard_payload_serializes_node_candidates():
     sim = DummySim(pos=np.zeros((4, 3)), vel=np.zeros((4, 3)))
     task = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 4, 10)
