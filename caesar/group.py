@@ -841,8 +841,21 @@ def create_new_group(obj, group_type):
 ''' New group functions from Romeel's rewrite April 2020 '''
 
 def get_group_properties(self,grp_list):
+    from caesar.group_funcs_loader import load_group_funcs
 
-    from caesar.group_funcs import get_group_overall_properties,get_group_gas_properties,get_group_star_properties,get_group_bh_properties,get_group_dust_properties
+    (
+        get_group_overall_properties,
+        get_group_gas_properties,
+        get_group_star_properties,
+        get_group_bh_properties,
+        get_group_dust_properties,
+    ) = load_group_funcs(
+        'get_group_overall_properties',
+        'get_group_gas_properties',
+        'get_group_star_properties',
+        'get_group_bh_properties',
+        'get_group_dust_properties',
+    )
 
     get_group_overall_properties(self,grp_list)
     if 'gas' in self.obj.data_manager.ptypes: get_group_gas_properties(self,grp_list)

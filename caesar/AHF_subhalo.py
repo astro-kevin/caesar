@@ -440,17 +440,28 @@ def _concat_unique_index_arrays(values: Iterable[np.ndarray]) -> np.ndarray:
 
 
 class _ShardYTUnitHelper:
+    def __init__(self, *, redshift: float = 0.0):
+        self.scale_factor = 1.0 / (1.0 + max(float(redshift), 0.0))
+        from unyt import unyt_quantity
+        from unyt.dimensions import length
+        from unyt.unit_registry import UnitRegistry
+
+        self.registry = UnitRegistry()
+        for symbol, base_unit in (("pccm", "pc"), ("kpccm", "kpc"), ("Mpccm", "Mpc")):
+            base_value = float((unyt_quantity(1.0, base_unit) * self.scale_factor).to("cm").value)
+            self.registry.add(symbol, base_value, length, tex_repr=f"\\rm{{{symbol}}}")
+
     def quan(self, value, unit):
         from unyt import unyt_quantity
 
-        u = "dimensionless" if unit in (None, "") else unit
-        return unyt_quantity(value, u)
+        u = "dimensionless" if unit in (None, "") else str(unit)
+        return unyt_quantity(value, u, registry=self.registry)
 
     def arr(self, value, unit):
         from unyt import unyt_array
 
-        u = "dimensionless" if unit in (None, "") else unit
-        return unyt_array(value, u)
+        u = "dimensionless" if unit in (None, "") else str(unit)
+        return unyt_array(value, u, registry=self.registry)
 
 
 class _ShardDatasetType:
@@ -507,6 +518,20 @@ def _serialize_stage3_group_input(group, *, galaxy_index_map: Optional[Dict[int,
 def _build_stage3_property_payload(sim, halos: Sequence) -> Dict[str, object]:
     halos = list(halos)
     halo_index_map = {int(getattr(halo, "AHF_haloID", -1)): int(i) for i, halo in enumerate(halos)}
+
+    def _scalar(value, default=0.0):
+        raw = getattr(value, "d", value)
+        try:
+            return float(raw)
+        except Exception:
+            return float(default)
+
+    def _vector(value, default):
+        raw = getattr(value, "d", value)
+        try:
+            return np.asarray(raw, dtype=np.float64)
+        except Exception:
+            return np.asarray(default, dtype=np.float64)
 
     galaxy_list = []
     seen_galaxy_index = set()
@@ -619,9 +644,20 @@ def _build_stage3_property_payload(sim, halos: Sequence) -> Dict[str, object]:
         "redshift": float(getattr(sim.simulation, "redshift", 0.0)),
         "omega_baryon": float(getattr(sim.simulation, "omega_baryon", 0.0)),
         "omega_matter": float(getattr(sim.simulation, "omega_matter", 0.0)),
+        "omega_lambda": float(getattr(sim.simulation, "omega_lambda", 0.0)),
+        "Om_z": float(getattr(sim.simulation, "Om_z", getattr(sim.simulation, "omega_matter", 0.0))),
         "boxsize": float(boxsize_val),
+        "critical_density": _scalar(getattr(sim.simulation, "critical_density", 0.0)),
+        "G": _scalar(getattr(sim.simulation, "G", 4.51691362044e-39)),
+        "H_z": _scalar(getattr(sim.simulation, "H_z", 0.0)),
+        "Densities": _vector(
+            getattr(sim.simulation, "Densities", np.asarray([0.0, 0.0, 0.0], dtype=np.float64)),
+            [0.0, 0.0, 0.0],
+        ),
         "ngas": int(gas_ids.size),
         "nstar": int(star_ids.size),
+        "nbh": int(bh_ids.size),
+        "ndust": int(dust_ids.size),
         "ntot": int(global_ids.size),
     }
 
@@ -639,26 +675,42 @@ def _build_stage3_property_payload(sim, halos: Sequence) -> Dict[str, object]:
 
 
 def _build_stage3_property_runtime(payload: Dict[str, object], *, nproc: int):
+    from caesar.main import CAESAR
     from caesar.group import create_new_group
 
-    sim = SimpleNamespace()
+    sim = CAESAR()
     sim._kwargs = dict(payload.get("kwargs", {}))
-    sim.units = dict(payload.get("units", {}))
+    sim.units = dict(payload.get("units", sim.units))
     sim.load_pot = bool(payload.get("load_pot", True))
     sim.nproc = int(max(1, nproc))
-    sim.yt_dataset = _ShardYTUnitHelper()
 
     sim_payload = dict(payload.get("simulation", {}))
-    sim.simulation = SimpleNamespace(
-        XH=float(sim_payload.get("XH", 0.76)),
-        redshift=float(sim_payload.get("redshift", 0.0)),
-        omega_baryon=float(sim_payload.get("omega_baryon", 0.0)),
-        omega_matter=float(sim_payload.get("omega_matter", 0.0)),
-        boxsize=SimpleNamespace(d=float(sim_payload.get("boxsize", 0.0))),
-        ngas=int(sim_payload.get("ngas", 0)),
-        nstar=int(sim_payload.get("nstar", 0)),
-        ntot=int(sim_payload.get("ntot", 0)),
+    sim._ds = _ShardYTUnitHelper(redshift=float(sim_payload.get("redshift", 0.0)))
+    sim.simulation.XH = float(sim_payload.get("XH", 0.76))
+    sim.simulation.redshift = float(sim_payload.get("redshift", 0.0))
+    sim.simulation.omega_baryon = float(sim_payload.get("omega_baryon", 0.0))
+    sim.simulation.omega_matter = float(sim_payload.get("omega_matter", 0.0))
+    sim.simulation.omega_lambda = float(sim_payload.get("omega_lambda", 0.0))
+    sim.simulation.Om_z = float(sim_payload.get("Om_z", sim.simulation.omega_matter))
+    sim.simulation.boxsize = sim.yt_dataset.quan(float(sim_payload.get("boxsize", 0.0)), sim.units["length"])
+    sim.simulation.critical_density = sim.yt_dataset.quan(
+        float(sim_payload.get("critical_density", 0.0)),
+        "Msun/kpc**3",
     )
+    sim.simulation.G = sim.yt_dataset.quan(
+        float(sim_payload.get("G", 4.51691362044e-39)),
+        "kpc**3/(Msun * s**2)",
+    )
+    sim.simulation.H_z = sim.yt_dataset.quan(float(sim_payload.get("H_z", 0.0)), "1/s")
+    sim.simulation.Densities = sim.yt_dataset.arr(
+        np.asarray(sim_payload.get("Densities", [0.0, 0.0, 0.0]), dtype=np.float64),
+        "Msun/kpc**3",
+    )
+    sim.simulation.ngas = int(sim_payload.get("ngas", 0))
+    sim.simulation.nstar = int(sim_payload.get("nstar", 0))
+    sim.simulation.nbh = int(sim_payload.get("nbh", 0))
+    sim.simulation.ndust = int(sim_payload.get("ndust", 0))
+    sim.simulation.ntot = int(sim_payload.get("ntot", 0))
 
     dm_payload = dict(payload.get("data_manager", {}))
     dm = SimpleNamespace()
@@ -666,8 +718,9 @@ def _build_stage3_property_runtime(payload: Dict[str, object], *, nproc: int):
     dm.blackholes = bool(payload.get("blackholes", False))
     for key, value in dm_payload.items():
         setattr(dm, key, np.asarray(value))
-    sim.data_manager = dm
+    sim._dm = dm
     sim._ds_type = _ShardDatasetType(ptypes=dm.ptypes, data_manager_attrs=set(dm_payload.keys()))
+    sim.group_types = ["halo", "galaxy"]
 
     halo_list = []
     for rec in payload.get("halos", []):
@@ -721,14 +774,22 @@ def _compute_group_properties_subset(sim, *, group_type: str, groups: Sequence) 
     if not groups:
         return
 
-    from caesar.group_funcs import (
+    from caesar.group import has_property
+    from caesar.group_funcs_loader import load_group_funcs
+
+    (
         get_group_bh_properties,
         get_group_dust_properties,
         get_group_gas_properties,
         get_group_overall_properties,
         get_group_star_properties,
+    ) = load_group_funcs(
+        "get_group_bh_properties",
+        "get_group_dust_properties",
+        "get_group_gas_properties",
+        "get_group_overall_properties",
+        "get_group_star_properties",
     )
-    from caesar.group import has_property
 
     class _Ctx:
         def __init__(self, sim, group_type, groups):

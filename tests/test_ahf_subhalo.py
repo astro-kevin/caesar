@@ -25,6 +25,7 @@ saver_mod = _load_module("saver_subhalo_mod", "saver.py")
 loader_mod = _load_module("loader_subhalo_mod", "loader.py")
 modes_mod = _load_module("modes_subhalo_mod", "modes.py")
 mpi_mod = _load_module("ahf_subhalo_mpi_mod", "AHF_subhalo_mpi.py")
+group_loader_mod = _load_module("group_funcs_loader_mod", "group_funcs_loader.py")
 
 
 class DummyGalaxy:
@@ -589,6 +590,116 @@ def test_dispatch_stage_bundles_cpu_items_by_rank_threads(monkeypatch):
     assert sent_payloads[1]["item"]["payload_path"] == "cpu_2.pkl"
 
 
+def test_dispatch_stage_honors_thread_and_role_overrides(monkeypatch):
+    sent_payloads = []
+
+    class DummyStatus:
+        def __init__(self):
+            self._source = -1
+
+        def Get_source(self):
+            return self._source
+
+    class FakeComm:
+        def __init__(self):
+            self.inflight = []
+
+        def send(self, payload, dest, tag):
+            if tag == mpi_mod.MSG_WORK:
+                sent_payloads.append(payload)
+                self.inflight.append((int(dest), payload))
+
+        def iprobe(self, source=None, tag=None):
+            return bool(self.inflight)
+
+        def recv(self, source=None, tag=None, status=None):
+            rank, payload = self.inflight.pop(0)
+            status._source = int(rank)
+            item = payload["item"]
+            return {"stage": payload["stage"], "completed_count": int(item.get("completed_count", 1))}
+
+    monkeypatch.setattr(mpi_mod, "MPI", SimpleNamespace(Status=DummyStatus, ANY_SOURCE=-1))
+    monkeypatch.setattr(mpi_mod, "_rank0_log", lambda _msg: None)
+    monkeypatch.setattr(mpi_mod.time, "sleep", lambda _seconds: None)
+
+    cpu_items = [{"payload_path": f"cpu_{idx}.pkl"} for idx in range(4)]
+    mpi_mod._dispatch_stage(
+        FakeComm(),
+        worker_caps=[mpi_mod.WorkerCapability(rank=1, role="gpu_worker", hostname="nodeA", local_rank=0, gpu_device=0, threads=2)],
+        regular_queue=[],
+        small_queue=cpu_items,
+        stage_name="stage2",
+        regular_total=0,
+        small_total=4,
+        worker_threads={1: 3},
+        worker_roles={1: "cpu_worker"},
+    )
+
+    assert len(sent_payloads) == 2
+    assert len(sent_payloads[0]["item"]["items"]) == 3
+    assert sent_payloads[0]["item"]["nproc"] == 3
+    assert sent_payloads[1]["item"]["payload_path"] == "cpu_3.pkl"
+
+
+def test_uniform_stage_thread_map_uses_all_worker_cores():
+    worker_caps = [
+        mpi_mod.WorkerCapability(rank=1, role="gpu_worker", hostname="nodeA", local_rank=1, gpu_device=0, threads=2),
+        mpi_mod.WorkerCapability(rank=2, role="gpu_worker", hostname="nodeA", local_rank=2, gpu_device=1, threads=2),
+        mpi_mod.WorkerCapability(rank=3, role="gpu_worker", hostname="nodeA", local_rank=3, gpu_device=2, threads=2),
+        mpi_mod.WorkerCapability(rank=4, role="gpu_worker", hostname="nodeA", local_rank=4, gpu_device=3, threads=2),
+        mpi_mod.WorkerCapability(rank=5, role="cpu_worker", hostname="nodeA", local_rank=5, gpu_device=None, threads=4),
+        mpi_mod.WorkerCapability(rank=6, role="cpu_worker", hostname="nodeA", local_rank=6, gpu_device=None, threads=4),
+        mpi_mod.WorkerCapability(rank=7, role="cpu_worker", hostname="nodeA", local_rank=7, gpu_device=None, threads=4),
+        mpi_mod.WorkerCapability(rank=8, role="cpu_worker", hostname="nodeA", local_rank=8, gpu_device=None, threads=4),
+        mpi_mod.WorkerCapability(rank=9, role="cpu_worker", hostname="nodeA", local_rank=9, gpu_device=None, threads=4),
+    ]
+    world_layout = [{"rank": 0, "hostname": "nodeA", "visible_cores": 32}]
+    world_layout.extend(
+        {"rank": int(cap.rank), "hostname": "nodeA", "visible_cores": 32} for cap in worker_caps
+    )
+
+    thread_map = mpi_mod._build_uniform_stage_thread_map(
+        worker_caps=worker_caps,
+        world_layout=world_layout,
+        coordinator_rank=0,
+    )
+
+    vals = [int(thread_map[int(cap.rank)]) for cap in worker_caps]
+    assert sum(vals) == 31
+    assert min(vals) == 3
+    assert max(vals) == 4
+
+
+def test_stage1_thread_map_preserves_gpu_support_threads():
+    worker_caps = [
+        mpi_mod.WorkerCapability(rank=1, role="gpu_worker", hostname="nodeA", local_rank=1, gpu_device=0, threads=2),
+        mpi_mod.WorkerCapability(rank=2, role="gpu_worker", hostname="nodeA", local_rank=2, gpu_device=1, threads=2),
+        mpi_mod.WorkerCapability(rank=3, role="gpu_worker", hostname="nodeA", local_rank=3, gpu_device=2, threads=2),
+        mpi_mod.WorkerCapability(rank=4, role="gpu_worker", hostname="nodeA", local_rank=4, gpu_device=3, threads=2),
+        mpi_mod.WorkerCapability(rank=5, role="cpu_worker", hostname="nodeA", local_rank=5, gpu_device=None, threads=4),
+        mpi_mod.WorkerCapability(rank=6, role="cpu_worker", hostname="nodeA", local_rank=6, gpu_device=None, threads=4),
+        mpi_mod.WorkerCapability(rank=7, role="cpu_worker", hostname="nodeA", local_rank=7, gpu_device=None, threads=4),
+        mpi_mod.WorkerCapability(rank=8, role="cpu_worker", hostname="nodeA", local_rank=8, gpu_device=None, threads=4),
+        mpi_mod.WorkerCapability(rank=9, role="cpu_worker", hostname="nodeA", local_rank=9, gpu_device=None, threads=4),
+    ]
+    world_layout = [{"rank": 0, "hostname": "nodeA", "visible_cores": 32}]
+    world_layout.extend(
+        {"rank": int(cap.rank), "hostname": "nodeA", "visible_cores": 32} for cap in worker_caps
+    )
+
+    thread_map = mpi_mod._build_stage1_thread_map(
+        worker_caps=worker_caps,
+        world_layout=world_layout,
+        coordinator_rank=0,
+    )
+
+    gpu_vals = [int(thread_map[int(cap.rank)]) for cap in worker_caps if cap.gpu_device is not None]
+    cpu_vals = [int(thread_map[int(cap.rank)]) for cap in worker_caps if cap.gpu_device is None]
+    assert gpu_vals == [2, 2, 2, 2]
+    assert sum(cpu_vals) == 23
+    assert sum(gpu_vals) + sum(cpu_vals) == 31
+
+
 def test_worker_run_stage1_bundles_multiple_items(tmp_path):
     task_a = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 2, 2)
     task_b = subhalo_mod.AHFSubhaloTask(20, 0, 20, 0, tuple(), 2, 2)
@@ -840,3 +951,17 @@ def test_stage3_property_payload_roundtrip():
     assert np.array_equal(local_sim.data_manager.slist, np.asarray([1], dtype=np.int64))
     assert local_sim.galaxy_list[0].parent_halo_index == 0
     assert local_sim._ds_type.has_property("gas", "fh2")
+    subhalo_mod._compute_group_properties_subset(local_sim, group_type="halo", groups=list(local_sim.halo_list))
+    subhalo_mod._compute_group_properties_subset(local_sim, group_type="galaxy", groups=list(local_sim.galaxy_list))
+    assert local_sim.halo_list[0].masses["total"].value > 0.0
+    assert local_sim.galaxy_list[0].masses["stellar"].value > 0.0
+
+
+def test_group_funcs_loader_falls_back_to_local_extension(monkeypatch):
+    monkeypatch.setitem(sys.modules, "caesar.group_funcs", SimpleNamespace())
+    funcs = group_loader_mod.load_group_funcs(
+        "get_group_overall_properties",
+        "get_group_bh_properties",
+    )
+    assert len(funcs) == 2
+    assert all(callable(func) for func in funcs)

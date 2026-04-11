@@ -68,6 +68,7 @@ class WorkerCapability:
     local_rank: int
     gpu_device: Optional[int]
     threads: int
+    visible_cores: int = 0
 
 
 @dataclass
@@ -268,6 +269,26 @@ def _local_rank() -> int:
     return 0
 
 
+def _parse_first_int(raw: Optional[str]) -> Optional[int]:
+    if raw in (None, ""):
+        return None
+    try:
+        return int(str(raw).split(",")[0].split("(")[0].strip())
+    except Exception:
+        return None
+
+
+def _local_visible_cores() -> int:
+    for key in ("SLURM_CPUS_ON_NODE", "SLURM_CPUS_PER_TASK", "SLURM_JOB_CPUS_PER_NODE"):
+        parsed = _parse_first_int(os.environ.get(key))
+        if parsed is not None and parsed > 0:
+            return int(parsed)
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except Exception:
+        return max(1, os.cpu_count() or 1)
+
+
 def _gpu_device_for_rank(
     *,
     rank: int,
@@ -318,7 +339,103 @@ def _worker_capability(
         local_rank=int(local_rank),
         gpu_device=gpu_device,
         threads=int(max(1, threads)),
+        visible_cores=int(_local_visible_cores()),
     )
+
+
+def _distribute_even_threads(ranks: Sequence[int], total_threads: int) -> Dict[int, int]:
+    ordered = [int(rank) for rank in ranks]
+    if not ordered:
+        return {}
+    total_threads = max(int(total_threads), len(ordered))
+    base = int(total_threads) // len(ordered)
+    remainder = int(total_threads) % len(ordered)
+    out: Dict[int, int] = {}
+    for idx, rank in enumerate(sorted(ordered)):
+        out[int(rank)] = int(base + (1 if idx < remainder else 0))
+    return out
+
+
+def _host_core_budgets(
+    *,
+    world_layout: Sequence[Dict[str, object]],
+    coordinator_rank: int,
+    coordinator_reserve: int = 1,
+) -> Dict[str, int]:
+    host_cores: Dict[str, int] = {}
+    for entry in world_layout:
+        host = str(entry["hostname"])
+        host_cores[host] = max(host_cores.get(host, 0), int(entry.get("visible_cores", 0) or 0))
+
+    coord_host = next(
+        (str(entry["hostname"]) for entry in world_layout if int(entry["rank"]) == int(coordinator_rank)),
+        None,
+    )
+    if coord_host is not None:
+        host_cores[coord_host] = max(1, int(host_cores.get(coord_host, 1)) - int(max(0, coordinator_reserve)))
+    return host_cores
+
+
+def _build_stage1_thread_map(
+    *,
+    worker_caps: Sequence[WorkerCapability],
+    world_layout: Sequence[Dict[str, object]],
+    coordinator_rank: int,
+) -> Dict[int, int]:
+    host_budgets = _host_core_budgets(world_layout=world_layout, coordinator_rank=coordinator_rank)
+    out: Dict[int, int] = {}
+    caps_by_host: Dict[str, List[WorkerCapability]] = {}
+    for cap in worker_caps:
+        caps_by_host.setdefault(str(cap.hostname), []).append(cap)
+
+    for host, caps in caps_by_host.items():
+        gpu_caps = [cap for cap in caps if cap.gpu_device is not None]
+        cpu_caps = [cap for cap in caps if cap.gpu_device is None]
+
+        gpu_threads = 0
+        for cap in gpu_caps:
+            nthreads = max(1, int(cap.threads))
+            out[int(cap.rank)] = nthreads
+            gpu_threads += nthreads
+
+        remaining = max(0, int(host_budgets.get(host, len(cpu_caps))) - gpu_threads)
+        if cpu_caps:
+            if remaining < len(cpu_caps):
+                remaining = len(cpu_caps)
+            out.update(_distribute_even_threads([cap.rank for cap in cpu_caps], remaining))
+    return out
+
+
+def _build_uniform_stage_thread_map(
+    *,
+    worker_caps: Sequence[WorkerCapability],
+    world_layout: Sequence[Dict[str, object]],
+    coordinator_rank: int,
+) -> Dict[int, int]:
+    host_budgets = _host_core_budgets(world_layout=world_layout, coordinator_rank=coordinator_rank)
+    out: Dict[int, int] = {}
+    caps_by_host: Dict[str, List[WorkerCapability]] = {}
+    for cap in worker_caps:
+        caps_by_host.setdefault(str(cap.hostname), []).append(cap)
+
+    for host, caps in caps_by_host.items():
+        budget = max(len(caps), int(host_budgets.get(host, len(caps))))
+        out.update(_distribute_even_threads([cap.rank for cap in caps], budget))
+    return out
+
+
+def _log_thread_map(stage_name: str, worker_caps: Sequence[WorkerCapability], thread_map: Dict[int, int]) -> None:
+    if not thread_map:
+        return
+    threads = [int(thread_map.get(int(cap.rank), 1)) for cap in worker_caps]
+    gpu_threads = [int(thread_map.get(int(cap.rank), 1)) for cap in worker_caps if cap.gpu_device is not None]
+    cpu_threads = [int(thread_map.get(int(cap.rank), 1)) for cap in worker_caps if cap.gpu_device is None]
+    parts = [f"workers={len(threads)}", f"threads_total={sum(threads)}", f"min={min(threads)}", f"max={max(threads)}"]
+    if gpu_threads:
+        parts.append(f"gpu_threads_total={sum(gpu_threads)}")
+    if cpu_threads:
+        parts.append(f"cpu_threads_total={sum(cpu_threads)}")
+    _rank0_log(f"{stage_name}: thread budget " + ", ".join(parts))
 
 
 def _dump_pickle(path: Path, payload) -> None:
@@ -443,7 +560,7 @@ def _classify_stage2_roots(
         )
     ]
     if gpu_worker_count <= 0:
-        return [], list(reversed(ordered_roots))
+        return ordered_roots, []
     return ordered_roots, []
 
 
@@ -458,10 +575,10 @@ def _stage_queue(source, *, total: Optional[int] = None) -> _StageQueue:
     return _StageQueue(items=list(source), total=int(resolved_total))
 
 
-def _cpu_local_workers(cap: WorkerCapability, *, stage_name: str) -> int:
+def _cpu_local_workers(cap: WorkerCapability, *, stage_name: str, threads: Optional[int] = None) -> int:
     if str(cap.role) != "cpu_worker" or str(stage_name) not in {"stage1", "stage2"}:
-        return 1
-    default = max(1, int(cap.threads))
+        return max(1, int(threads if threads is not None else cap.threads))
+    default = max(1, int(threads if threads is not None else cap.threads))
     configured = max(
         1,
         _env_int(f"CAESAR_AHF_SUBHALO_MPI_{str(stage_name).upper()}_LOCAL_WORKERS", default),
@@ -520,6 +637,8 @@ def _dispatch_stage(
     prepare_small=None,
     regular_total: Optional[int] = None,
     small_total: Optional[int] = None,
+    worker_threads: Optional[Dict[int, int]] = None,
+    worker_roles: Optional[Dict[int, str]] = None,
 ):
     regular_state = _stage_queue(regular_queue, total=regular_total)
     small_state = _stage_queue(small_queue, total=small_total)
@@ -532,8 +651,16 @@ def _dispatch_stage(
     start_time = time.monotonic()
     last_status = start_time
     last_completion_log = 0
-    has_gpu_workers = any(str(cap.role) == "gpu_worker" for cap in worker_caps)
-    has_cpu_workers = any(str(cap.role) == "cpu_worker" for cap in worker_caps)
+    role_for = {
+        int(cap.rank): str(worker_roles.get(int(cap.rank), cap.role) if worker_roles is not None else cap.role)
+        for cap in worker_caps
+    }
+    threads_for = {
+        int(cap.rank): max(1, int(worker_threads.get(int(cap.rank), cap.threads) if worker_threads is not None else cap.threads))
+        for cap in worker_caps
+    }
+    has_gpu_workers = any(str(role_for.get(int(cap.rank), cap.role)) == "gpu_worker" for cap in worker_caps)
+    has_cpu_workers = any(str(role_for.get(int(cap.rank), cap.role)) == "cpu_worker" for cap in worker_caps)
 
     def log_progress(prefix: str) -> None:
         elapsed = time.monotonic() - start_time
@@ -550,7 +677,9 @@ def _dispatch_stage(
     def assign_next(rank: int, cap: WorkerCapability):
         nonlocal active
         item = None
-        if cap.role == "gpu_worker" and cap.gpu_device is not None:
+        stage_role = str(role_for.get(int(rank), cap.role))
+        stage_threads = int(threads_for.get(int(rank), cap.threads))
+        if stage_role == "gpu_worker" and cap.gpu_device is not None:
             raw = regular_state.next_front()
             if raw is not None:
                 item = prepare_regular(raw, cap=cap, direction="front") if prepare_regular else raw
@@ -558,23 +687,28 @@ def _dispatch_stage(
                 raw = small_state.next_front()
                 if raw is not None:
                     item = prepare_small(raw, cap=cap, direction="small") if prepare_small else raw
-        elif cap.role == "cpu_worker":
+        elif stage_role == "cpu_worker":
             item = _take_cpu_bundle(
                 small_queue=small_state,
                 regular_queue=regular_state,
-                max_items=_cpu_local_workers(cap, stage_name=stage_name),
+                max_items=_cpu_local_workers(cap, stage_name=stage_name, threads=stage_threads),
                 cap=cap,
                 prepare_small=prepare_small or (lambda raw, **_: raw),
                 prepare_regular=prepare_regular or (lambda raw, **_: raw),
                 use_regular_back=bool(has_gpu_workers),
             )
-        elif cap.role == "prop_worker":
+        elif stage_role == "prop_worker":
             raw = small_state.next_front()
             if raw is not None:
                 item = prepare_small(raw, cap=cap, direction="small") if prepare_small else raw
 
         if item is None:
             return False
+
+        if isinstance(item, dict):
+            item = dict(item)
+            item["nproc"] = int(stage_threads)
+            item["worker_role"] = str(stage_role)
 
         payload = {"type": "work", "stage": stage_name, "item": item}
         comm.send(payload, dest=rank, tag=MSG_WORK)
@@ -653,19 +787,36 @@ def _rank0_prepare_stage12(
     shard_root: Path,
     nproc: int,
     min_stars: Optional[int],
+    log_fn=None,
+    log_label: str = "stage1",
 ):
+    start_time = time.monotonic()
+    if log_fn is not None:
+        log_fn(f"{log_label}: loading snapshot and initializing CAESAR runtime")
     sim, pid_maps_sel, fof_ll, fof_vel_ll = _rank0_init_runtime(
         snapshot_file,
         ahf_particles_file,
         nproc=int(nproc),
     )
+    if log_fn is not None:
+        log_fn(
+            f"{log_label}: runtime ready; halos={len(getattr(sim, 'halo_list', []))}, "
+            f"elapsed={time.monotonic() - start_time:.1f}s"
+        )
     membership_arrays = getattr(sim, "_ahf_fast_memberships")
     ms = get_min_stars(sim, override=min_stars)
+    if log_fn is not None:
+        log_fn(f"{log_label}: building task manifest from AHF hierarchy")
     tasks, tasks_by_root, _, _ = _prepare_manifest(
         ahf_particles_file=ahf_particles_file,
         node_ndm=_build_node_dm_counts(membership_arrays),
         min_stars=int(ms),
     )
+    if log_fn is not None:
+        log_fn(
+            f"{log_label}: task manifest ready; tasks={len(tasks)}, roots={len(tasks_by_root)}, "
+            f"elapsed={time.monotonic() - start_time:.1f}s"
+        )
 
     root_limit = max(0, _env_int("CAESAR_AHF_SUBHALO_ROOT_LIMIT", 0))
     task_limit = max(0, _env_int("CAESAR_AHF_SUBHALO_TASK_LIMIT", 0))
@@ -688,7 +839,13 @@ def _rank0_prepare_stage12(
 
     task_payloads_by_node: Dict[int, Dict[str, object]] = {}
     filtered_tasks: List[AHFSubhaloTask] = []
-    for task in tasks:
+    progress_every = max(1, _env_int("CAESAR_AHF_SUBHALO_MPI_PREP_PROGRESS_EVERY", 1000))
+    progress_seconds = max(5.0, _env_float("CAESAR_AHF_SUBHALO_MPI_PREP_PROGRESS_SECONDS", 60.0))
+    last_status = time.monotonic()
+    dropped_tasks = 0
+    if log_fn is not None:
+        log_fn(f"{log_label}: building per-node stage1 payloads for {len(tasks)} tasks")
+    for idx, task in enumerate(tasks, start=1):
         payload = _build_task_input_payload(
             sim,
             task=task,
@@ -699,9 +856,24 @@ def _rank0_prepare_stage12(
             fof_use_sfr_gate=bool(fof_use_sfr_gate),
         )
         if payload is None or int(np.asarray(payload["star_sel"]).size) < int(ms):
-            continue
-        task_payloads_by_node[int(task.node_id)] = payload
-        filtered_tasks.append(task)
+            dropped_tasks += 1
+        else:
+            task_payloads_by_node[int(task.node_id)] = payload
+            filtered_tasks.append(task)
+        now = time.monotonic()
+        if (
+            log_fn is not None
+            and (
+                idx == len(tasks)
+                or idx % progress_every == 0
+                or now - last_status >= progress_seconds
+            )
+        ):
+            log_fn(
+                f"{log_label}: payload prep {idx}/{len(tasks)}; kept={len(filtered_tasks)}, "
+                f"dropped={dropped_tasks}, elapsed={now - start_time:.1f}s"
+            )
+            last_status = now
 
     filtered_ids = {int(task.node_id) for task in filtered_tasks}
     tasks = filtered_tasks
@@ -749,9 +921,16 @@ def _write_stage2_root_payloads(
     shard_root: Path,
     tasks_by_root: Dict[int, List[AHFSubhaloTask]],
     task_payloads_by_node: Dict[int, Dict[str, object]],
+    log_fn=None,
+    progress_label: str = "stage2",
 ) -> Dict[int, str]:
     root_payload_paths: Dict[int, str] = {}
-    for root_id, root_tasks in tasks_by_root.items():
+    total_roots = len(tasks_by_root)
+    progress_every = max(1, _env_int("CAESAR_AHF_SUBHALO_MPI_PREP_PROGRESS_EVERY", 1000))
+    progress_seconds = max(5.0, _env_float("CAESAR_AHF_SUBHALO_MPI_PREP_PROGRESS_SECONDS", 60.0))
+    start_time = time.monotonic()
+    last_status = start_time
+    for idx, (root_id, root_tasks) in enumerate(tasks_by_root.items(), start=1):
         payload_path = shard_root / f"stage2_input_root{int(root_id)}.pkl"
         payload = {
             "root_id": int(root_id),
@@ -763,6 +942,20 @@ def _write_stage2_root_payloads(
         }
         _dump_pickle(payload_path, payload)
         root_payload_paths[int(root_id)] = str(payload_path)
+        now = time.monotonic()
+        if (
+            log_fn is not None
+            and (
+                idx == total_roots
+                or idx % progress_every == 0
+                or now - last_status >= progress_seconds
+            )
+        ):
+            log_fn(
+                f"{progress_label}: wrote root payloads {idx}/{total_roots}; "
+                f"elapsed={now - start_time:.1f}s"
+            )
+            last_status = now
     return root_payload_paths
 
 
@@ -775,6 +968,7 @@ def _worker_run_stage1(
     shard_dir: Path,
     nproc: int = 1,
 ) -> Dict:
+    nproc = int(item.get("nproc", nproc))
     items = list(item.get("items", [item]))
     fof_use_sfr_gate = os.environ.get("CAESAR_AHF_FAST_FOF_USE_SFR", "1") == "1"
     cc_backend = _env_str("CAESAR_AHF_SUBHALO_CC_BACKEND", "auto").lower()
@@ -841,6 +1035,7 @@ def _worker_run_stage2(
     shard_dir: Path,
     nproc: int = 1,
 ) -> Dict:
+    nproc = int(item.get("nproc", nproc))
     items = list(item.get("items", [item]))
     cc_backend = _env_str("CAESAR_AHF_SUBHALO_CC_BACKEND", "auto").lower()
     max_pairs_per_batch = max(1, _env_int("CAESAR_AHF_SUBHALO_MAX_PAIRS_PER_BATCH", 5_000_000))
@@ -927,12 +1122,34 @@ def _stage3_halo_work_payload(halos: Sequence) -> List[int]:
     return [int(getattr(halo, "AHF_haloID", -1)) for halo in halos]
 
 
+def _stage3_halo_cost(halo) -> int:
+    try:
+        return max(1, int(len(getattr(halo, "global_indexes", []))))
+    except Exception:
+        return 1
+
+
+def _build_stage3_batches(sim, worker_count: int) -> List[List]:
+    halos = list(getattr(sim, "halo_list", []))
+    if not halos:
+        return []
+    multiplier = max(1, _env_int("CAESAR_AHF_SUBHALO_STAGE3_BATCH_MULTIPLIER", 4))
+    target_batches = max(int(worker_count), int(worker_count) * int(multiplier))
+    bins = [{"cost": 0, "halos": []} for _ in range(max(1, target_batches))]
+    for halo in sorted(halos, key=_stage3_halo_cost, reverse=True):
+        slot = min(bins, key=lambda rec: int(rec["cost"]))
+        slot["halos"].append(halo)
+        slot["cost"] += int(_stage3_halo_cost(halo))
+    return [list(rec["halos"]) for rec in bins if rec["halos"]]
+
+
 def _worker_run_stage3(
     *,
     item: Dict,
     shard_dir: Path,
     nproc: int,
 ) -> Dict:
+    nproc = int(item.get("nproc", nproc))
     payload = _load_pickle(Path(item["payload_path"]))
     sim = _build_stage3_property_runtime(payload, nproc=int(nproc))
 
@@ -967,6 +1184,27 @@ def _build_caesar_runtime_from_loaded_ds(ds, *, nproc: int, snapshot_hash: Optio
     sim.nproc = int(nproc)
     sim.load_haloid = False
     sim._assign_simulation_attributes()
+    return sim
+
+
+def _rank0_prepare_final_sim_from_existing(
+    *,
+    sim,
+    pid_maps_sel,
+    ahf_particles_file: str,
+    final_shards: Sequence[str],
+):
+    final_galaxies = []
+    for path in final_shards:
+        payload = _load_pickle(Path(path))
+        final_galaxies.extend(_deserialize_candidate_group(sim, rec) for rec in payload)
+
+    _prepare_final_subhalo_galaxies(
+        sim,
+        ahf_particles_file=ahf_particles_file,
+        galaxy_list=final_galaxies,
+        pid_maps_sel=pid_maps_sel,
+    )
     return sim
 
 
@@ -1014,15 +1252,27 @@ def _rank0_run_stage3_and_save(
     nproc: int,
     shard_root: Path,
     snapshot_hash: Optional[str] = None,
+    sim=None,
+    pid_maps_sel=None,
+    worker_threads: Optional[Dict[int, int]] = None,
 ):
-    _rank0_log("stage3: rebuilding final reconciled catalogue")
-    sim = _rank0_build_final_sim(
-        snapshot_file=snapshot_file,
-        ahf_particles_file=ahf_particles_file,
-        final_shards=final_shards,
-        nproc=int(nproc),
-        snapshot_hash=snapshot_hash,
-    )
+    if sim is None or pid_maps_sel is None:
+        _rank0_log("stage3: rebuilding final reconciled catalogue")
+        sim = _rank0_build_final_sim(
+            snapshot_file=snapshot_file,
+            ahf_particles_file=ahf_particles_file,
+            final_shards=final_shards,
+            nproc=int(nproc),
+            snapshot_hash=snapshot_hash,
+        )
+    else:
+        _rank0_log("stage3: reusing in-memory coordinator runtime")
+        sim = _rank0_prepare_final_sim_from_existing(
+            sim=sim,
+            pid_maps_sel=pid_maps_sel,
+            ahf_particles_file=ahf_particles_file,
+            final_shards=final_shards,
+        )
 
     for idx, halo in enumerate(sim.halo_list):
         halo._merge_id = int(idx)
@@ -1030,7 +1280,7 @@ def _rank0_run_stage3_and_save(
         gal._merge_id = int(idx)
 
     stage3_cpu_items = []
-    halo_batches = [batch for batch in _split_even(list(sim.halo_list), len(worker_caps)) if batch]
+    halo_batches = _build_stage3_batches(sim, len(worker_caps))
     _rank0_log(
         f"stage3: prepared property batches count={len(halo_batches)} halos={len(sim.halo_list)} galaxies={len(sim.galaxy_list)}"
     )
@@ -1047,6 +1297,8 @@ def _rank0_run_stage3_and_save(
         stage_name="stage3",
         regular_total=0,
         small_total=len(stage3_cpu_items),
+        worker_threads=worker_threads,
+        worker_roles={int(cap.rank): "prop_worker" for cap in worker_caps},
     )
 
     halo_by_id = {int(getattr(halo, "AHF_haloID", -1)): halo for halo in sim.halo_list}
@@ -1165,7 +1417,7 @@ def run_mpi(
         raise RuntimeError("mpi4py is required for AHF-subhalo MPI execution")
 
     phase = str(phase)
-    if phase not in {"stage1", "stage2", "stage3", "stage12"}:
+    if phase not in {"stage1", "stage2", "stage3", "stage12", "pipeline"}:
         raise ValueError(f"Unsupported AHF-subhalo MPI phase: {phase}")
 
     comm = MPI.COMM_WORLD
@@ -1175,7 +1427,7 @@ def run_mpi(
         raise RuntimeError("AHF-subhalo MPI requires at least 2 ranks (1 coordinator + workers)")
 
     role = str(role)
-    if phase in {"stage1", "stage12"}:
+    if phase in {"stage1", "stage12", "pipeline"}:
         valid_roles = {"coordinator", "gpu_worker", "cpu_worker", "auto"}
     elif phase == "stage2":
         valid_roles = {"coordinator", "cpu_worker", "auto"}
@@ -1196,7 +1448,7 @@ def run_mpi(
     if role == "auto":
         if int(rank) == int(coordinator_rank):
             effective_role = "coordinator"
-        elif phase in {"stage1", "stage12"}:
+        elif phase in {"stage1", "stage12", "pipeline"}:
             effective_role = "gpu_worker" if _available_gpu_device_ids() else "cpu_worker"
         elif phase == "stage2":
             effective_role = "cpu_worker"
@@ -1209,6 +1461,7 @@ def run_mpi(
             "role": str(effective_role),
             "hostname": os.uname().nodename,
             "local_rank": int(_local_rank()),
+            "visible_cores": int(_local_visible_cores()),
         }
     )
 
@@ -1217,10 +1470,11 @@ def run_mpi(
         shard_root.mkdir(parents=True, exist_ok=True)
     shard_root = Path(comm.bcast(str(shard_root), root=coordinator_rank))
 
-    if phase in {"stage1", "stage12"}:
+    if phase in {"stage1", "stage12", "pipeline"}:
         if effective_role == "coordinator":
             stage_label = "stage12" if phase == "stage12" else "stage1"
-            _rank0_log(f"{stage_label}: coordinator starting on shard_root={shard_root}")
+            coordinator_label = "pipeline" if phase == "pipeline" else stage_label
+            _rank0_log(f"{coordinator_label}: coordinator starting on shard_root={shard_root}")
             worker_ranks = [i for i in range(size) if int(i) != int(coordinator_rank)]
             worker_caps = [comm.recv(source=i, tag=MSG_REGISTER) for i in worker_ranks]
             worker_caps = [WorkerCapability(**cap) if isinstance(cap, dict) else cap for cap in worker_caps]
@@ -1233,8 +1487,8 @@ def run_mpi(
 
             _rank0_log(f"{stage_label}: preparing runtime, task manifest, and per-node payloads")
             (
-                _sim,
-                _pid_maps_sel,
+                sim_runtime,
+                pid_maps_sel,
                 min_stars_val,
                 fof_ll,
                 fof_vel_ll,
@@ -1247,6 +1501,8 @@ def run_mpi(
                 shard_root=shard_root,
                 nproc=int(nproc),
                 min_stars=min_stars,
+                log_fn=_rank0_log,
+                log_label=stage_label,
             )
             _rank0_log(
                 f"{stage_label}: preparation complete "
@@ -1258,6 +1514,12 @@ def run_mpi(
                 gpu_worker_count=int(gpu_worker_count),
                 cpu_worker_count=int(cpu_worker_count),
             )
+            stage1_thread_map = _build_stage1_thread_map(
+                worker_caps=worker_caps,
+                world_layout=world_layout,
+                coordinator_rank=coordinator_rank,
+            )
+            _log_thread_map("stage1", worker_caps, stage1_thread_map)
             _rank0_log(
                 "stage1: classified batches "
                 f"regular={len(regular_batches)}, small={len(small_batches)}, total={len(regular_batches) + len(small_batches)}"
@@ -1308,9 +1570,9 @@ def run_mpi(
 
             buffer_scale = max(1, _env_int("CAESAR_AHF_SUBHALO_MPI_STAGE1_BUFFER_SCALE", 4))
             stage1_cpu_capacity = sum(
-                _cpu_local_workers(cap, stage_name="stage1")
+                _cpu_local_workers(cap, stage_name="stage1", threads=int(stage1_thread_map.get(int(cap.rank), cap.threads)))
                 for cap in worker_caps
-                if str(cap.role) == "cpu_worker"
+                if cap.gpu_device is None
             )
             stage1_regular_queue = _BufferedPreparedQueue(
                 specs=stage1_regular_specs,
@@ -1339,6 +1601,7 @@ def run_mpi(
                 prepare_small=_bind_stage1_item,
                 regular_total=len(stage1_regular_specs),
                 small_total=len(stage1_small_specs),
+                worker_threads=stage1_thread_map,
             )
 
             root_to_shards: Dict[int, List[str]] = {int(root): [] for root in tasks_by_root}
@@ -1355,6 +1618,8 @@ def run_mpi(
                 shard_root=shard_root,
                 tasks_by_root=tasks_by_root,
                 task_payloads_by_node=task_payloads_by_node,
+                log_fn=_rank0_log,
+                progress_label="stage2",
             )
             root_costs = {
                 int(root_id): int(sum(int(task.fof_candidates) for task in root_tasks))
@@ -1365,7 +1630,7 @@ def run_mpi(
                 snapshot_file=snapshot_file,
                 ahf_particles_file=ahf_particles_file,
                 output_file=output_file,
-                snapshot_hash=getattr(_sim, "hash", None),
+                snapshot_hash=getattr(sim_runtime, "hash", None),
                 fof_ll=float(fof_ll),
                 fof_vel_ll=fof_vel_ll,
                 min_stars=int(min_stars_val),
@@ -1379,24 +1644,39 @@ def run_mpi(
                 _stop_workers(comm, worker_caps=worker_caps)
                 return
 
-            stage2_regular_roots, stage2_small_roots = _classify_stage2_roots(
-                root_costs=root_costs,
-                gpu_worker_count=int(gpu_worker_count),
-                cpu_worker_count=int(cpu_worker_count),
-            )
+            if phase == "pipeline":
+                stage2_regular_roots = [
+                    int(root_id)
+                    for root_id, _cost in sorted(root_costs.items(), key=lambda kv: int(kv[1]), reverse=True)
+                ]
+                stage2_small_roots = []
+                stage2_thread_map = _build_uniform_stage_thread_map(
+                    worker_caps=worker_caps,
+                    world_layout=world_layout,
+                    coordinator_rank=coordinator_rank,
+                )
+                stage2_worker_roles = {int(cap.rank): "cpu_worker" for cap in worker_caps}
+            else:
+                stage2_regular_roots, stage2_small_roots = _classify_stage2_roots(
+                    root_costs=root_costs,
+                    gpu_worker_count=int(gpu_worker_count),
+                    cpu_worker_count=int(cpu_worker_count),
+                )
+                stage2_thread_map = {int(cap.rank): int(cap.threads) for cap in worker_caps}
+                stage2_worker_roles = {int(cap.rank): str(cap.role) for cap in worker_caps}
+            _log_thread_map("stage2", worker_caps, stage2_thread_map)
             _rank0_log(
                 "stage2: classified roots "
                 f"regular={len(stage2_regular_roots)}, small={len(stage2_small_roots)}, total={len(stage2_regular_roots) + len(stage2_small_roots)}"
             )
 
             def _prepare_stage2_root(root_id, *, cap, direction):
-                backend = "gpu" if str(cap.role) == "gpu_worker" else "cpu"
                 return {
                     "root_id": int(root_id),
                     "shard_paths": root_to_shards[int(root_id)],
                     "root_payload_path": root_payload_paths[int(root_id)],
-                    "backend": backend,
-                    "device_id": cap.gpu_device if backend == "gpu" else None,
+                    "backend": "cpu",
+                    "device_id": None,
                     "fof_ll": float(fof_ll),
                     "fof_vel_ll": fof_vel_ll,
                     "min_stars": int(min_stars_val),
@@ -1412,17 +1692,44 @@ def run_mpi(
                 prepare_small=_prepare_stage2_root,
                 regular_total=len(stage2_regular_roots),
                 small_total=len(stage2_small_roots),
+                worker_threads=stage2_thread_map,
+                worker_roles=stage2_worker_roles,
             )
-            _stop_workers(comm, worker_caps=worker_caps)
             final_shards = [str(result["shard_path"]) for result in stage2_results]
             _rank0_log(f"stage2: complete; final_shards={len(final_shards)}")
+
+            if phase == "pipeline":
+                stage3_thread_map = _build_uniform_stage_thread_map(
+                    worker_caps=worker_caps,
+                    world_layout=world_layout,
+                    coordinator_rank=coordinator_rank,
+                )
+                _log_thread_map("stage3", worker_caps, stage3_thread_map)
+                _rank0_run_stage3_and_save(
+                    comm,
+                    worker_caps=worker_caps,
+                    snapshot_file=snapshot_file,
+                    ahf_particles_file=ahf_particles_file,
+                    output_file=output_file,
+                    final_shards=final_shards,
+                    nproc=int(nproc),
+                    shard_root=shard_root,
+                    snapshot_hash=getattr(sim_runtime, "hash", None),
+                    sim=sim_runtime,
+                    pid_maps_sel=pid_maps_sel,
+                    worker_threads=stage3_thread_map,
+                )
+                _stop_workers(comm, worker_caps=worker_caps)
+                return
+
+            _stop_workers(comm, worker_caps=worker_caps)
             _write_stage3_manifest(
                 shard_root=shard_root,
                 snapshot_file=snapshot_file,
                 ahf_particles_file=ahf_particles_file,
                 output_file=output_file,
                 final_shards=final_shards,
-                snapshot_hash=getattr(_sim, "hash", None),
+                snapshot_hash=getattr(sim_runtime, "hash", None),
             )
             _rank0_log("stage12: wrote stage3 manifest")
             return
@@ -1463,6 +1770,12 @@ def run_mpi(
                     shard_dir=shard_root,
                     nproc=int(cap.threads),
                 )
+            elif stage == "stage3":
+                result = _worker_run_stage3(
+                    item=item,
+                    shard_dir=shard_root,
+                    nproc=int(cap.threads),
+                )
             else:
                 raise RuntimeError(f"Unknown MPI stage: {stage}")
 
@@ -1498,6 +1811,12 @@ def run_mpi(
                 gpu_worker_count=0,
                 cpu_worker_count=int(cpu_worker_count),
             )
+            stage2_thread_map = _build_uniform_stage_thread_map(
+                worker_caps=worker_caps,
+                world_layout=world_layout,
+                coordinator_rank=coordinator_rank,
+            )
+            _log_thread_map("stage2", worker_caps, stage2_thread_map)
             _rank0_log(
                 "stage2: classified roots "
                 f"regular={len(stage2_regular_roots)}, small={len(stage2_small_roots)}, total={len(stage2_regular_roots) + len(stage2_small_roots)}"
@@ -1525,6 +1844,8 @@ def run_mpi(
                 prepare_small=_prepare_stage2_root,
                 regular_total=len(stage2_regular_roots),
                 small_total=len(stage2_small_roots),
+                worker_threads=stage2_thread_map,
+                worker_roles={int(cap.rank): "cpu_worker" for cap in worker_caps},
             )
             _stop_workers(comm, worker_caps=worker_caps)
             final_shards = [str(result["shard_path"]) for result in stage2_results]
@@ -1574,6 +1895,12 @@ def run_mpi(
         worker_caps = [comm.recv(source=i, tag=MSG_REGISTER) for i in worker_ranks]
         worker_caps = [WorkerCapability(**cap) if isinstance(cap, dict) else cap for cap in worker_caps]
         manifest = _load_stage3_manifest(shard_root)
+        stage3_thread_map = _build_uniform_stage_thread_map(
+            worker_caps=worker_caps,
+            world_layout=world_layout,
+            coordinator_rank=coordinator_rank,
+        )
+        _log_thread_map("stage3", worker_caps, stage3_thread_map)
         _rank0_run_stage3_and_save(
             comm,
             worker_caps=worker_caps,
@@ -1584,6 +1911,7 @@ def run_mpi(
             nproc=int(nproc),
             shard_root=shard_root,
             snapshot_hash=manifest.get("snapshot_hash"),
+            worker_threads=stage3_thread_map,
         )
         _stop_workers(comm, worker_caps=worker_caps)
         return
@@ -1617,9 +1945,9 @@ def main():
     parser.add_argument(
         "--phase",
         type=str,
-        default="stage12",
-        choices=("stage12", "stage3"),
-        help="MPI phase to run: non-uniform stage12 or uniform property stage3",
+        default="pipeline",
+        choices=("stage1", "stage2", "stage3", "stage12", "pipeline"),
+        help="MPI phase to run: stage1, stage2, stage3, stage12, or persistent single-job pipeline",
     )
     parser.add_argument(
         "--role",
