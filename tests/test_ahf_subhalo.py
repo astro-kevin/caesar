@@ -401,16 +401,18 @@ def test_stateless_batch_fof_and_reconcile_root_payload():
     assert np.array_equal(root_out[0]["slist"], np.array([10, 11], dtype=np.int32))
 
 
-def test_stage1_batch_classification_prefers_gpu_for_large_regular_tasks():
+def test_stage1_batch_classification_builds_front_back_regular_queue_and_small_batches():
+    t_tiny = subhalo_mod.AHFSubhaloTask(5, 0, 5, 0, tuple(), 8, 100)
     t_small = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 64, 1000)
     t_large = subhalo_mod.AHFSubhaloTask(20, 0, 20, 0, tuple(), 64, 100000)
-    gpu_items, cpu_items = mpi_mod._classify_stage1_batches(
-        tasks=[t_small, t_large],
+    regular_items, small_items = mpi_mod._classify_stage1_batches(
+        tasks=[t_tiny, t_small, t_large],
         gpu_worker_count=1,
         cpu_worker_count=1,
     )
-    assert any(int(item.tasks[0].node_id) == 20 for item in gpu_items)
-    assert any(int(item.tasks[0].node_id) == 10 for item in cpu_items)
+    assert [int(item.tasks[0].node_id) for item in regular_items] == [20, 10]
+    assert len(small_items) == 1
+    assert int(small_items[0].tasks[0].node_id) == 5
 
 
 def test_gpu_device_assignment_uses_gpu_worker_order_within_host(monkeypatch):
@@ -445,22 +447,24 @@ def test_stage1_shard_payload_serializes_node_candidates():
     assert np.array_equal(payload[10][0]["slist"], np.array([1, 2], dtype=np.int32))
 
 
-def test_iter_stage1_batch_payloads_writes_lazily(tmp_path):
+def test_materialize_stage1_batch_item_writes_payload_on_assignment(tmp_path):
     task = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 4, 10)
     batch = subhalo_mod.AHFSubhaloBatch(tasks=(task,), is_tiny_batch=False, target_backend="cpu", estimated_cost=10)
-    payload_iter = mpi_mod._iter_stage1_batch_payloads(
+    payload_path = tmp_path / "stage1_input_regular_000000.pkl"
+    assert not payload_path.exists()
+
+    item = mpi_mod._materialize_stage1_batch_item(
         shard_root=tmp_path,
-        stage_batches=[batch],
-        prefix="cpu",
+        batch=batch,
+        prefix="regular",
+        batch_index=0,
         task_payloads_by_node={10: {"task": subhalo_mod._serialize_task(task), "dummy": 1}},
         fof_ll=0.02,
         fof_vel_ll=1.0,
         min_stars=16,
+        backend="cpu",
+        device_id=None,
     )
-    payload_path = tmp_path / "stage1_input_cpu_000000.pkl"
-    assert not payload_path.exists()
-
-    item = next(payload_iter)
 
     assert payload_path.exists()
     assert item["payload_path"] == str(payload_path)
@@ -468,9 +472,8 @@ def test_iter_stage1_batch_payloads_writes_lazily(tmp_path):
     assert item["fof_ll"] == 0.02
 
 
-def test_dispatch_stage_consumes_iterators_incrementally(monkeypatch):
-    produced = []
-    send_counts = []
+def test_dispatch_stage_assigns_regular_front_and_back_with_small_queue(monkeypatch):
+    sent_payloads = []
     logs = []
 
     class DummyStatus:
@@ -486,7 +489,7 @@ def test_dispatch_stage_consumes_iterators_incrementally(monkeypatch):
 
         def send(self, payload, dest, tag):
             if tag == mpi_mod.MSG_WORK:
-                send_counts.append(len(produced))
+                sent_payloads.append(payload)
                 self.inflight.append((int(dest), payload))
 
         def iprobe(self, source=None, tag=None):
@@ -497,28 +500,41 @@ def test_dispatch_stage_consumes_iterators_incrementally(monkeypatch):
             status._source = int(rank)
             return {"stage": payload["stage"], "item": payload["item"], "rank": int(rank)}
 
-    def cpu_items():
-        for idx in range(3):
-            produced.append(idx)
-            yield {"payload_path": f"cpu_{idx}.pkl"}
-
     monkeypatch.setattr(mpi_mod, "MPI", SimpleNamespace(Status=DummyStatus, ANY_SOURCE=-1))
     monkeypatch.setattr(mpi_mod, "_rank0_log", logs.append)
     monkeypatch.setattr(mpi_mod.time, "sleep", lambda _seconds: None)
 
+    def prepare_regular(raw, *, cap, direction):
+        backend = "gpu" if str(cap.role) == "gpu_worker" else "cpu"
+        return {"payload_path": f"{backend}_{raw}.pkl", "backend": backend, "direction": direction}
+
+    def prepare_small(raw, *, cap, direction):
+        return {"payload_path": f"small_{raw}.pkl", "backend": "cpu", "direction": direction}
+
     results = mpi_mod._dispatch_stage(
         FakeComm(),
-        worker_caps=[mpi_mod.WorkerCapability(rank=1, role="cpu_worker", hostname="nodeA", local_rank=0, gpu_device=None, threads=1)],
-        gpu_queue=[],
-        cpu_queue=cpu_items(),
+        worker_caps=[
+            mpi_mod.WorkerCapability(rank=1, role="gpu_worker", hostname="nodeA", local_rank=0, gpu_device=0, threads=1),
+            mpi_mod.WorkerCapability(rank=2, role="cpu_worker", hostname="nodeA", local_rank=1, gpu_device=None, threads=2),
+        ],
+        regular_queue=["r0", "r1", "r2"],
+        small_queue=["s0"],
         stage_name="stage1",
-        gpu_total=0,
-        cpu_total=3,
+        prepare_regular=prepare_regular,
+        prepare_small=prepare_small,
+        regular_total=3,
+        small_total=1,
     )
 
     assert len(results) == 3
-    assert produced == [0, 1, 2]
-    assert send_counts == [1, 2, 3]
+    assert len(sent_payloads) == 3
+    first = sent_payloads[0]["item"]
+    second = sent_payloads[1]["item"]
+    third = sent_payloads[2]["item"]
+    assert first["payload_path"] == "gpu_r0.pkl"
+    assert second["items"][0]["payload_path"] == "small_s0.pkl"
+    assert second["items"][1]["payload_path"] == "cpu_r2.pkl"
+    assert third["payload_path"] == "gpu_r1.pkl"
     assert any("stage1: starting" in msg for msg in logs)
     assert any("stage1: complete" in msg for msg in logs)
 
@@ -559,11 +575,11 @@ def test_dispatch_stage_bundles_cpu_items_by_rank_threads(monkeypatch):
     results = mpi_mod._dispatch_stage(
         FakeComm(),
         worker_caps=[mpi_mod.WorkerCapability(rank=1, role="cpu_worker", hostname="nodeA", local_rank=0, gpu_device=None, threads=2)],
-        gpu_queue=[],
-        cpu_queue=cpu_items,
+        regular_queue=[],
+        small_queue=cpu_items,
         stage_name="stage1",
-        gpu_total=0,
-        cpu_total=3,
+        regular_total=0,
+        small_total=3,
     )
 
     assert len(results) == 2
@@ -705,6 +721,7 @@ def test_stage3_manifest_roundtrip(tmp_path):
         ahf_particles_file="ahf_particles",
         output_file="out.hdf5",
         final_shards=["a.pkl", "b.pkl"],
+        snapshot_hash="abc123",
     )
     assert path.is_file()
     payload = mpi_mod._load_stage3_manifest(tmp_path)
@@ -712,6 +729,36 @@ def test_stage3_manifest_roundtrip(tmp_path):
     assert payload["ahf_particles_file"] == "ahf_particles"
     assert payload["output_file"] == "out.hdf5"
     assert payload["final_shards"] == ["a.pkl", "b.pkl"]
+    assert payload["snapshot_hash"] == "abc123"
+
+
+def test_build_caesar_runtime_from_loaded_ds_sets_hash_and_load_haloid(monkeypatch):
+    class DummySim:
+        def __init__(self):
+            self.assigned = False
+
+        def _assign_simulation_attributes(self):
+            self.assigned = True
+
+    class DummyDatasetType:
+        def __init__(self, ds):
+            self.ds = ds
+
+    monkeypatch.setitem(sys.modules, "caesar", SimpleNamespace(CAESAR=lambda: DummySim()))
+    monkeypatch.setitem(
+        sys.modules,
+        "caesar.property_manager",
+        SimpleNamespace(DatasetType=DummyDatasetType),
+    )
+
+    sim = mpi_mod._build_caesar_runtime_from_loaded_ds("dummy-ds", nproc=3, snapshot_hash="hash123")
+
+    assert sim._ds == "dummy-ds"
+    assert sim.hash == "hash123"
+    assert sim.nproc == 3
+    assert sim.load_haloid is False
+    assert sim.assigned is True
+    assert isinstance(sim._ds_type, DummyDatasetType)
 
 
 def test_stage3_property_payload_roundtrip():

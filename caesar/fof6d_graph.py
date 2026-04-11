@@ -114,6 +114,8 @@ def radius_pairs_grid(
     offsets: Optional[np.ndarray] = None,
     max_pairs_per_batch: int = 5_000_000,
 ) -> RadiusPairs:
+    """Compute unique pairs (i<j) with ||pos[i]-pos[j]|| <= radius."""
+
     if radius <= 0:
         raise ValueError("radius must be > 0")
 
@@ -151,6 +153,7 @@ def radius_pairs_grid(
         cell_s = cell - cell_min
 
     key = (cell_s[:, 0] * dims[1] + cell_s[:, 1]) * dims[2] + cell_s[:, 2]
+
     order = xp.argsort(key)
     key_sorted = key[order]
     pos_sorted = pos[order]
@@ -159,10 +162,12 @@ def radius_pairs_grid(
     unique_keys, start_idx, counts = xp.unique(
         key_sorted, return_index=True, return_counts=True
     )
+
     cell_coords = cell_sorted[start_idx]
     n_cells = int(unique_keys.shape[0])
 
     r2_thresh = float(radius) ** 2
+
     out_u = []
     out_v = []
     out_r2 = []
@@ -173,6 +178,7 @@ def radius_pairs_grid(
         return dxyz - box_arr * xp.rint(dxyz / box_arr)
 
     for off in offsets_xp:
+        dx, dy, dz = int(off[0]), int(off[1]), int(off[2])
         if box_arr is not None:
             neigh_coords_in = xp.mod(cell_coords + off, dims)
             inb = None
@@ -182,85 +188,79 @@ def radius_pairs_grid(
             if not bool(xp.any(inb)):
                 continue
             neigh_coords_in = neigh_coords[inb]
-        neigh_key = (neigh_coords_in[:, 0] * dims[1] + neigh_coords_in[:, 1]) * dims[2] + neigh_coords_in[:, 2]
+        neigh_key = (neigh_coords_in[:, 0] * dims[1] + neigh_coords_in[:, 1]) * dims[
+            2
+        ] + neigh_coords_in[:, 2]
         idx = xp.searchsorted(unique_keys, neigh_key)
-        ok0 = idx < n_cells
-        idx_ok = idx[ok0]
-        key_ok = neigh_key[ok0]
-        hit = unique_keys[idx_ok] == key_ok
-        if not bool(xp.any(hit)):
+        if bool(xp.any(idx < n_cells)):
+            ok0 = idx < n_cells
+            ok = ok0.copy()
+            idx_ok = idx[ok0]
+            ok[ok0] = unique_keys[idx_ok] == neigh_key[ok0]
+        else:
+            ok = idx < n_cells
+        if not bool(xp.any(ok)):
             continue
-        src_cells = xp.where(ok0)[0][hit]
-        dst_cells = idx_ok[hit]
-        if inb is not None:
-            src_cells = xp.where(inb)[0][src_cells]
+        if inb is None:
+            cellA = xp.arange(n_cells, dtype=xp.int64)[ok]
+        else:
+            cellA = xp.nonzero(inb)[0][ok]
+        cellB = idx[ok]
 
-        for sc, dc in zip(src_cells.tolist(), dst_cells.tolist()):
-            s0 = int(start_idx[sc])
-            s1 = s0 + int(counts[sc])
-            d0 = int(start_idx[dc])
-            d1 = d0 + int(counts[dc])
+        startA = start_idx[cellA].astype(xp.int64, copy=False)
+        countA = counts[cellA].astype(xp.int64, copy=False)
+        startB = start_idx[cellB].astype(xp.int64, copy=False)
+        countB = counts[cellB].astype(xp.int64, copy=False)
 
-            ns = max(1, s1 - s0)
-            nd = max(1, d1 - d0)
-            total_pairs = ns * nd
-            if sc == dc:
-                total_pairs = ns * max(0, ns - 1) // 2
-                if total_pairs == 0:
+        pair_counts = countA * countB
+        total_pairs = int(pair_counts.sum())
+        if total_pairs == 0:
+            continue
+
+        prefix = xp.cumsum(pair_counts)
+        prefix_prev = xp.concatenate(
+            (xp.asarray([0], dtype=prefix.dtype), prefix[:-1])
+        )
+
+        for p0 in range(0, total_pairs, max_pairs_per_batch):
+            p1 = min(total_pairs, p0 + max_pairs_per_batch)
+            p = xp.arange(p0, p1, dtype=prefix.dtype)
+            k = xp.searchsorted(prefix, p, side="right").astype(xp.int64, copy=False)
+            local = p - prefix_prev[k]
+            cb = countB[k]
+            ia = local // cb
+            ib = local - ia * cb
+            ii = startA[k] + ia
+            jj = startB[k] + ib
+
+            if dx == 0 and dy == 0 and dz == 0:
+                keep_tri = ii < jj
+                if not bool(xp.any(keep_tri)):
                     continue
+                ii = ii[keep_tri]
+                jj = jj[keep_tri]
 
-            batch = max(1, int(max_pairs_per_batch))
-            src_idx = xp.arange(s0, s1, dtype=xp.int64)
-            dst_idx = xp.arange(d0, d1, dtype=xp.int64)
+            dxyz = _min_image(pos_sorted[ii] - pos_sorted[jj])
+            r2 = xp.sum(dxyz * dxyz, axis=1)
+            keep = r2 <= r2_thresh
+            if not bool(xp.any(keep)):
+                continue
 
-            if sc == dc:
-                if ns * ns <= batch:
-                    ii, jj = xp.triu_indices(ns, k=1)
-                    us = src_idx[ii]
-                    vs = src_idx[jj]
-                    dxyz = _min_image(pos_sorted[us] - pos_sorted[vs])
-                    r2 = xp.sum(dxyz * dxyz, axis=1)
-                    keep = r2 <= r2_thresh
-                    if bool(xp.any(keep)):
-                        out_u.append(order[us[keep]])
-                        out_v.append(order[vs[keep]])
-                        out_r2.append(r2[keep])
-                else:
-                    for i0 in range(0, ns, max(1, batch // max(1, ns))):
-                        i1 = min(ns, i0 + max(1, batch // max(1, ns)))
-                        local = src_idx[i0:i1]
-                        ii, jj = xp.meshgrid(local, src_idx, indexing="ij")
-                        mask = ii < jj
-                        us = ii[mask]
-                        vs = jj[mask]
-                        if int(us.size) == 0:
-                            continue
-                        dxyz = _min_image(pos_sorted[us] - pos_sorted[vs])
-                        r2 = xp.sum(dxyz * dxyz, axis=1)
-                        keep = r2 <= r2_thresh
-                        if bool(xp.any(keep)):
-                            out_u.append(order[us[keep]])
-                            out_v.append(order[vs[keep]])
-                            out_r2.append(r2[keep])
-            else:
-                rows_per_chunk = max(1, batch // nd)
-                for i0 in range(0, ns, rows_per_chunk):
-                    i1 = min(ns, i0 + rows_per_chunk)
-                    local = src_idx[i0:i1]
-                    ii, jj = xp.meshgrid(local, dst_idx, indexing="ij")
-                    us = ii.reshape(-1)
-                    vs = jj.reshape(-1)
-                    dxyz = _min_image(pos_sorted[us] - pos_sorted[vs])
-                    r2 = xp.sum(dxyz * dxyz, axis=1)
-                    keep = r2 <= r2_thresh
-                    if bool(xp.any(keep)):
-                        uu = order[us[keep]]
-                        vv = order[vs[keep]]
-                        lo = xp.minimum(uu, vv)
-                        hi = xp.maximum(uu, vv)
-                        out_u.append(lo)
-                        out_v.append(hi)
-                        out_r2.append(r2[keep])
+            ii = ii[keep]
+            jj = jj[keep]
+            r2 = r2[keep]
+
+            u = order[ii].astype(xp.int64, copy=False)
+            v = order[jj].astype(xp.int64, copy=False)
+            swap = u > v
+            if bool(xp.any(swap)):
+                u2 = u.copy()
+                u = xp.where(swap, v, u2)
+                v = xp.where(swap, u2, v)
+
+            out_u.append(u)
+            out_v.append(v)
+            out_r2.append(r2.astype(pos.dtype, copy=False))
 
     if not out_u:
         empty_i = xp.empty(0, dtype=xp.int64)
@@ -269,20 +269,7 @@ def radius_pairs_grid(
 
     u = xp.concatenate(out_u).astype(xp.int64, copy=False)
     v = xp.concatenate(out_v).astype(xp.int64, copy=False)
-    r2 = xp.concatenate(out_r2).astype(pos.dtype, copy=False)
-
-    if box_arr is None:
-        pair_key = u * n + v
-        keep = xp.ones(u.shape[0], dtype=bool)
-        order_unique = xp.argsort(pair_key)
-        key_sorted = pair_key[order_unique]
-        dup = xp.zeros(key_sorted.shape[0], dtype=bool)
-        dup[1:] = key_sorted[1:] == key_sorted[:-1]
-        keep_unique = ~dup
-        chosen = order_unique[keep_unique]
-        u = u[chosen]
-        v = v[chosen]
-        r2 = r2[chosen]
+    r2 = xp.concatenate(out_r2)
 
     return RadiusPairs(u=u, v=v, r2=r2)
 

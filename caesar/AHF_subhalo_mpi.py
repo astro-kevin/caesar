@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 import os
 import pickle
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -71,25 +72,169 @@ class WorkerCapability:
 
 @dataclass
 class _StageQueue:
-    iterator: object
+    items: List[object]
     total: int
-    dispatched: int = 0
-    exhausted: bool = False
+    front_index: int = 0
+    back_index: int = -1
+    front_assigned: int = 0
+    back_assigned: int = 0
 
-    def next_item(self):
-        if self.exhausted:
+    def __post_init__(self):
+        self.items = list(self.items)
+        if int(self.total) <= 0:
+            self.total = len(self.items)
+        self.back_index = len(self.items) - 1
+
+    def next_front(self):
+        if self.front_index > self.back_index:
             return None
-        try:
-            item = next(self.iterator)
-        except StopIteration:
-            self.exhausted = True
+        item = self.items[self.front_index]
+        self.front_index += 1
+        self.front_assigned += 1
+        return item
+
+    def next_back(self):
+        if self.front_index > self.back_index:
             return None
-        self.dispatched += 1
+        item = self.items[self.back_index]
+        self.back_index -= 1
+        self.back_assigned += 1
         return item
 
     @property
     def remaining(self) -> int:
-        return max(0, int(self.total) - int(self.dispatched))
+        return max(0, int(self.back_index) - int(self.front_index) + 1)
+
+    @property
+    def dispatched(self) -> int:
+        return int(self.front_assigned) + int(self.back_assigned)
+
+
+@dataclass
+class _BufferedPreparedQueue:
+    specs: List[object]
+    prepare_fn: object
+    total: int
+    front_target: int = 0
+    back_target: int = 0
+    max_workers: int = 2
+    front_index: int = 0
+    back_index: int = -1
+    front_assigned: int = 0
+    back_assigned: int = 0
+    ready_front: deque = field(default_factory=deque)
+    ready_back: deque = field(default_factory=deque)
+    _pending_front: List[object] = field(default_factory=list)
+    _pending_back: List[object] = field(default_factory=list)
+    _executor: Optional[ThreadPoolExecutor] = None
+
+    def __post_init__(self):
+        self.specs = list(self.specs)
+        if int(self.total) <= 0:
+            self.total = len(self.specs)
+        self.back_index = len(self.specs) - 1
+        self.front_target = max(0, int(self.front_target))
+        self.back_target = max(0, int(self.back_target))
+        self.max_workers = max(1, int(self.max_workers))
+        if len(self.specs) > 0 and (self.front_target > 0 or self.back_target > 0):
+            self._executor = ThreadPoolExecutor(max_workers=self.max_workers)
+            self._top_up()
+            self._wait_until_ready()
+
+    @property
+    def remaining(self) -> int:
+        return max(0, int(self.back_index) - int(self.front_index) + 1)
+
+    @property
+    def dispatched(self) -> int:
+        return int(self.front_assigned) + int(self.back_assigned)
+
+    def _drain_completed(self) -> None:
+        for pending, ready in (
+            (self._pending_front, self.ready_front),
+            (self._pending_back, self.ready_back),
+        ):
+            keep = []
+            for fut in pending:
+                if fut.done():
+                    ready.append(fut.result())
+                else:
+                    keep.append(fut)
+            pending[:] = keep
+
+    def _submit_front(self) -> bool:
+        if self._executor is None or self.front_index > self.back_index:
+            return False
+        spec = self.specs[self.front_index]
+        self.front_index += 1
+        self._pending_front.append(self._executor.submit(self.prepare_fn, spec, "front"))
+        return True
+
+    def _submit_back(self) -> bool:
+        if self._executor is None or self.front_index > self.back_index:
+            return False
+        spec = self.specs[self.back_index]
+        self.back_index -= 1
+        self._pending_back.append(self._executor.submit(self.prepare_fn, spec, "back"))
+        return True
+
+    def _top_up(self) -> None:
+        self._drain_completed()
+        while (
+            self.front_index <= self.back_index
+            and len(self.ready_front) + len(self._pending_front) < self.front_target
+        ):
+            if not self._submit_front():
+                break
+        while (
+            self.front_index <= self.back_index
+            and len(self.ready_back) + len(self._pending_back) < self.back_target
+        ):
+            if not self._submit_back():
+                break
+        self._drain_completed()
+
+    def _wait_until_ready(self) -> None:
+        while True:
+            front_need = self.front_target > 0 and len(self.ready_front) == 0 and len(self._pending_front) > 0
+            back_need = self.back_target > 0 and len(self.ready_back) == 0 and len(self._pending_back) > 0
+            if not (front_need or back_need):
+                break
+            futures = list(self._pending_front) + list(self._pending_back)
+            if not futures:
+                break
+            wait(futures, return_when=FIRST_COMPLETED)
+            self._drain_completed()
+            self._top_up()
+
+    def next_front(self):
+        self._drain_completed()
+        self._top_up()
+        if not self.ready_front and self._pending_front:
+            self._wait_until_ready()
+        if self.ready_front:
+            self.front_assigned += 1
+            item = self.ready_front.popleft()
+            self._top_up()
+            return item
+        return None
+
+    def next_back(self):
+        self._drain_completed()
+        self._top_up()
+        if not self.ready_back and self._pending_back:
+            self._wait_until_ready()
+        if self.ready_back:
+            self.back_assigned += 1
+            item = self.ready_back.popleft()
+            self._top_up()
+            return item
+        return None
+
+    def close(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
 
 
 def _serialize_batch(batch: AHFSubhaloBatch) -> Dict[str, object]:
@@ -241,7 +386,6 @@ def _classify_stage1_batches(
         1,
         _env_int("CAESAR_AHF_SUBHALO_TINY_MAX_FOF_CANDIDATES", 250_000),
     )
-    gpu_min_fof = max(1, _env_int("CAESAR_AHF_SUBHALO_GPU_MIN_FOF", 50_000))
 
     tiny_tasks = [task for task in tasks if int(task.star_count) <= int(tiny_star_threshold)]
     regular_tasks = [task for task in tasks if int(task.star_count) > int(tiny_star_threshold)]
@@ -250,60 +394,57 @@ def _classify_stage1_batches(
         max_nodes_per_batch=int(tiny_max_nodes_per_batch),
         max_fof_candidates_per_batch=int(tiny_max_fof_candidates_per_batch),
     )
-
-    gpu_regular = [task for task in regular_tasks if int(task.fof_candidates) >= int(gpu_min_fof)]
-    cpu_regular = [task for task in regular_tasks if int(task.fof_candidates) < int(gpu_min_fof)]
-
-    gpu_items = [
-        AHFSubhaloBatch(tasks=(task,), is_tiny_batch=False, target_backend="gpu", estimated_cost=int(task.fof_candidates))
-        for task in sorted(gpu_regular, key=lambda t: int(t.fof_candidates), reverse=True)
-    ]
-    cpu_items = [
+    regular_items = [
         AHFSubhaloBatch(tasks=(task,), is_tiny_batch=False, target_backend="cpu", estimated_cost=int(task.fof_candidates))
-        for task in sorted(cpu_regular, key=lambda t: int(t.fof_candidates), reverse=True)
+        for task in sorted(regular_tasks, key=lambda t: int(t.fof_candidates), reverse=True)
     ]
-    cpu_items.extend(tiny_batches)
+    small_items = sorted(
+        tiny_batches,
+        key=lambda batch: (
+            int(batch.estimated_cost),
+            int(len(batch.tasks)),
+            int(batch.tasks[0].node_id) if batch.tasks else -1,
+        ),
+    )
 
     if gpu_worker_count <= 0:
-        cpu_items = gpu_items + cpu_items
-        gpu_items = []
-    if cpu_worker_count <= 0 and cpu_items:
-        gpu_items.extend(
+        small_items.extend(
+            AHFSubhaloBatch(tasks=(task,), is_tiny_batch=False, target_backend="cpu", estimated_cost=int(task.fof_candidates))
+            for task in sorted(regular_tasks, key=lambda t: int(t.fof_candidates))
+        )
+        regular_items = []
+    if cpu_worker_count <= 0 and small_items:
+        regular_items.extend(
             AHFSubhaloBatch(
                 tasks=item.tasks,
                 is_tiny_batch=bool(item.is_tiny_batch),
                 target_backend="gpu",
                 estimated_cost=int(item.estimated_cost),
             )
-            for item in cpu_items
+            for item in sorted(small_items, key=lambda batch: int(batch.estimated_cost), reverse=True)
         )
-        cpu_items = []
+        small_items = []
 
-    return gpu_items, cpu_items
+    return regular_items, small_items
 
 
 def _classify_stage2_roots(
     *,
-    tasks_by_root: Dict[int, List[AHFSubhaloTask]],
+    root_costs: Dict[int, int],
     gpu_worker_count: int,
     cpu_worker_count: int,
 ) -> Tuple[List[int], List[int]]:
-    gpu_min_root_fof = max(1, _env_int("CAESAR_AHF_SUBHALO_GPU_MIN_ROOT_FOF", 250_000))
-    gpu_roots = []
-    cpu_roots = []
-    for root_id, tasks in tasks_by_root.items():
-        total = int(sum(int(task.fof_candidates) for task in tasks))
-        if gpu_worker_count > 0 and total >= int(gpu_min_root_fof):
-            gpu_roots.append(int(root_id))
-        else:
-            cpu_roots.append(int(root_id))
+    ordered_roots = [
+        int(root_id)
+        for root_id, _cost in sorted(
+            root_costs.items(),
+            key=lambda kv: int(kv[1]),
+            reverse=True,
+        )
+    ]
     if gpu_worker_count <= 0:
-        cpu_roots = gpu_roots + cpu_roots
-        gpu_roots = []
-    if cpu_worker_count <= 0 and cpu_roots:
-        gpu_roots.extend(cpu_roots)
-        cpu_roots = []
-    return gpu_roots, cpu_roots
+        return [], list(reversed(ordered_roots))
+    return ordered_roots, []
 
 
 def _rank0_log(message: str) -> None:
@@ -311,13 +452,10 @@ def _rank0_log(message: str) -> None:
 
 
 def _stage_queue(source, *, total: Optional[int] = None) -> _StageQueue:
+    if hasattr(source, "next_front") and hasattr(source, "next_back"):
+        return source
     resolved_total = int(total) if total is not None else -1
-    if resolved_total < 0:
-        try:
-            resolved_total = int(len(source))
-        except Exception:
-            resolved_total = 0
-    return _StageQueue(iterator=iter(source), total=int(resolved_total))
+    return _StageQueue(items=list(source), total=int(resolved_total))
 
 
 def _cpu_local_workers(cap: WorkerCapability, *, stage_name: str) -> int:
@@ -331,52 +469,81 @@ def _cpu_local_workers(cap: WorkerCapability, *, stage_name: str) -> int:
     return int(min(default, configured))
 
 
-def _take_cpu_bundle(queue: _StageQueue, *, max_items: int):
-    items = []
-    for _ in range(max(1, int(max_items))):
-        item = queue.next_item()
-        if item is None:
-            break
-        items.append(item)
+def _bundle_items(items: Sequence[Dict]) -> Optional[Dict]:
     if not items:
         return None
     if len(items) == 1:
         return items[0]
     bundle = dict(items[0])
-    bundle["items"] = items
+    bundle["items"] = list(items)
     bundle["completed_count"] = len(items)
     return bundle
+
+
+def _take_cpu_bundle(
+    *,
+    small_queue: _StageQueue,
+    regular_queue: _StageQueue,
+    max_items: int,
+    cap: WorkerCapability,
+    prepare_small,
+    prepare_regular,
+    use_regular_back: bool,
+):
+    prepared: List[Dict] = []
+    for _ in range(max(1, int(max_items))):
+        raw_small = small_queue.next_front()
+        if raw_small is not None:
+            prepared.append(prepare_small(raw_small, cap=cap, direction="small"))
+            continue
+        raw_regular = regular_queue.next_back() if use_regular_back else regular_queue.next_front()
+        if raw_regular is None:
+            break
+        prepared.append(
+            prepare_regular(
+                raw_regular,
+                cap=cap,
+                direction="back" if use_regular_back else "front",
+            )
+        )
+    return _bundle_items(prepared)
 
 
 def _dispatch_stage(
     comm,
     *,
     worker_caps: Sequence[WorkerCapability],
-    gpu_queue,
-    cpu_queue,
+    regular_queue,
+    small_queue,
     stage_name: str,
-    gpu_total: Optional[int] = None,
-    cpu_total: Optional[int] = None,
+    prepare_regular=None,
+    prepare_small=None,
+    regular_total: Optional[int] = None,
+    small_total: Optional[int] = None,
 ):
-    gpu_state = _stage_queue(gpu_queue, total=gpu_total)
-    cpu_state = _stage_queue(cpu_queue, total=cpu_total)
-    total_items = int(gpu_state.total) + int(cpu_state.total)
+    regular_state = _stage_queue(regular_queue, total=regular_total)
+    small_state = _stage_queue(small_queue, total=small_total)
+    total_items = int(regular_state.total) + int(small_state.total)
     active = 0
     results = []
     completed = 0
     progress_every = max(1, _env_int("CAESAR_AHF_SUBHALO_MPI_PROGRESS_EVERY", 100))
     progress_seconds = max(5.0, _env_float("CAESAR_AHF_SUBHALO_MPI_PROGRESS_SECONDS", 60.0))
     start_time = time.monotonic()
-    last_heartbeat = start_time
+    last_status = start_time
     last_completion_log = 0
+    has_gpu_workers = any(str(cap.role) == "gpu_worker" for cap in worker_caps)
+    has_cpu_workers = any(str(cap.role) == "cpu_worker" for cap in worker_caps)
 
     def log_progress(prefix: str) -> None:
         elapsed = time.monotonic() - start_time
+        queued_remaining = int(regular_state.remaining) + int(small_state.remaining)
         _rank0_log(
             f"{stage_name}: {prefix}; completed={completed}/{total_items}, "
-            f"active={active}, dispatched_gpu={gpu_state.dispatched}/{gpu_state.total}, "
-            f"dispatched_cpu={cpu_state.dispatched}/{cpu_state.total}, "
-            f"remaining_gpu={gpu_state.remaining}, remaining_cpu={cpu_state.remaining}, "
+            f"active={active}, regular_front_assigned={regular_state.front_assigned}, "
+            f"regular_back_assigned={regular_state.back_assigned}, small_assigned={small_state.front_assigned}, "
+            f"regular_remaining={regular_state.remaining}, small_remaining={small_state.remaining}, "
+            f"queued_remaining={queued_remaining}, "
             f"elapsed={elapsed:.1f}s"
         )
 
@@ -384,23 +551,27 @@ def _dispatch_stage(
         nonlocal active
         item = None
         if cap.role == "gpu_worker" and cap.gpu_device is not None:
-            item = gpu_state.next_item()
+            raw = regular_state.next_front()
+            if raw is not None:
+                item = prepare_regular(raw, cap=cap, direction="front") if prepare_regular else raw
+            elif not has_cpu_workers:
+                raw = small_state.next_front()
+                if raw is not None:
+                    item = prepare_small(raw, cap=cap, direction="small") if prepare_small else raw
         elif cap.role == "cpu_worker":
             item = _take_cpu_bundle(
-                cpu_state,
+                small_queue=small_state,
+                regular_queue=regular_state,
                 max_items=_cpu_local_workers(cap, stage_name=stage_name),
+                cap=cap,
+                prepare_small=prepare_small or (lambda raw, **_: raw),
+                prepare_regular=prepare_regular or (lambda raw, **_: raw),
+                use_regular_back=bool(has_gpu_workers),
             )
         elif cap.role == "prop_worker":
-            item = cpu_state.next_item()
-        if item is None and cap.role == "gpu_worker":
-            item = gpu_state.next_item()
-        if item is None and cap.role == "cpu_worker":
-            item = _take_cpu_bundle(
-                cpu_state,
-                max_items=_cpu_local_workers(cap, stage_name=stage_name),
-            )
-        if item is None and cap.role == "prop_worker":
-            item = cpu_state.next_item()
+            raw = small_state.next_front()
+            if raw is not None:
+                item = prepare_small(raw, cap=cap, direction="small") if prepare_small else raw
 
         if item is None:
             return False
@@ -418,9 +589,9 @@ def _dispatch_stage(
     while active > 0:
         if not comm.iprobe(source=MPI.ANY_SOURCE, tag=MSG_RESULT):
             now = time.monotonic()
-            if now - last_heartbeat >= progress_seconds:
-                log_progress("heartbeat")
-                last_heartbeat = now
+            if now - last_status >= progress_seconds:
+                log_progress("status")
+                last_status = now
             time.sleep(0.5)
             continue
         status = MPI.Status()
@@ -434,9 +605,13 @@ def _dispatch_stage(
         if completed == total_items or completed - last_completion_log >= progress_every:
             log_progress("progress")
             last_completion_log = completed
-            last_heartbeat = time.monotonic()
+            last_status = time.monotonic()
 
     log_progress("complete")
+    for queue in (regular_state, small_state):
+        close_fn = getattr(queue, "close", None)
+        if callable(close_fn):
+            close_fn()
     return results
 
 
@@ -539,32 +714,34 @@ def _rank0_prepare_stage12(
     return sim, pid_maps_sel, int(ms), float(fof_ll), fof_vel_ll, tasks, tasks_by_root, task_payloads_by_node
 
 
-def _iter_stage1_batch_payloads(
+def _materialize_stage1_batch_item(
     *,
     shard_root: Path,
-    stage_batches: Sequence[AHFSubhaloBatch],
+    batch: AHFSubhaloBatch,
     prefix: str,
+    batch_index: int,
     task_payloads_by_node: Dict[int, Dict[str, object]],
     fof_ll: float,
     fof_vel_ll: Optional[float],
     min_stars: int,
+    backend: str,
+    device_id: Optional[int],
 ):
-    for idx, batch in enumerate(stage_batches):
-        payload_path = shard_root / f"stage1_input_{prefix}_{idx:06d}.pkl"
-        payload = {
-            "batch": _serialize_batch(batch),
-            "task_payloads": [task_payloads_by_node[int(task.node_id)] for task in batch.tasks],
-        }
-        _dump_pickle(payload_path, payload)
-        yield {
-            "batch": _serialize_batch(batch),
-            "payload_path": str(payload_path),
-            "backend": str(batch.target_backend),
-            "device_id": batch.target_device,
-            "fof_ll": float(fof_ll),
-            "fof_vel_ll": fof_vel_ll,
-            "min_stars": int(min_stars),
-        }
+    payload_path = shard_root / f"stage1_input_{prefix}_{int(batch_index):06d}.pkl"
+    payload = {
+        "batch": _serialize_batch(batch),
+        "task_payloads": [task_payloads_by_node[int(task.node_id)] for task in batch.tasks],
+    }
+    _dump_pickle(payload_path, payload)
+    return {
+        "batch": _serialize_batch(batch),
+        "payload_path": str(payload_path),
+        "backend": str(backend),
+        "device_id": device_id,
+        "fof_ll": float(fof_ll),
+        "fof_vel_ll": fof_vel_ll,
+        "min_stars": int(min_stars),
+    }
 
 
 def _write_stage2_root_payloads(
@@ -778,19 +955,37 @@ def _worker_run_stage3(
     }
 
 
+def _build_caesar_runtime_from_loaded_ds(ds, *, nproc: int, snapshot_hash: Optional[str] = None):
+    import caesar
+    from caesar.property_manager import DatasetType
+
+    sim = caesar.CAESAR()
+    sim._ds = ds
+    sim._ds_type = DatasetType(ds)
+    if snapshot_hash not in (None, ""):
+        sim.hash = str(snapshot_hash)
+    sim.nproc = int(nproc)
+    sim.load_haloid = False
+    sim._assign_simulation_attributes()
+    return sim
+
+
 def _rank0_build_final_sim(
     *,
     snapshot_file: str,
     ahf_particles_file: str,
     final_shards: Sequence[str],
     nproc: int,
+    snapshot_hash: Optional[str] = None,
 ):
     import yt
-    import caesar
 
     ds = yt.load(snapshot_file)
-    sim = caesar.CAESAR(ds)
-    sim.nproc = int(nproc)
+    sim = _build_caesar_runtime_from_loaded_ds(
+        ds,
+        nproc=int(nproc),
+        snapshot_hash=snapshot_hash,
+    )
     build_halos_from_ahf_fast(sim, ahf_particles_file, compute_properties=False)
     pid_maps_sel = _build_selected_pid_maps(sim)
 
@@ -818,6 +1013,7 @@ def _rank0_run_stage3_and_save(
     final_shards: Sequence[str],
     nproc: int,
     shard_root: Path,
+    snapshot_hash: Optional[str] = None,
 ):
     _rank0_log("stage3: rebuilding final reconciled catalogue")
     sim = _rank0_build_final_sim(
@@ -825,6 +1021,7 @@ def _rank0_run_stage3_and_save(
         ahf_particles_file=ahf_particles_file,
         final_shards=final_shards,
         nproc=int(nproc),
+        snapshot_hash=snapshot_hash,
     )
 
     for idx, halo in enumerate(sim.halo_list):
@@ -845,11 +1042,11 @@ def _rank0_run_stage3_and_save(
     stage3_results = _dispatch_stage(
         comm,
         worker_caps=worker_caps,
-        gpu_queue=[],
-        cpu_queue=stage3_cpu_items,
+        regular_queue=[],
+        small_queue=stage3_cpu_items,
         stage_name="stage3",
-        gpu_total=0,
-        cpu_total=len(stage3_cpu_items),
+        regular_total=0,
+        small_total=len(stage3_cpu_items),
     )
 
     halo_by_id = {int(getattr(halo, "AHF_haloID", -1)): halo for halo in sim.halo_list}
@@ -869,6 +1066,53 @@ def _rank0_run_stage3_and_save(
     _rank0_log(f"stage3: saved catalogue to {output_file}")
 
 
+def _stage2_manifest_path(shard_root: Path) -> Path:
+    return shard_root / "stage2_manifest.pkl"
+
+
+def _write_stage2_manifest(
+    *,
+    shard_root: Path,
+    snapshot_file: str,
+    ahf_particles_file: str,
+    output_file: str,
+    snapshot_hash: Optional[str],
+    fof_ll: float,
+    fof_vel_ll: Optional[float],
+    min_stars: int,
+    root_payload_paths: Dict[int, str],
+    root_to_shards: Dict[int, List[str]],
+    root_costs: Dict[int, int],
+) -> Path:
+    path = _stage2_manifest_path(shard_root)
+    _dump_pickle(
+        path,
+        {
+            "snapshot_file": str(snapshot_file),
+            "ahf_particles_file": str(ahf_particles_file),
+            "output_file": str(output_file),
+            "snapshot_hash": None if snapshot_hash in (None, "") else str(snapshot_hash),
+            "fof_ll": float(fof_ll),
+            "fof_vel_ll": fof_vel_ll,
+            "min_stars": int(min_stars),
+            "root_payload_paths": {int(k): str(v) for k, v in root_payload_paths.items()},
+            "root_to_shards": {int(k): [str(x) for x in v] for k, v in root_to_shards.items()},
+            "root_costs": {int(k): int(v) for k, v in root_costs.items()},
+        },
+    )
+    return path
+
+
+def _load_stage2_manifest(shard_root: Path) -> Dict[str, object]:
+    path = _stage2_manifest_path(shard_root)
+    if not path.is_file():
+        raise RuntimeError(f"Stage-2 manifest not found: {path}")
+    payload = _load_pickle(path)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid stage-2 manifest payload: {path}")
+    return payload
+
+
 def _stage3_manifest_path(shard_root: Path) -> Path:
     return shard_root / "stage3_manifest.pkl"
 
@@ -880,6 +1124,7 @@ def _write_stage3_manifest(
     ahf_particles_file: str,
     output_file: str,
     final_shards: Sequence[str],
+    snapshot_hash: Optional[str] = None,
 ) -> Path:
     path = _stage3_manifest_path(shard_root)
     _dump_pickle(
@@ -889,6 +1134,7 @@ def _write_stage3_manifest(
             "ahf_particles_file": str(ahf_particles_file),
             "output_file": str(output_file),
             "final_shards": [str(v) for v in final_shards],
+            "snapshot_hash": None if snapshot_hash in (None, "") else str(snapshot_hash),
         },
     )
     return path
@@ -913,13 +1159,13 @@ def run_mpi(
     role: str = "auto",
     min_stars: Optional[int] = None,
     shard_dir: Optional[str] = None,
-    phase: str = "stage12",
+    phase: str = "stage1",
 ) -> None:
     if MPI is None:
         raise RuntimeError("mpi4py is required for AHF-subhalo MPI execution")
 
     phase = str(phase)
-    if phase not in {"stage12", "stage3"}:
+    if phase not in {"stage1", "stage2", "stage3", "stage12"}:
         raise ValueError(f"Unsupported AHF-subhalo MPI phase: {phase}")
 
     comm = MPI.COMM_WORLD
@@ -929,8 +1175,10 @@ def run_mpi(
         raise RuntimeError("AHF-subhalo MPI requires at least 2 ranks (1 coordinator + workers)")
 
     role = str(role)
-    if phase == "stage12":
+    if phase in {"stage1", "stage12"}:
         valid_roles = {"coordinator", "gpu_worker", "cpu_worker", "auto"}
+    elif phase == "stage2":
+        valid_roles = {"coordinator", "cpu_worker", "auto"}
     else:
         valid_roles = {"coordinator", "prop_worker", "auto"}
     if role not in valid_roles:
@@ -948,8 +1196,10 @@ def run_mpi(
     if role == "auto":
         if int(rank) == int(coordinator_rank):
             effective_role = "coordinator"
-        elif phase == "stage12":
+        elif phase in {"stage1", "stage12"}:
             effective_role = "gpu_worker" if _available_gpu_device_ids() else "cpu_worker"
+        elif phase == "stage2":
+            effective_role = "cpu_worker"
         else:
             effective_role = "prop_worker"
 
@@ -967,20 +1217,21 @@ def run_mpi(
         shard_root.mkdir(parents=True, exist_ok=True)
     shard_root = Path(comm.bcast(str(shard_root), root=coordinator_rank))
 
-    if phase == "stage12":
+    if phase in {"stage1", "stage12"}:
         if effective_role == "coordinator":
-            _rank0_log(f"stage12: coordinator starting on shard_root={shard_root}")
+            stage_label = "stage12" if phase == "stage12" else "stage1"
+            _rank0_log(f"{stage_label}: coordinator starting on shard_root={shard_root}")
             worker_ranks = [i for i in range(size) if int(i) != int(coordinator_rank)]
             worker_caps = [comm.recv(source=i, tag=MSG_REGISTER) for i in worker_ranks]
             worker_caps = [WorkerCapability(**cap) if isinstance(cap, dict) else cap for cap in worker_caps]
             gpu_worker_count = sum(1 for cap in worker_caps if cap.gpu_device is not None)
             cpu_worker_count = len(worker_caps) - gpu_worker_count
             _rank0_log(
-                "stage12: workers registered "
+                f"{stage_label}: workers registered "
                 f"gpu={gpu_worker_count}, cpu={cpu_worker_count}, total={len(worker_caps)}"
             )
 
-            _rank0_log("stage12: preparing runtime, task manifest, and per-node payloads")
+            _rank0_log(f"{stage_label}: preparing runtime, task manifest, and per-node payloads")
             (
                 _sim,
                 _pid_maps_sel,
@@ -998,46 +1249,96 @@ def run_mpi(
                 min_stars=min_stars,
             )
             _rank0_log(
-                "stage12: preparation complete "
+                f"{stage_label}: preparation complete "
                 f"tasks={len(tasks)}, roots={len(tasks_by_root)}, min_stars={int(min_stars_val)}"
             )
 
-            gpu_batches, cpu_batches = _classify_stage1_batches(
+            regular_batches, small_batches = _classify_stage1_batches(
                 tasks=tasks,
                 gpu_worker_count=int(gpu_worker_count),
                 cpu_worker_count=int(cpu_worker_count),
             )
             _rank0_log(
                 "stage1: classified batches "
-                f"gpu={len(gpu_batches)}, cpu={len(cpu_batches)}, total={len(gpu_batches) + len(cpu_batches)}"
+                f"regular={len(regular_batches)}, small={len(small_batches)}, total={len(regular_batches) + len(small_batches)}"
             )
-            stage1_gpu_items = _iter_stage1_batch_payloads(
-                shard_root=shard_root,
-                stage_batches=gpu_batches,
-                prefix="gpu",
-                task_payloads_by_node=task_payloads_by_node,
-                fof_ll=float(fof_ll),
-                fof_vel_ll=fof_vel_ll,
-                min_stars=int(min_stars_val),
+            stage1_regular_specs = [
+                {"batch_index": idx, "batch": batch}
+                for idx, batch in enumerate(regular_batches)
+            ]
+            stage1_small_specs = [
+                {"batch_index": idx, "batch": batch}
+                for idx, batch in enumerate(small_batches)
+            ]
+
+            def _materialize_stage1_regular_spec(spec, direction):
+                return _materialize_stage1_batch_item(
+                    shard_root=shard_root,
+                    batch=spec["batch"],
+                    prefix="regular",
+                    batch_index=int(spec["batch_index"]),
+                    task_payloads_by_node=task_payloads_by_node,
+                    fof_ll=float(fof_ll),
+                    fof_vel_ll=fof_vel_ll,
+                    min_stars=int(min_stars_val),
+                    backend="cpu",
+                    device_id=None,
+                )
+
+            def _materialize_stage1_small_spec(spec, direction):
+                return _materialize_stage1_batch_item(
+                    shard_root=shard_root,
+                    batch=spec["batch"],
+                    prefix="small",
+                    batch_index=int(spec["batch_index"]),
+                    task_payloads_by_node=task_payloads_by_node,
+                    fof_ll=float(fof_ll),
+                    fof_vel_ll=fof_vel_ll,
+                    min_stars=int(min_stars_val),
+                    backend="cpu",
+                    device_id=None,
+                )
+
+            def _bind_stage1_item(base_item, *, cap, direction):
+                item = dict(base_item)
+                backend = "gpu" if str(cap.role) == "gpu_worker" else "cpu"
+                item["backend"] = backend
+                item["device_id"] = cap.gpu_device if backend == "gpu" else None
+                return item
+
+            buffer_scale = max(1, _env_int("CAESAR_AHF_SUBHALO_MPI_STAGE1_BUFFER_SCALE", 4))
+            stage1_cpu_capacity = sum(
+                _cpu_local_workers(cap, stage_name="stage1")
+                for cap in worker_caps
+                if str(cap.role) == "cpu_worker"
             )
-            stage1_cpu_items = _iter_stage1_batch_payloads(
-                shard_root=shard_root,
-                stage_batches=cpu_batches,
-                prefix="cpu",
-                task_payloads_by_node=task_payloads_by_node,
-                fof_ll=float(fof_ll),
-                fof_vel_ll=fof_vel_ll,
-                min_stars=int(min_stars_val),
+            stage1_regular_queue = _BufferedPreparedQueue(
+                specs=stage1_regular_specs,
+                prepare_fn=_materialize_stage1_regular_spec,
+                total=len(stage1_regular_specs),
+                front_target=max(0, int(gpu_worker_count) * int(buffer_scale)),
+                back_target=max(0, int(stage1_cpu_capacity) * int(buffer_scale)),
+                max_workers=max(1, min(8, int(gpu_worker_count) + int(cpu_worker_count))),
+            )
+            stage1_small_queue = _BufferedPreparedQueue(
+                specs=stage1_small_specs,
+                prepare_fn=_materialize_stage1_small_spec,
+                total=len(stage1_small_specs),
+                front_target=max(0, int(stage1_cpu_capacity) * int(buffer_scale)),
+                back_target=0,
+                max_workers=max(1, min(8, int(cpu_worker_count))),
             )
 
             stage1_results = _dispatch_stage(
                 comm,
                 worker_caps=worker_caps,
-                gpu_queue=stage1_gpu_items,
-                cpu_queue=stage1_cpu_items,
+                regular_queue=stage1_regular_queue,
+                small_queue=stage1_small_queue,
                 stage_name="stage1",
-                gpu_total=len(gpu_batches),
-                cpu_total=len(cpu_batches),
+                prepare_regular=_bind_stage1_item,
+                prepare_small=_bind_stage1_item,
+                regular_total=len(stage1_regular_specs),
+                small_total=len(stage1_small_specs),
             )
 
             root_to_shards: Dict[int, List[str]] = {int(root): [] for root in tasks_by_root}
@@ -1055,48 +1356,62 @@ def run_mpi(
                 tasks_by_root=tasks_by_root,
                 task_payloads_by_node=task_payloads_by_node,
             )
+            root_costs = {
+                int(root_id): int(sum(int(task.fof_candidates) for task in root_tasks))
+                for root_id, root_tasks in tasks_by_root.items()
+            }
+            _write_stage2_manifest(
+                shard_root=shard_root,
+                snapshot_file=snapshot_file,
+                ahf_particles_file=ahf_particles_file,
+                output_file=output_file,
+                snapshot_hash=getattr(_sim, "hash", None),
+                fof_ll=float(fof_ll),
+                fof_vel_ll=fof_vel_ll,
+                min_stars=int(min_stars_val),
+                root_payload_paths=root_payload_paths,
+                root_to_shards=root_to_shards,
+                root_costs=root_costs,
+            )
+            _rank0_log("stage1: wrote stage2 manifest")
 
-            gpu_root_queue, cpu_root_queue = _classify_stage2_roots(
-                tasks_by_root=tasks_by_root,
+            if phase == "stage1":
+                _stop_workers(comm, worker_caps=worker_caps)
+                return
+
+            stage2_regular_roots, stage2_small_roots = _classify_stage2_roots(
+                root_costs=root_costs,
                 gpu_worker_count=int(gpu_worker_count),
                 cpu_worker_count=int(cpu_worker_count),
             )
             _rank0_log(
                 "stage2: classified roots "
-                f"gpu={len(gpu_root_queue)}, cpu={len(cpu_root_queue)}, total={len(gpu_root_queue) + len(cpu_root_queue)}"
+                f"regular={len(stage2_regular_roots)}, small={len(stage2_small_roots)}, total={len(stage2_regular_roots) + len(stage2_small_roots)}"
             )
-            stage2_gpu_items = [
-                {
+
+            def _prepare_stage2_root(root_id, *, cap, direction):
+                backend = "gpu" if str(cap.role) == "gpu_worker" else "cpu"
+                return {
                     "root_id": int(root_id),
                     "shard_paths": root_to_shards[int(root_id)],
                     "root_payload_path": root_payload_paths[int(root_id)],
-                    "backend": "gpu",
+                    "backend": backend,
+                    "device_id": cap.gpu_device if backend == "gpu" else None,
                     "fof_ll": float(fof_ll),
                     "fof_vel_ll": fof_vel_ll,
                     "min_stars": int(min_stars_val),
                 }
-                for root_id in gpu_root_queue
-            ]
-            stage2_cpu_items = [
-                {
-                    "root_id": int(root_id),
-                    "shard_paths": root_to_shards[int(root_id)],
-                    "root_payload_path": root_payload_paths[int(root_id)],
-                    "backend": "cpu",
-                    "fof_ll": float(fof_ll),
-                    "fof_vel_ll": fof_vel_ll,
-                    "min_stars": int(min_stars_val),
-                }
-                for root_id in cpu_root_queue
-            ]
+
             stage2_results = _dispatch_stage(
                 comm,
                 worker_caps=worker_caps,
-                gpu_queue=stage2_gpu_items,
-                cpu_queue=stage2_cpu_items,
+                regular_queue=stage2_regular_roots,
+                small_queue=stage2_small_roots,
                 stage_name="stage2",
-                gpu_total=len(stage2_gpu_items),
-                cpu_total=len(stage2_cpu_items),
+                prepare_regular=_prepare_stage2_root,
+                prepare_small=_prepare_stage2_root,
+                regular_total=len(stage2_regular_roots),
+                small_total=len(stage2_small_roots),
             )
             _stop_workers(comm, worker_caps=worker_caps)
             final_shards = [str(result["shard_path"]) for result in stage2_results]
@@ -1107,6 +1422,7 @@ def run_mpi(
                 ahf_particles_file=ahf_particles_file,
                 output_file=output_file,
                 final_shards=final_shards,
+                snapshot_hash=getattr(_sim, "hash", None),
             )
             _rank0_log("stage12: wrote stage3 manifest")
             return
@@ -1153,6 +1469,106 @@ def run_mpi(
             comm.send(result, dest=coordinator_rank, tag=MSG_RESULT)
         return
 
+    if phase == "stage2":
+        if effective_role == "coordinator":
+            _rank0_log(f"stage2: coordinator starting on shard_root={shard_root}")
+            worker_ranks = [i for i in range(size) if int(i) != int(coordinator_rank)]
+            worker_caps = [comm.recv(source=i, tag=MSG_REGISTER) for i in worker_ranks]
+            worker_caps = [WorkerCapability(**cap) if isinstance(cap, dict) else cap for cap in worker_caps]
+            cpu_worker_count = len(worker_caps)
+            _rank0_log(
+                "stage2: workers registered "
+                f"cpu={cpu_worker_count}, total={len(worker_caps)}"
+            )
+
+            manifest = _load_stage2_manifest(shard_root)
+            root_payload_paths = {
+                int(k): str(v) for k, v in dict(manifest.get("root_payload_paths", {})).items()
+            }
+            root_to_shards = {
+                int(k): [str(x) for x in v]
+                for k, v in dict(manifest.get("root_to_shards", {})).items()
+            }
+            root_costs = {
+                int(k): int(v) for k, v in dict(manifest.get("root_costs", {})).items()
+            }
+
+            stage2_regular_roots, stage2_small_roots = _classify_stage2_roots(
+                root_costs=root_costs,
+                gpu_worker_count=0,
+                cpu_worker_count=int(cpu_worker_count),
+            )
+            _rank0_log(
+                "stage2: classified roots "
+                f"regular={len(stage2_regular_roots)}, small={len(stage2_small_roots)}, total={len(stage2_regular_roots) + len(stage2_small_roots)}"
+            )
+
+            def _prepare_stage2_root(root_id, *, cap, direction):
+                return {
+                    "root_id": int(root_id),
+                    "shard_paths": root_to_shards[int(root_id)],
+                    "root_payload_path": root_payload_paths[int(root_id)],
+                    "backend": "cpu",
+                    "device_id": None,
+                    "fof_ll": float(manifest.get("fof_ll", 0.0)),
+                    "fof_vel_ll": manifest.get("fof_vel_ll"),
+                    "min_stars": int(manifest.get("min_stars", min_stars or 0)),
+                }
+
+            stage2_results = _dispatch_stage(
+                comm,
+                worker_caps=worker_caps,
+                regular_queue=stage2_regular_roots,
+                small_queue=stage2_small_roots,
+                stage_name="stage2",
+                prepare_regular=_prepare_stage2_root,
+                prepare_small=_prepare_stage2_root,
+                regular_total=len(stage2_regular_roots),
+                small_total=len(stage2_small_roots),
+            )
+            _stop_workers(comm, worker_caps=worker_caps)
+            final_shards = [str(result["shard_path"]) for result in stage2_results]
+            _rank0_log(f"stage2: complete; final_shards={len(final_shards)}")
+            _write_stage3_manifest(
+                shard_root=shard_root,
+                snapshot_file=str(manifest.get("snapshot_file", snapshot_file)),
+                ahf_particles_file=str(manifest.get("ahf_particles_file", ahf_particles_file)),
+                output_file=str(manifest.get("output_file", output_file)),
+                final_shards=final_shards,
+                snapshot_hash=manifest.get("snapshot_hash"),
+            )
+            _rank0_log("stage2: wrote stage3 manifest")
+            return
+
+        cap = _worker_capability(
+            rank,
+            role=effective_role,
+            threads=int(nproc),
+            world_layout=world_layout,
+        )
+        comm.send(cap.__dict__, dest=coordinator_rank, tag=MSG_REGISTER)
+
+        while True:
+            status = MPI.Status()
+            msg = comm.recv(source=coordinator_rank, tag=MPI.ANY_TAG, status=status)
+            if status.Get_tag() == MSG_STOP or msg.get("type") == "stop":
+                break
+            if msg.get("type") != "work":
+                raise RuntimeError(f"Unexpected MPI message: {msg}")
+            if str(msg["stage"]) != "stage2":
+                raise RuntimeError(f"Unexpected stage-2 MPI message: {msg}")
+            item = msg["item"]
+            result = _worker_run_stage2(
+                item=item,
+                fof_ll=float(item["fof_ll"]),
+                fof_vel_ll=item.get("fof_vel_ll"),
+                min_stars=int(item["min_stars"]),
+                shard_dir=shard_root,
+                nproc=int(cap.threads),
+            )
+            comm.send(result, dest=coordinator_rank, tag=MSG_RESULT)
+        return
+
     if effective_role == "coordinator":
         worker_ranks = [i for i in range(size) if int(i) != int(coordinator_rank)]
         worker_caps = [comm.recv(source=i, tag=MSG_REGISTER) for i in worker_ranks]
@@ -1167,6 +1583,7 @@ def run_mpi(
             final_shards=[str(v) for v in manifest.get("final_shards", [])],
             nproc=int(nproc),
             shard_root=shard_root,
+            snapshot_hash=manifest.get("snapshot_hash"),
         )
         _stop_workers(comm, worker_caps=worker_caps)
         return
