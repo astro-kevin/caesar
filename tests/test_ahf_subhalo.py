@@ -445,6 +445,202 @@ def test_stage1_shard_payload_serializes_node_candidates():
     assert np.array_equal(payload[10][0]["slist"], np.array([1, 2], dtype=np.int32))
 
 
+def test_iter_stage1_batch_payloads_writes_lazily(tmp_path):
+    task = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 4, 10)
+    batch = subhalo_mod.AHFSubhaloBatch(tasks=(task,), is_tiny_batch=False, target_backend="cpu", estimated_cost=10)
+    payload_iter = mpi_mod._iter_stage1_batch_payloads(
+        shard_root=tmp_path,
+        stage_batches=[batch],
+        prefix="cpu",
+        task_payloads_by_node={10: {"task": subhalo_mod._serialize_task(task), "dummy": 1}},
+        fof_ll=0.02,
+        fof_vel_ll=1.0,
+        min_stars=16,
+    )
+    payload_path = tmp_path / "stage1_input_cpu_000000.pkl"
+    assert not payload_path.exists()
+
+    item = next(payload_iter)
+
+    assert payload_path.exists()
+    assert item["payload_path"] == str(payload_path)
+    assert item["min_stars"] == 16
+    assert item["fof_ll"] == 0.02
+
+
+def test_dispatch_stage_consumes_iterators_incrementally(monkeypatch):
+    produced = []
+    send_counts = []
+    logs = []
+
+    class DummyStatus:
+        def __init__(self):
+            self._source = -1
+
+        def Get_source(self):
+            return self._source
+
+    class FakeComm:
+        def __init__(self):
+            self.inflight = []
+
+        def send(self, payload, dest, tag):
+            if tag == mpi_mod.MSG_WORK:
+                send_counts.append(len(produced))
+                self.inflight.append((int(dest), payload))
+
+        def iprobe(self, source=None, tag=None):
+            return bool(self.inflight)
+
+        def recv(self, source=None, tag=None, status=None):
+            rank, payload = self.inflight.pop(0)
+            status._source = int(rank)
+            return {"stage": payload["stage"], "item": payload["item"], "rank": int(rank)}
+
+    def cpu_items():
+        for idx in range(3):
+            produced.append(idx)
+            yield {"payload_path": f"cpu_{idx}.pkl"}
+
+    monkeypatch.setattr(mpi_mod, "MPI", SimpleNamespace(Status=DummyStatus, ANY_SOURCE=-1))
+    monkeypatch.setattr(mpi_mod, "_rank0_log", logs.append)
+    monkeypatch.setattr(mpi_mod.time, "sleep", lambda _seconds: None)
+
+    results = mpi_mod._dispatch_stage(
+        FakeComm(),
+        worker_caps=[mpi_mod.WorkerCapability(rank=1, role="cpu_worker", hostname="nodeA", local_rank=0, gpu_device=None, threads=1)],
+        gpu_queue=[],
+        cpu_queue=cpu_items(),
+        stage_name="stage1",
+        gpu_total=0,
+        cpu_total=3,
+    )
+
+    assert len(results) == 3
+    assert produced == [0, 1, 2]
+    assert send_counts == [1, 2, 3]
+    assert any("stage1: starting" in msg for msg in logs)
+    assert any("stage1: complete" in msg for msg in logs)
+
+
+def test_dispatch_stage_bundles_cpu_items_by_rank_threads(monkeypatch):
+    sent_payloads = []
+
+    class DummyStatus:
+        def __init__(self):
+            self._source = -1
+
+        def Get_source(self):
+            return self._source
+
+    class FakeComm:
+        def __init__(self):
+            self.inflight = []
+
+        def send(self, payload, dest, tag):
+            if tag == mpi_mod.MSG_WORK:
+                sent_payloads.append(payload)
+                self.inflight.append((int(dest), payload))
+
+        def iprobe(self, source=None, tag=None):
+            return bool(self.inflight)
+
+        def recv(self, source=None, tag=None, status=None):
+            rank, payload = self.inflight.pop(0)
+            status._source = int(rank)
+            item = payload["item"]
+            return {"stage": payload["stage"], "completed_count": int(item.get("completed_count", 1))}
+
+    monkeypatch.setattr(mpi_mod, "MPI", SimpleNamespace(Status=DummyStatus, ANY_SOURCE=-1))
+    monkeypatch.setattr(mpi_mod, "_rank0_log", lambda _msg: None)
+    monkeypatch.setattr(mpi_mod.time, "sleep", lambda _seconds: None)
+
+    cpu_items = [{"payload_path": f"cpu_{idx}.pkl"} for idx in range(3)]
+    results = mpi_mod._dispatch_stage(
+        FakeComm(),
+        worker_caps=[mpi_mod.WorkerCapability(rank=1, role="cpu_worker", hostname="nodeA", local_rank=0, gpu_device=None, threads=2)],
+        gpu_queue=[],
+        cpu_queue=cpu_items,
+        stage_name="stage1",
+        gpu_total=0,
+        cpu_total=3,
+    )
+
+    assert len(results) == 2
+    assert len(sent_payloads) == 2
+    assert len(sent_payloads[0]["item"]["items"]) == 2
+    assert sent_payloads[0]["item"]["completed_count"] == 2
+    assert sent_payloads[1]["item"]["payload_path"] == "cpu_2.pkl"
+
+
+def test_worker_run_stage1_bundles_multiple_items(tmp_path):
+    task_a = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 2, 2)
+    task_b = subhalo_mod.AHFSubhaloTask(20, 0, 20, 0, tuple(), 2, 2)
+    batch_a = subhalo_mod.AHFSubhaloBatch(tasks=(task_a,), is_tiny_batch=False, target_backend="cpu", estimated_cost=2)
+    batch_b = subhalo_mod.AHFSubhaloBatch(tasks=(task_b,), is_tiny_batch=False, target_backend="cpu", estimated_cost=2)
+
+    payload_a = {
+        "batch": mpi_mod._serialize_batch(batch_a),
+        "task_payloads": [
+            {
+                "task": subhalo_mod._serialize_task(task_a),
+                "gas_sel": np.array([], dtype=np.int32),
+                "star_sel": np.array([0, 1], dtype=np.int32),
+                "bh_sel": np.array([], dtype=np.int32),
+                "dm_sel": np.array([], dtype=np.int32),
+                "ng": 0,
+                "ns": 2,
+                "nb": 0,
+                "eligible_pos": np.array([[0.0, 0.0, 0.0], [0.05, 0.0, 0.0]], dtype=np.float64),
+                "eligible_vel": np.zeros((2, 3), dtype=np.float64),
+            }
+        ],
+    }
+    payload_b = {
+        "batch": mpi_mod._serialize_batch(batch_b),
+        "task_payloads": [
+            {
+                "task": subhalo_mod._serialize_task(task_b),
+                "gas_sel": np.array([], dtype=np.int32),
+                "star_sel": np.array([10, 11], dtype=np.int32),
+                "bh_sel": np.array([], dtype=np.int32),
+                "dm_sel": np.array([], dtype=np.int32),
+                "ng": 0,
+                "ns": 2,
+                "nb": 0,
+                "eligible_pos": np.array([[10.0, 0.0, 0.0], [10.05, 0.0, 0.0]], dtype=np.float64),
+                "eligible_vel": np.zeros((2, 3), dtype=np.float64),
+            }
+        ],
+    }
+
+    path_a = tmp_path / "stage1_input_cpu_000000.pkl"
+    path_b = tmp_path / "stage1_input_cpu_000001.pkl"
+    mpi_mod._dump_pickle(path_a, payload_a)
+    mpi_mod._dump_pickle(path_b, payload_b)
+
+    result = mpi_mod._worker_run_stage1(
+        item={
+            "items": [
+                {"payload_path": str(path_a), "backend": "cpu"},
+                {"payload_path": str(path_b), "backend": "cpu"},
+            ]
+        },
+        fof_ll=0.1,
+        fof_vel_ll=1.0,
+        min_stars=2,
+        shard_dir=tmp_path,
+        nproc=2,
+    )
+
+    assert result["completed_count"] == 2
+    assert set(result["node_ids"]) == {10, 20}
+    payload = mpi_mod._load_pickle(Path(result["shard_path"]))
+    assert set(payload.keys()) == {10, 20}
+    assert np.array_equal(payload[10][0]["slist"], np.array([0, 1], dtype=np.int32))
+    assert np.array_equal(payload[20][0]["slist"], np.array([10, 11], dtype=np.int32))
+
+
 def test_group_state_serialization_and_apply_roundtrip():
     sim = DummySim(pos=np.zeros((4, 3)), vel=np.zeros((4, 3)))
     task = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 2, 2)
