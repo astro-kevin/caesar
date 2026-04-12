@@ -21,11 +21,23 @@ def _matching_extension_paths() -> list[Path]:
 
 @lru_cache(maxsize=1)
 def _load_group_funcs_extension() -> ModuleType:
+    caesar_dir = Path(__file__).resolve().parent
     errors = []
+    try:
+        importlib.invalidate_caches()
+        if str(caesar_dir) not in sys.path:
+            sys.path.insert(0, str(caesar_dir))
+        module = importlib.import_module("group_funcs")
+        if getattr(module, "__file__", None):
+            return module
+    except Exception as exc:
+        errors.append(f"import group_funcs: {exc}")
+
     for path in _matching_extension_paths():
         try:
             spec = importlib.util.spec_from_file_location("group_funcs", str(path))
             if spec is None or spec.loader is None:
+                errors.append(f"{path.name}: no loader available")
                 continue
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
