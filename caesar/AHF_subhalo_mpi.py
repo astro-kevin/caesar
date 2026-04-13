@@ -33,9 +33,11 @@ from caesar.AHF_subhalo import (
     _build_task_manifest,
     _build_tiny_batches,
     _complete_finalization_after_properties,
+    _complete_finalization_after_properties_direct,
     _compute_group_properties_subset,
     _deserialize_candidate_group,
     _deserialize_task,
+    _build_direct_stage3_runtime,
     _env_float,
     _env_int,
     _env_str,
@@ -47,6 +49,15 @@ from caesar.AHF_subhalo import (
     _serialize_candidate_group,
     _serialize_task,
     _apply_group_state,
+)
+from caesar.ahf_subhalo_hdf5 import (
+    AHFSubhaloDirectState,
+    build_direct_state,
+    build_task_payload as _build_direct_task_payload,
+)
+from caesar.ahf_subhalo_tables import (
+    candidate_records_from_table_payload,
+    candidate_records_to_table,
 )
 from caesar.fubar import get_b as _get_b
 from caesar.fubar import get_mean_interparticle_separation as _get_mean_interparticle_separation
@@ -459,7 +470,8 @@ def _stage1_shard_payload(results_by_node: Dict[int, List]) -> Dict[int, List[di
 
 
 def _stage2_shard_payload(galaxies: Sequence) -> List[dict]:
-    return [gal if isinstance(gal, dict) else _serialize_candidate_group(gal) for gal in galaxies]
+    records = [gal if isinstance(gal, dict) else _serialize_candidate_group(gal) for gal in galaxies]
+    return candidate_records_to_table(records).to_payload()
 
 
 def _prepare_manifest(
@@ -780,6 +792,16 @@ def _rank0_init_runtime(snapshot_file: str, ahf_particles_file: str, *, nproc: i
     return sim, pid_maps_sel, fof_ll, fof_vel_ll
 
 
+def _direct_fof_linking_length(snapshot) -> float:
+    ndm = int(snapshot.particle_counts.get("dm", 0))
+    if ndm <= 0:
+        raise RuntimeError("AHF-subhalo direct runtime requires dark-matter particles to compute fof_ll")
+    b_halo = 0.2
+    b_galaxy = float(os.environ.get("CAESAR_B_GALAXY", b_halo * 0.1))
+    mis = float(snapshot.boxsize) / float(ndm) ** (1.0 / 3.0)
+    return float(mis * b_galaxy)
+
+
 def _rank0_prepare_stage12(
     *,
     snapshot_file: str,
@@ -792,24 +814,26 @@ def _rank0_prepare_stage12(
 ):
     start_time = time.monotonic()
     if log_fn is not None:
-        log_fn(f"{log_label}: loading snapshot and initializing CAESAR runtime")
-    sim, pid_maps_sel, fof_ll, fof_vel_ll = _rank0_init_runtime(
-        snapshot_file,
-        ahf_particles_file,
-        nproc=int(nproc),
-    )
+        log_fn(f"{log_label}: loading direct-HDF5 snapshot tables and AHF node manifest")
+    direct_state = build_direct_state(snapshot_file, ahf_particles_file)
+    fof_ll = _direct_fof_linking_length(direct_state.snapshot)
+    pid_maps_sel = None
     if log_fn is not None:
         log_fn(
-            f"{log_label}: runtime ready; halos={len(getattr(sim, 'halo_list', []))}, "
+            f"{log_label}: direct runtime ready; ptypes={','.join(direct_state.snapshot.ptypes)}, "
+            f"nodes={len(direct_state.nodes)}, "
             f"elapsed={time.monotonic() - start_time:.1f}s"
         )
-    membership_arrays = getattr(sim, "_ahf_fast_memberships")
-    ms = get_min_stars(sim, override=min_stars)
+    ms = get_min_stars(None, override=min_stars)
     if log_fn is not None:
         log_fn(f"{log_label}: building task manifest from AHF hierarchy")
+    node_ndm = {
+        int(hid): int(ndm)
+        for hid, ndm in zip(direct_state.nodes.halo_id.tolist(), direct_state.nodes.dm_count.tolist())
+    }
     tasks, tasks_by_root, _, _ = _prepare_manifest(
         ahf_particles_file=ahf_particles_file,
-        node_ndm=_build_node_dm_counts(membership_arrays),
+        node_ndm=node_ndm,
         min_stars=int(ms),
     )
     if log_fn is not None:
@@ -846,11 +870,9 @@ def _rank0_prepare_stage12(
     if log_fn is not None:
         log_fn(f"{log_label}: building per-node stage1 payloads for {len(tasks)} tasks")
     for idx, task in enumerate(tasks, start=1):
-        payload = _build_task_input_payload(
-            sim,
+        payload = _build_direct_task_payload(
+            direct_state,
             task=task,
-            membership_arrays=membership_arrays,
-            pid_maps_sel=pid_maps_sel,
             fof_nHlim=float(fof_nHlim),
             fof_Tlim=float(fof_Tlim),
             fof_use_sfr_gate=bool(fof_use_sfr_gate),
@@ -858,6 +880,7 @@ def _rank0_prepare_stage12(
         if payload is None or int(np.asarray(payload["star_sel"]).size) < int(ms):
             dropped_tasks += 1
         else:
+            payload["task"] = _serialize_task(task)
             task_payloads_by_node[int(task.node_id)] = payload
             filtered_tasks.append(task)
         now = time.monotonic()
@@ -883,7 +906,7 @@ def _rank0_prepare_stage12(
     }
     tasks_by_root = {int(root): root_tasks for root, root_tasks in tasks_by_root.items() if root_tasks}
 
-    return sim, pid_maps_sel, int(ms), float(fof_ll), fof_vel_ll, tasks, tasks_by_root, task_payloads_by_node
+    return direct_state, pid_maps_sel, int(ms), float(fof_ll), fof_vel_ll, tasks, tasks_by_root, task_payloads_by_node
 
 
 def _materialize_stage1_batch_item(
@@ -1074,7 +1097,7 @@ def _worker_run_stage2(
         )
         return {
             "root_id": int(root_id),
-            "galaxies": _stage2_shard_payload(galaxies),
+            "galaxies": [gal if isinstance(gal, dict) else _serialize_candidate_group(gal) for gal in galaxies],
             "count": int(len(galaxies)),
         }
 
@@ -1092,12 +1115,12 @@ def _worker_run_stage2(
     root_ids = []
     total_count = 0
     for out in outputs:
-        galaxies_payload.extend(out["galaxies"])
+        galaxies_payload.extend(list(out["galaxies"]))
         root_ids.append(int(out["root_id"]))
         total_count += int(out["count"])
 
     shard_path = shard_dir / f"stage2_rank{os.getpid()}_{abs(hash(tuple(sorted(root_ids))))}.pkl"
-    _dump_pickle(shard_path, galaxies_payload)
+    _dump_pickle(shard_path, _stage2_shard_payload(galaxies_payload))
     return {
         "stage": "stage2",
         "shard_path": str(shard_path),
@@ -1160,7 +1183,7 @@ def _worker_run_stage3(
     _dump_pickle(
         shard_path,
         {
-            "halos": [_serialize_group_state(group, id_key="AHF_haloID") for group in sim.halo_list],
+            "halos": [_serialize_group_state(group, id_key="_merge_id") for group in sim.halo_list],
             "galaxies": [_serialize_group_state(group, id_key="_merge_id") for group in sim.galaxy_list],
         },
     )
@@ -1197,13 +1220,19 @@ def _rank0_prepare_final_sim_from_existing(
     final_galaxies = []
     for path in final_shards:
         payload = _load_pickle(Path(path))
-        final_galaxies.extend(_deserialize_candidate_group(sim, rec) for rec in payload)
+        records = (
+            candidate_records_from_table_payload(payload)
+            if isinstance(payload, dict) and "ahf_halo_id" in payload
+            else list(payload)
+        )
+        final_galaxies.extend(_deserialize_candidate_group(sim, rec) for rec in records)
 
     _prepare_final_subhalo_galaxies(
         sim,
         ahf_particles_file=ahf_particles_file,
         galaxy_list=final_galaxies,
         pid_maps_sel=pid_maps_sel,
+        compute_missing_halo_properties=False,
     )
     return sim
 
@@ -1230,13 +1259,19 @@ def _rank0_build_final_sim(
     final_galaxies = []
     for path in final_shards:
         payload = _load_pickle(Path(path))
-        final_galaxies.extend(_deserialize_candidate_group(sim, rec) for rec in payload)
+        records = (
+            candidate_records_from_table_payload(payload)
+            if isinstance(payload, dict) and "ahf_halo_id" in payload
+            else list(payload)
+        )
+        final_galaxies.extend(_deserialize_candidate_group(sim, rec) for rec in records)
 
     _prepare_final_subhalo_galaxies(
         sim,
         ahf_particles_file=ahf_particles_file,
         galaxy_list=final_galaxies,
         pid_maps_sel=pid_maps_sel,
+        compute_missing_halo_properties=False,
     )
     return sim
 
@@ -1256,23 +1291,28 @@ def _rank0_run_stage3_and_save(
     pid_maps_sel=None,
     worker_threads: Optional[Dict[int, int]] = None,
 ):
-    if sim is None or pid_maps_sel is None:
-        _rank0_log("stage3: rebuilding final reconciled catalogue")
-        sim = _rank0_build_final_sim(
-            snapshot_file=snapshot_file,
-            ahf_particles_file=ahf_particles_file,
-            final_shards=final_shards,
-            nproc=int(nproc),
-            snapshot_hash=snapshot_hash,
-        )
+    if isinstance(sim, AHFSubhaloDirectState):
+        direct_state = sim
+        _rank0_log("stage3: reusing in-memory direct shard runtime")
     else:
-        _rank0_log("stage3: reusing in-memory coordinator runtime")
-        sim = _rank0_prepare_final_sim_from_existing(
-            sim=sim,
-            pid_maps_sel=pid_maps_sel,
-            ahf_particles_file=ahf_particles_file,
-            final_shards=final_shards,
+        _rank0_log("stage3: rebuilding direct shard runtime")
+        direct_state = build_direct_state(snapshot_file, ahf_particles_file)
+
+    final_galaxies = []
+    for path in final_shards:
+        payload = _load_pickle(Path(path))
+        records = (
+            candidate_records_from_table_payload(payload)
+            if isinstance(payload, dict) and "ahf_halo_id" in payload
+            else list(payload)
         )
+        final_galaxies.extend(records)
+
+    sim = _build_direct_stage3_runtime(
+        direct_state,
+        galaxy_payloads=final_galaxies,
+        nproc=int(nproc),
+    )
 
     for idx, halo in enumerate(sim.halo_list):
         halo._merge_id = int(idx)
@@ -1301,19 +1341,53 @@ def _rank0_run_stage3_and_save(
         worker_roles={int(cap.rank): "prop_worker" for cap in worker_caps},
     )
 
-    halo_by_id = {int(getattr(halo, "AHF_haloID", -1)): halo for halo in sim.halo_list}
+    halo_by_id = {int(getattr(halo, "_merge_id", -1)): halo for halo in sim.halo_list}
     gal_by_id = {int(getattr(gal, "_merge_id", -1)): gal for gal in sim.galaxy_list}
+    seen_halo_ids = set()
+    seen_gal_ids = set()
 
     for result in stage3_results:
         shard = _load_pickle(Path(result["shard_path"]))
         for state in shard.get("halos", []):
-            halo = halo_by_id[int(state["id"])]
+            hid = int(state["id"])
+            halo = halo_by_id[hid]
             _apply_group_state(halo, state)
+            seen_halo_ids.add(hid)
         for state in shard.get("galaxies", []):
-            gal = gal_by_id[int(state["id"])]
+            gid = int(state["id"])
+            gal = gal_by_id[gid]
             _apply_group_state(gal, state)
+            seen_gal_ids.add(gid)
 
-    _complete_finalization_after_properties(sim)
+    expected_halo_ids = {int(getattr(halo, "_merge_id", -1)) for halo in sim.halo_list}
+    expected_gal_ids = {int(getattr(gal, "_merge_id", -1)) for gal in sim.galaxy_list}
+    missing_halo_ids = sorted(expected_halo_ids - seen_halo_ids)
+    missing_gal_ids = sorted(expected_gal_ids - seen_gal_ids)
+    if missing_halo_ids or missing_gal_ids:
+        raise RuntimeError(
+            "Stage-3 shard merge incomplete: "
+            f"missing_halos={missing_halo_ids[:10]} (count={len(missing_halo_ids)}), "
+            f"missing_galaxies={missing_gal_ids[:10]} (count={len(missing_gal_ids)})"
+        )
+
+    bad_halos = [
+        int(getattr(halo, "AHF_haloID", -1))
+        for halo in sim.halo_list
+        if not hasattr(halo, "masses") or "total" not in getattr(halo, "masses", {})
+    ]
+    bad_gals = [
+        int(getattr(gal, "AHF_haloID", -1))
+        for gal in sim.galaxy_list
+        if not hasattr(gal, "masses") or "stellar" not in getattr(gal, "masses", {})
+    ]
+    if bad_halos or bad_gals:
+        raise RuntimeError(
+            "Stage-3 properties incomplete before finalization: "
+            f"halos_missing_total={bad_halos[:10]} (count={len(bad_halos)}), "
+            f"galaxies_missing_stellar={bad_gals[:10]} (count={len(bad_gals)})"
+        )
+
+    _complete_finalization_after_properties_direct(sim)
     sim.save(output_file)
     _rank0_log(f"stage3: saved catalogue to {output_file}")
 

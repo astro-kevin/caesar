@@ -1,0 +1,297 @@
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import h5py
+import numpy as np
+import pandas as pd
+
+
+ROOT = Path(__file__).resolve().parents[1] / "caesar"
+if str(ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(ROOT.parent))
+sys.modules.pop("caesar", None)
+
+
+def _load_module(name: str, filename: str):
+    module_path = ROOT / filename
+    spec = importlib.util.spec_from_file_location(name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+tables_mod = _load_module("ahf_subhalo_tables_mod", "ahf_subhalo_tables.py")
+hdf5_mod = _load_module("ahf_subhalo_hdf5_mod", "ahf_subhalo_hdf5.py")
+subhalo_mod = _load_module("ahf_subhalo_runtime_mod", "AHF_subhalo.py")
+
+
+def _write_test_snapshot(path: Path) -> None:
+    with h5py.File(path, "w") as handle:
+        header = handle.create_group("Header")
+        header.attrs["BoxSize"] = 100000.0
+        header.attrs["HubbleParam"] = 0.5
+        header.attrs["Omega0"] = 0.3
+        header.attrs["OmegaLambda"] = 0.7
+        header.attrs["Redshift"] = 1.0
+        header.attrs["Time"] = 0.5
+        header.attrs["MassTable"] = np.zeros(6, dtype=np.float64)
+
+        gas = handle.create_group("PartType0")
+        gas["ParticleIDs"] = np.asarray([1001, 1002], dtype=np.int64)
+        gas["Coordinates"] = np.asarray([[1.0, 2.0, 3.0], [5.0, 6.0, 7.0]], dtype=np.float32)
+        gas["Velocities"] = np.asarray([[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]], dtype=np.float32)
+        gas["Masses"] = np.asarray([1.0, 2.0], dtype=np.float32)
+        gas["Density"] = np.asarray([1.0e-3, 2.0e-3], dtype=np.float32)
+        gas["InternalEnergy"] = np.asarray([1.0, 2.0], dtype=np.float32)
+        gas["ElectronAbundance"] = np.asarray([0.5, 1.0], dtype=np.float32)
+        gas["StarFormationRate"] = np.asarray([0.0, 1.0], dtype=np.float32)
+        gas["GrackleHI"] = np.asarray([0.7, 0.2], dtype=np.float32)
+        gas["FractionH2"] = np.asarray([0.1, 0.5], dtype=np.float32)
+        gas["Metallicity"] = np.asarray([[0.02], [0.03]], dtype=np.float32)
+
+        dm = handle.create_group("PartType1")
+        dm["ParticleIDs"] = np.asarray([2001, 2002], dtype=np.int64)
+        dm["Coordinates"] = np.asarray([[11.0, 12.0, 13.0], [15.0, 16.0, 17.0]], dtype=np.float32)
+        dm["Velocities"] = np.asarray([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
+        dm["Masses"] = np.asarray([3.0, 4.0], dtype=np.float32)
+        dm["Potential"] = np.asarray([-1.0, -2.0], dtype=np.float32)
+
+        star = handle.create_group("PartType4")
+        star["ParticleIDs"] = np.asarray([3001, 3002], dtype=np.int64)
+        star["Coordinates"] = np.asarray([[21.0, 22.0, 23.0], [25.0, 26.0, 27.0]], dtype=np.float32)
+        star["Velocities"] = np.asarray([[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]], dtype=np.float32)
+        star["Masses"] = np.asarray([5.0, 6.0], dtype=np.float32)
+        star["StellarFormationTime"] = np.asarray([0.25, 0.4], dtype=np.float32)
+        star["Metallicity"] = np.asarray([[0.01], [0.015]], dtype=np.float32)
+
+        bh = handle.create_group("PartType5")
+        bh["ParticleIDs"] = np.asarray([4001], dtype=np.int64)
+        bh["Coordinates"] = np.asarray([[31.0, 32.0, 33.0]], dtype=np.float32)
+        bh["Velocities"] = np.asarray([[13.0, 14.0, 15.0]], dtype=np.float32)
+        bh["Masses"] = np.asarray([7.0], dtype=np.float32)
+        bh["BH_Mass"] = np.asarray([8.0], dtype=np.float32)
+        bh["BH_Mdot"] = np.asarray([0.25], dtype=np.float32)
+
+
+def test_ragged_index_block_round_trip():
+    block = tables_mod.RaggedIndexBlock.from_sequences([[1, 2], [], [3]])
+    assert np.array_equal(block.offsets, np.asarray([0, 2, 2, 3], dtype=np.int64))
+    assert np.array_equal(block.get(0), np.asarray([1, 2], dtype=np.int64))
+    assert np.array_equal(block.get(1), np.empty(0, dtype=np.int64))
+    payload = block.to_payload()
+    restored = tables_mod.RaggedIndexBlock.from_payload(payload)
+    assert np.array_equal(restored.offsets, block.offsets)
+    assert np.array_equal(restored.data, block.data)
+
+
+def test_candidate_galaxy_table_round_trip():
+    records = [
+        {
+            "AHF_haloID": 10,
+            "AHF_parent_haloID": 0,
+            "AHF_top_haloID": 10,
+            "AHF_depth": 0,
+            "AHF_ancestor_haloIDs": np.asarray([], dtype=np.int64),
+            "glist": np.asarray([1, 2], dtype=np.int32),
+            "slist": np.asarray([3], dtype=np.int32),
+            "dmlist": np.asarray([], dtype=np.int32),
+            "bhlist": np.asarray([4], dtype=np.int32),
+            "dlist": np.asarray([], dtype=np.int32),
+        },
+        {
+            "AHF_haloID": 11,
+            "AHF_parent_haloID": 10,
+            "AHF_top_haloID": 10,
+            "AHF_depth": 1,
+            "AHF_ancestor_haloIDs": np.asarray([10], dtype=np.int64),
+            "glist": np.asarray([], dtype=np.int32),
+            "slist": np.asarray([5, 6], dtype=np.int32),
+            "dmlist": np.asarray([7], dtype=np.int32),
+            "bhlist": np.asarray([], dtype=np.int32),
+            "dlist": np.asarray([], dtype=np.int32),
+        },
+    ]
+    table = tables_mod.candidate_records_to_table(records)
+    restored = tables_mod.candidate_records_from_table_payload(table.to_payload())
+    assert len(restored) == 2
+    assert restored[0]["AHF_haloID"] == 10
+    assert np.array_equal(restored[0]["glist"], np.asarray([1, 2], dtype=np.int32))
+    assert np.array_equal(restored[1]["AHF_ancestor_haloIDs"], np.asarray([10], dtype=np.int64))
+    assert np.array_equal(restored[1]["dmlist"], np.asarray([7], dtype=np.int32))
+
+
+def test_direct_hdf5_snapshot_loading(tmp_path):
+    snapshot = tmp_path / "snap.hdf5"
+    _write_test_snapshot(snapshot)
+
+    meta = hdf5_mod.load_snapshot_meta(str(snapshot))
+    assert meta.snapshot_file == str(snapshot)
+    assert meta.ptypes == ("gas", "dm", "star", "bh")
+    assert meta.units["mass"] == "Msun"
+    assert np.isclose(meta.boxsize, 200000.0)
+
+    shard = hdf5_mod.load_particle_shard(str(snapshot))
+    gas = shard.table("gas")
+    dm = shard.table("dm")
+    star = shard.table("star")
+    bh = shard.table("bh")
+
+    assert np.allclose(gas.get("pos")[0], np.asarray([2.0, 4.0, 6.0], dtype=np.float32))
+    assert np.allclose(dm.get("mass"), np.asarray([6.0e10, 8.0e10], dtype=np.float32))
+    assert gas.has("gnh")
+    assert gas.has("gT")
+    assert gas.has("gfHI")
+    assert gas.has("gfH2")
+    assert star.has("age")
+    assert bh.has("bhmass")
+    assert bh.has("bhmdot")
+
+
+def test_build_ahf_node_table_maps_memberships(monkeypatch, tmp_path):
+    snapshot = tmp_path / "snap.hdf5"
+    _write_test_snapshot(snapshot)
+    shard = hdf5_mod.load_particle_shard(str(snapshot))
+
+    hierarchy = SimpleNamespace(
+        parent_of={10: 0, 11: 10},
+        children_of={10: [11], 11: []},
+    )
+    halos_df = pd.DataFrame(
+        {
+            "hid": np.asarray([10, 11], dtype=np.int64),
+            "host_hid": np.asarray([0, 10], dtype=np.int64),
+            "npart": np.asarray([4, 2], dtype=np.int64),
+            "n_star": np.asarray([1, 1], dtype=np.int64),
+        }
+    )
+    memberships = {
+        10: np.asarray([[1001, 0], [2001, 1], [3001, 4], [4001, 5]], dtype=np.int64),
+        11: np.asarray([[1002, 0], [3002, 4]], dtype=np.int64),
+    }
+
+    monkeypatch.setattr(hdf5_mod, "load_ahf_hierarchy", lambda _: hierarchy)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_halos_dataframe", lambda _: halos_df)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_particle_blocks", lambda *args, **kwargs: memberships)
+
+    nodes = hdf5_mod.build_ahf_node_table("dummy.AHF_particles", shard)
+    assert np.array_equal(nodes.halo_id, np.asarray([10, 11], dtype=np.int64))
+    assert np.array_equal(nodes.parent_halo_id, np.asarray([0, 10], dtype=np.int64))
+    assert np.array_equal(nodes.top_halo_id, np.asarray([10, 10], dtype=np.int64))
+    assert np.array_equal(nodes.depth, np.asarray([0, 1], dtype=np.int64))
+    assert np.array_equal(nodes.ancestors_for(0), np.empty(0, dtype=np.int64))
+    assert np.array_equal(nodes.ancestors_for(1), np.asarray([10], dtype=np.int64))
+    assert np.array_equal(nodes.members_for(0, "gas"), np.asarray([0], dtype=np.int64))
+    assert np.array_equal(nodes.members_for(0, "dm"), np.asarray([0], dtype=np.int64))
+    assert np.array_equal(nodes.members_for(0, "star"), np.asarray([0], dtype=np.int64))
+    assert np.array_equal(nodes.members_for(0, "bh"), np.asarray([0], dtype=np.int64))
+    assert np.array_equal(nodes.members_for(1, "gas"), np.asarray([1], dtype=np.int64))
+    assert np.array_equal(nodes.members_for(1, "star"), np.asarray([1], dtype=np.int64))
+    assert np.array_equal(nodes.star_count, np.asarray([1, 1], dtype=np.int64))
+    assert np.array_equal(nodes.dm_count, np.asarray([1, 0], dtype=np.int64))
+    assert np.array_equal(nodes.fof_candidates, np.asarray([4, 2], dtype=np.int64))
+
+
+def test_build_task_payload_uses_direct_particle_tables(monkeypatch, tmp_path):
+    snapshot = tmp_path / "snap.hdf5"
+    _write_test_snapshot(snapshot)
+
+    hierarchy = SimpleNamespace(
+        parent_of={10: 0},
+        children_of={10: []},
+    )
+    halos_df = pd.DataFrame(
+        {
+            "hid": np.asarray([10], dtype=np.int64),
+            "host_hid": np.asarray([0], dtype=np.int64),
+            "npart": np.asarray([5], dtype=np.int64),
+            "n_star": np.asarray([1], dtype=np.int64),
+        }
+    )
+    memberships = {
+        10: np.asarray([[1002, 0], [2001, 1], [3001, 4], [4001, 5]], dtype=np.int64),
+    }
+
+    monkeypatch.setattr(hdf5_mod, "load_ahf_hierarchy", lambda _: hierarchy)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_halos_dataframe", lambda _: halos_df)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_particle_blocks", lambda *args, **kwargs: memberships)
+
+    state = hdf5_mod.build_direct_state(str(snapshot), "dummy.AHF_particles")
+    task = SimpleNamespace(node_id=10)
+    payload = hdf5_mod.build_task_payload(
+        state,
+        task=task,
+        fof_nHlim=0.0,
+        fof_Tlim=1.0e9,
+        fof_use_sfr_gate=True,
+    )
+    assert payload is not None
+    assert np.array_equal(payload["gas_sel"], np.asarray([1], dtype=np.int32))
+    assert np.array_equal(payload["star_sel"], np.asarray([0], dtype=np.int32))
+    assert np.array_equal(payload["bh_sel"], np.asarray([0], dtype=np.int32))
+    assert np.array_equal(payload["dm_sel"], np.asarray([0], dtype=np.int32))
+    assert payload["eligible_pos"].shape == (3, 3)
+    assert payload["eligible_vel"].shape == (3, 3)
+
+
+def test_direct_stage3_runtime_can_compute_and_save(monkeypatch, tmp_path):
+    snapshot = tmp_path / "snap.hdf5"
+    _write_test_snapshot(snapshot)
+
+    hierarchy = SimpleNamespace(
+        parent_of={10: 0},
+        children_of={10: []},
+    )
+    halos_df = pd.DataFrame(
+        {
+            "hid": np.asarray([10], dtype=np.int64),
+            "host_hid": np.asarray([0], dtype=np.int64),
+            "npart": np.asarray([4], dtype=np.int64),
+            "n_star": np.asarray([1], dtype=np.int64),
+        }
+    )
+    memberships = {
+        10: np.asarray([[1002, 0], [2001, 1], [3001, 4], [4001, 5]], dtype=np.int64),
+    }
+
+    monkeypatch.setattr(hdf5_mod, "load_ahf_hierarchy", lambda _: hierarchy)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_halos_dataframe", lambda _: halos_df)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_particle_blocks", lambda *args, **kwargs: memberships)
+
+    state = hdf5_mod.build_direct_state(str(snapshot), "dummy.AHF_particles")
+    galaxy_payloads = [
+        {
+            "AHF_haloID": 10,
+            "AHF_parent_haloID": 0,
+            "AHF_top_haloID": 10,
+            "AHF_depth": 0,
+            "AHF_ancestor_haloIDs": np.asarray([], dtype=np.int64),
+            "glist": np.asarray([1], dtype=np.int32),
+            "slist": np.asarray([0], dtype=np.int32),
+            "dmlist": np.asarray([], dtype=np.int32),
+            "bhlist": np.asarray([0], dtype=np.int32),
+            "dlist": np.asarray([], dtype=np.int32),
+        }
+    ]
+
+    sim = subhalo_mod._build_direct_stage3_runtime(
+        state,
+        galaxy_payloads=galaxy_payloads,
+        nproc=1,
+    )
+    subhalo_mod._compute_group_properties_subset(sim, group_type="halo", groups=list(sim.halo_list))
+    subhalo_mod._compute_group_properties_subset(sim, group_type="galaxy", groups=list(sim.galaxy_list))
+    subhalo_mod._complete_finalization_after_properties_direct(sim)
+
+    outfile = tmp_path / "caesar_direct.hdf5"
+    sim.save(str(outfile))
+
+    with h5py.File(outfile, "r") as handle:
+        assert int(handle.attrs["nhalos"]) == 1
+        assert int(handle.attrs["ngalaxies"]) == 1
+        assert np.array_equal(handle["halo_data/AHF_haloID"][:], np.asarray([10], dtype=np.int64))
+        assert np.array_equal(handle["galaxy_data/AHF_haloID"][:], np.asarray([10], dtype=np.int64))

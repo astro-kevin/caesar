@@ -8,6 +8,9 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1] / "caesar"
+if str(ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(ROOT.parent))
+sys.modules.pop("caesar", None)
 
 
 def _load_module(name: str, filename: str):
@@ -60,6 +63,52 @@ class DummySim:
 def test_resolve_mode_ahf_subhalo():
     mode = modes_mod.resolve_mode({"haloid": "AHF-subhalo", "haloid_file": "x"})
     assert mode == modes_mod.Mode.AHF_SUBHALO
+
+
+def test_run_uses_direct_runtime_entrypoint(monkeypatch, tmp_path):
+    calls = {}
+
+    class FakeDS:
+        directory = str(tmp_path)
+        basename = "snap.hdf5"
+
+    class FakeObj:
+        def __init__(self):
+            self._args = ()
+            self._kwargs = {"haloid_file": "dummy.AHF_particles", "nproc": 2}
+            self._ds = FakeDS()
+            self.nproc = 1
+
+    fake_obj = FakeObj()
+
+    import caesar.group as group_pkg
+
+    monkeypatch.setattr(group_pkg, "get_min_stars", lambda _obj: 16)
+
+    def fake_direct(snapshot_file, ahf_particles_file, *, kwargs, nproc, min_stars):
+        calls["snapshot_file"] = snapshot_file
+        calls["ahf_particles_file"] = ahf_particles_file
+        calls["kwargs"] = dict(kwargs)
+        calls["nproc"] = int(nproc)
+        calls["min_stars"] = int(min_stars)
+        return SimpleNamespace(marker="direct-runtime")
+
+    def fake_adopt(obj, runtime):
+        calls["adopt_obj"] = obj
+        calls["adopt_runtime"] = runtime
+
+    monkeypatch.setattr(subhalo_mod, "_run_ahf_subhalo_direct", fake_direct)
+    monkeypatch.setattr(subhalo_mod, "_adopt_caesar_runtime", fake_adopt)
+
+    subhalo_mod.run(fake_obj)
+
+    assert calls["snapshot_file"] == str(tmp_path / "snap.hdf5")
+    assert calls["ahf_particles_file"] == "dummy.AHF_particles"
+    assert calls["kwargs"]["haloid_file"] == "dummy.AHF_particles"
+    assert calls["nproc"] == 2
+    assert calls["min_stars"] == 16
+    assert calls["adopt_obj"] is fake_obj
+    assert getattr(calls["adopt_runtime"], "marker", "") == "direct-runtime"
 
 
 def test_ancestor_chain_and_task_manifest():

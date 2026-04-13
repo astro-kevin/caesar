@@ -1012,6 +1012,7 @@ def _ensure_missing_ahf_halos(
     missing_ids: Set[int],
     ahf_particles_file: str,
     pid_maps_sel: Dict[str, _PidLookup],
+    recompute_properties: bool = True,
 ) -> Dict[int, int]:
     """Guarantee that each requested AHF halo ID has a CAESAR halo entry.
 
@@ -1169,7 +1170,7 @@ def _ensure_missing_ahf_halos(
         sim.halo_list.append(halo)
         created[hid] = halo.GroupID
 
-    if created:
+    if created and recompute_properties:
         try:
             from types import SimpleNamespace
             from caesar.group import get_group_properties

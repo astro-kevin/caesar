@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+import os
 from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -224,6 +225,50 @@ def _build_task_manifest(
     return tasks, tasks_by_root
 
 
+def _build_task_manifest_from_direct_state(
+    state,
+    *,
+    min_stars: int,
+) -> Tuple[List[AHFSubhaloTask], Dict[int, List[AHFSubhaloTask]]]:
+    tasks: List[AHFSubhaloTask] = []
+    tasks_by_root: Dict[int, List[AHFSubhaloTask]] = {}
+    for idx in range(len(state.nodes)):
+        node_id = int(state.nodes.halo_id[idx])
+        parent_id = int(state.nodes.parent_halo_id[idx])
+        top_id = int(state.nodes.top_halo_id[idx])
+        depth = int(state.nodes.depth[idx])
+        star_count = int(state.nodes.star_count[idx])
+        if star_count < int(min_stars):
+            continue
+        dm_count = int(state.nodes.dm_count[idx])
+        min_dm = (
+            int(MINIMUM_DM_PER_TOPLEVEL_AHF_HALO)
+            if int(parent_id) <= 0
+            else int(MINIMUM_DM_PER_AHF_SUBHALO)
+        )
+        if dm_count < int(min_dm):
+            continue
+        task = AHFSubhaloTask(
+            node_id=node_id,
+            parent_id=parent_id,
+            top_id=top_id,
+            depth=depth,
+            ancestors=tuple(int(v) for v in state.nodes.ancestors_for(idx).tolist()),
+            star_count=star_count,
+            fof_candidates=int(max(1, int(state.nodes.fof_candidates[idx]))),
+        )
+        tasks.append(task)
+        tasks_by_root.setdefault(int(top_id), []).append(task)
+
+    tasks.sort(key=lambda task: (int(task.top_id), int(task.depth), int(task.node_id)))
+    for root_id in list(tasks_by_root.keys()):
+        tasks_by_root[int(root_id)] = sorted(
+            tasks_by_root[int(root_id)],
+            key=lambda task: (int(task.depth), int(task.node_id)),
+        )
+    return tasks, tasks_by_root
+
+
 def _env_int(name: str, default: int) -> int:
     import os
 
@@ -249,6 +294,52 @@ def _env_str(name: str, default: str) -> str:
     if value is None:
         return str(default)
     return str(value)
+
+
+def _snapshot_file_from_obj(obj) -> str:
+    if hasattr(obj, "_kwargs") and obj._kwargs.get("snapshot_file"):
+        return str(obj._kwargs["snapshot_file"])
+
+    ds = getattr(obj, "_ds", None)
+    if ds not in (None, 0):
+        directory = getattr(ds, "directory", None)
+        basename = getattr(ds, "basename", None)
+        if directory and basename:
+            return os.path.join(str(directory), str(basename))
+        fullpath = getattr(ds, "fullpath", None)
+        if fullpath and basename:
+            return os.path.join(str(fullpath), str(basename))
+        if fullpath and os.path.isfile(str(fullpath)):
+            return str(fullpath)
+
+    try:
+        ds = obj.yt_dataset
+        directory = getattr(ds, "directory", None)
+        basename = getattr(ds, "basename", None)
+        if directory and basename:
+            return os.path.join(str(directory), str(basename))
+    except Exception:
+        pass
+
+    raise ValueError("AHF-subhalo direct path could not determine the snapshot file from the CAESAR object.")
+
+
+def _direct_fof_linking_length(snapshot, *, kwargs: Optional[Dict[str, object]] = None) -> float:
+    ndm = int(snapshot.particle_counts.get("dm", 0))
+    if ndm <= 0:
+        raise RuntimeError("AHF-subhalo direct runtime requires dark-matter particles to compute fof_ll")
+
+    opts = dict(kwargs or {})
+    b = 0.2
+    if isinstance(opts.get("b_halo"), (int, float)):
+        b = float(opts["b_halo"])
+    if isinstance(opts.get("b_galaxy"), (int, float)):
+        b = float(opts["b_galaxy"])
+    else:
+        b *= 0.1
+
+    mis = float(snapshot.boxsize) / float(ndm) ** (1.0 / 3.0)
+    return float(mis * b)
 
 
 def _dense_gas_selected(
@@ -442,26 +533,26 @@ def _concat_unique_index_arrays(values: Iterable[np.ndarray]) -> np.ndarray:
 class _ShardYTUnitHelper:
     def __init__(self, *, redshift: float = 0.0):
         self.scale_factor = 1.0 / (1.0 + max(float(redshift), 0.0))
-        from unyt import unyt_quantity
+        from yt.units.yt_array import UnitRegistry
+        from yt.units.yt_array import YTQuantity
         from unyt.dimensions import length
-        from unyt.unit_registry import UnitRegistry
 
-        self.registry = UnitRegistry()
+        self.unit_registry = UnitRegistry()
         for symbol, base_unit in (("pccm", "pc"), ("kpccm", "kpc"), ("Mpccm", "Mpc")):
-            base_value = float((unyt_quantity(1.0, base_unit) * self.scale_factor).to("cm").value)
-            self.registry.add(symbol, base_value, length, tex_repr=f"\\rm{{{symbol}}}")
+            base_value = float((YTQuantity(1.0, base_unit) * self.scale_factor).to("cm").value)
+            self.unit_registry.add(symbol, base_value, length, tex_repr=f"\\rm{{{symbol}}}")
 
     def quan(self, value, unit):
-        from unyt import unyt_quantity
+        from yt.units.yt_array import YTQuantity
 
         u = "dimensionless" if unit in (None, "") else str(unit)
-        return unyt_quantity(value, u, registry=self.registry)
+        return YTQuantity(value, u, registry=self.unit_registry)
 
     def arr(self, value, unit):
-        from unyt import unyt_array
+        from yt.units.yt_array import YTArray
 
         u = "dimensionless" if unit in (None, "") else str(unit)
-        return unyt_array(value, u, registry=self.registry)
+        return YTArray(value, u, registry=self.unit_registry)
 
 
 class _ShardDatasetType:
@@ -733,6 +824,8 @@ def _build_stage3_property_runtime(payload: Dict[str, object], *, nproc: int):
         halo.bhlist = np.asarray(rec["bhlist"], dtype=np.int64)
         halo.dlist = np.asarray(rec["dlist"], dtype=np.int64)
         halo.galaxy_index_list = np.asarray(rec.get("galaxy_index_list", []), dtype=np.int32)
+        if "_merge_id" in rec:
+            halo._merge_id = int(rec["_merge_id"])
         halo_list.append(halo)
 
     galaxy_list = []
@@ -1252,7 +1345,10 @@ def _compute_single_group_properties_selfcontained(sim, group, group_type: str) 
         if np.any(valid):
             rhocrit = float(getattr(sim.simulation.critical_density.to("Msun/kpc**3"), "value", sim.simulation.critical_density.to("Msun/kpc**3").d))
             overdensity = np.full_like(r_sorted, np.nan, dtype=np.float64)
-            overdensity[valid] = m_sorted[valid] / ((4.0 / 3.0) * np.pi * r_sorted[valid] ** 3 * rhocrit)
+            if rhocrit > 0.0:
+                overdensity[valid] = m_sorted[valid] / (
+                    (4.0 / 3.0) * np.pi * r_sorted[valid] ** 3 * rhocrit
+                )
             for factor in (200, 500, 2500):
                 mask = overdensity >= float(factor)
                 if np.any(mask):
@@ -2290,6 +2386,7 @@ def _prepare_final_subhalo_galaxies(
     ahf_particles_file: str,
     galaxy_list: Sequence,
     pid_maps_sel,
+    compute_missing_halo_properties: bool = True,
 ):
     from caesar.halo_matching import _ensure_missing_ahf_halos, _prune_halos_after_galaxies, _update_ahf_galaxy_maps
 
@@ -2322,7 +2419,13 @@ def _prepare_final_subhalo_galaxies(
         if int(gal.AHF_top_haloID) not in ahf_to_halo_index
     }
     if missing_top_ids:
-        _ensure_missing_ahf_halos(sim, missing_top_ids, ahf_particles_file, pid_maps_sel)
+        _ensure_missing_ahf_halos(
+            sim,
+            missing_top_ids,
+            ahf_particles_file,
+            pid_maps_sel,
+            recompute_properties=bool(compute_missing_halo_properties),
+        )
         ahf_to_halo_index = {}
         for halo_index, halo in enumerate(sim.halo_list):
             ahf_hid = getattr(halo, "AHF_haloID", None)
@@ -2431,6 +2534,420 @@ def _complete_finalization_after_properties(sim):
 
     reset_global_particle_IDs(sim)
     load_global_lists(sim)
+
+
+def _direct_group_global_indexes(sim, group) -> np.ndarray:
+    dm = sim.data_manager
+    blocks = []
+    for group_attr, dm_attr in (
+        ("glist", "glist"),
+        ("slist", "slist"),
+        ("dmlist", "dmlist"),
+        ("bhlist", "bhlist"),
+        ("dlist", "dlist"),
+    ):
+        if not hasattr(group, group_attr) or not hasattr(dm, dm_attr):
+            continue
+        local = np.asarray(getattr(group, group_attr), dtype=np.int64)
+        if local.size == 0:
+            continue
+        blocks.append(np.asarray(getattr(dm, dm_attr)[local], dtype=np.int64))
+    if not blocks:
+        return np.empty(0, dtype=np.int64)
+    return np.concatenate(blocks).astype(np.int64, copy=False)
+
+
+def _build_direct_stage3_runtime(
+    state,
+    *,
+    galaxy_payloads: Sequence[Dict[str, np.ndarray | int]],
+    nproc: int,
+    kwargs: Optional[Dict[str, object]] = None,
+):
+    import os
+    from types import SimpleNamespace
+
+    from caesar.group import create_new_group
+    from caesar.main import CAESAR
+    from caesar.property_manager import ptype_ints
+
+    sim = CAESAR()
+    sim._kwargs = dict(kwargs or {})
+    sim.units = dict(state.snapshot.units)
+    sim.load_pot = True
+    sim.nproc = int(max(1, nproc))
+    sim._ds = _ShardYTUnitHelper(redshift=float(state.snapshot.redshift))
+
+    z = float(state.snapshot.redshift)
+    a = float(state.snapshot.scale_factor)
+    om0 = float(state.snapshot.omega_matter)
+    ol0 = float(state.snapshot.omega_lambda)
+    ok0 = float(state.snapshot.omega_curvature)
+    ez = float(np.sqrt(ol0 + ok0 * (1.0 + z) ** 2 + om0 * (1.0 + z) ** 3))
+    omz = float(om0 * (1.0 + z) ** 3 / (ez * ez)) if ez > 0.0 else float(om0)
+    h0_s = float(state.snapshot.hubble_constant) * 100.0 * 3.24077929e-20
+    hz_s = float(h0_s * ez)
+
+    sim.simulation.cosmological_simulation = True
+    sim.simulation.XH = 0.76
+    sim.simulation.redshift = z
+    sim.simulation.scale_factor = a
+    sim.simulation.omega_matter = om0
+    sim.simulation.omega_lambda = ol0
+    sim.simulation.omega_baryon = 0.0
+    sim.simulation.Om_z = omz
+    sim.simulation.E_z = ez
+    sim.simulation.fullpath = os.path.dirname(str(state.snapshot.snapshot_file))
+    sim.simulation.basename = os.path.basename(str(state.snapshot.snapshot_file))
+    sim.simulation.parameters = {}
+    sim.simulation.ds_type = "GadgetHDF5Dataset"
+    sim.simulation.time = sim.yt_dataset.quan(float(state.snapshot.time_gyr), "Gyr")
+    sim.simulation.H_z = sim.yt_dataset.quan(hz_s, "1/s")
+    sim.simulation.G = sim.yt_dataset.quan(4.51691362044e-39, "kpc**3/(Msun * s**2)")
+    sim.simulation.boxsize = sim.yt_dataset.quan(float(state.snapshot.boxsize), sim.units["length"])
+    sim.simulation.boxsize_units = str(sim.simulation.boxsize.units)
+    sim.simulation.search_radius = sim.yt_dataset.arr([300.0, 1000.0, 3000.0], sim.units["length"])
+    sim.simulation.critical_density = sim.yt_dataset.quan(
+        float(state.snapshot.critical_density_msun_kpc3),
+        "Msun/kpc**3",
+    )
+    sim.simulation.Densities = sim.yt_dataset.arr(
+        np.asarray(
+            [
+                200.0 * float(state.snapshot.critical_density_msun_kpc3),
+                500.0 * float(state.snapshot.critical_density_msun_kpc3),
+                2500.0 * float(state.snapshot.critical_density_msun_kpc3),
+            ],
+            dtype=np.float64,
+        ),
+        "Msun/kpc**3",
+    )
+    sim.simulation.ngas = int(state.snapshot.particle_counts.get("gas", 0))
+    sim.simulation.nstar = int(state.snapshot.particle_counts.get("star", 0))
+    sim.simulation.nbh = int(state.snapshot.particle_counts.get("bh", 0))
+    sim.simulation.ndust = int(state.snapshot.particle_counts.get("dust", 0))
+    sim.simulation.ndm = int(state.snapshot.particle_counts.get("dm", 0))
+    sim.simulation.ndm2 = int(state.snapshot.particle_counts.get("dm2", 0))
+    sim.simulation.ndm3 = int(state.snapshot.particle_counts.get("dm3", 0))
+    sim.simulation.ntot = int(sum(int(v) for v in state.snapshot.particle_counts.values()))
+
+    ordered_ptypes = [
+        ptype for ptype in ("gas", "dm", "dm2", "dm3", "star", "bh", "dust")
+        if state.particles.has_ptype(ptype)
+    ]
+    offsets: Dict[str, int] = {}
+    pos_blocks = []
+    vel_blocks = []
+    mass_blocks = []
+    pot_blocks = []
+    ptype_blocks = []
+
+    dm = SimpleNamespace()
+    dm.ptypes = list(ordered_ptypes)
+    dm.blackholes = "bh" in ordered_ptypes
+    dm.dust = "dust" in ordered_ptypes
+
+    offset = 0
+    for ptype in ordered_ptypes:
+        table = state.particles.table(ptype)
+        count = len(table)
+        offsets[ptype] = int(offset)
+        setattr(dm, f"{ptype}list" if ptype != "star" else "slist", np.arange(count, dtype=np.int64) + int(offset))
+        if ptype == "gas":
+            dm.glist = np.arange(count, dtype=np.int64) + int(offset)
+        elif ptype == "dm":
+            dm.dmlist = np.arange(count, dtype=np.int64) + int(offset)
+        elif ptype == "bh":
+            dm.bhlist = np.arange(count, dtype=np.int64) + int(offset)
+        elif ptype == "dust":
+            dm.dlist = np.arange(count, dtype=np.int64) + int(offset)
+
+        pos_blocks.append(np.asarray(table.get("pos"), dtype=np.float32))
+        vel_blocks.append(np.asarray(table.get("vel"), dtype=np.float32))
+        mass_blocks.append(np.asarray(table.get("mass"), dtype=np.float32))
+        pot_blocks.append(np.asarray(table.get("pot", np.zeros(count, dtype=np.float32)), dtype=np.float32))
+        ptype_blocks.append(np.full(count, ptype_ints[ptype], dtype=np.int32))
+        for attr in ("gnh", "gsfr", "gZ", "gT", "gfH2", "gfHI", "dustmass", "sZ", "age", "bhmass", "bhmdot"):
+            if table.has(attr):
+                setattr(dm, attr, np.asarray(table.get(attr)))
+        offset += count
+
+    dm.pos = np.concatenate(pos_blocks, axis=0) if pos_blocks else np.empty((0, 3), dtype=np.float32)
+    dm.vel = np.concatenate(vel_blocks, axis=0) if vel_blocks else np.empty((0, 3), dtype=np.float32)
+    dm.mass = np.concatenate(mass_blocks, axis=0) if mass_blocks else np.empty(0, dtype=np.float32)
+    dm.pot = np.concatenate(pot_blocks, axis=0) if pot_blocks else np.empty(0, dtype=np.float32)
+    dm.ptype = np.concatenate(ptype_blocks, axis=0) if ptype_blocks else np.empty(0, dtype=np.int32)
+    dm.indexes = np.arange(dm.mass.size, dtype=np.int64)
+    sim._dm = dm
+    sim._ds_type = _ShardDatasetType(ptypes=dm.ptypes, data_manager_attrs=set(dm.__dict__.keys()))
+    sim.group_types = ["halo", "galaxy"]
+    setattr(sim, "_ahf_matched", True)
+    setattr(sim, "_include_dm_in_galaxies", True)
+
+    def _keep_halo(node_index: int, required_host_ids: set[int]) -> bool:
+        halo_id = int(state.nodes.halo_id[node_index])
+        parent_id = int(state.nodes.parent_halo_id[node_index])
+        dm_count = int(state.nodes.dm_count[node_index])
+        min_dm = int(MINIMUM_DM_PER_TOPLEVEL_AHF_HALO) if parent_id <= 0 else int(MINIMUM_DM_PER_AHF_SUBHALO)
+        return dm_count >= min_dm or halo_id in required_host_ids
+
+    required_host_ids = {int(rec["AHF_top_haloID"]) for rec in galaxy_payloads}
+    ahf_to_halo_index: Dict[int, int] = {}
+    halo_list = []
+    for node_index in range(len(state.nodes)):
+        if not _keep_halo(node_index, required_host_ids):
+            continue
+        halo = create_new_group(sim, "halo")
+        halo.AHF_haloID = int(state.nodes.halo_id[node_index])
+        halo.AHF_parent_haloID = int(state.nodes.parent_halo_id[node_index])
+        halo.AHF_top_haloID = int(state.nodes.top_halo_id[node_index])
+        halo.AHF_depth = int(state.nodes.depth[node_index])
+        halo.AHF_ancestor_haloIDs = np.asarray(state.nodes.ancestors_for(node_index), dtype=np.int64)
+        halo.glist = np.asarray(state.nodes.members_for(node_index, "gas"), dtype=np.int32)
+        halo.slist = np.asarray(state.nodes.members_for(node_index, "star"), dtype=np.int32)
+        halo.dmlist = np.asarray(state.nodes.members_for(node_index, "dm"), dtype=np.int32)
+        halo.bhlist = np.asarray(state.nodes.members_for(node_index, "bh"), dtype=np.int32)
+        halo.dlist = np.asarray(state.nodes.members_for(node_index, "dust"), dtype=np.int32)
+        halo.galaxy_index_list = np.empty(0, dtype=np.int32)
+        halo.global_indexes = _direct_group_global_indexes(sim, halo)
+        ahf_to_halo_index[int(halo.AHF_haloID)] = len(halo_list)
+        halo_list.append(halo)
+
+    galaxy_list = []
+    for payload in galaxy_payloads:
+        gal = create_new_group(sim, "galaxy")
+        gal.AHF_haloID = int(payload["AHF_haloID"])
+        gal.AHF_parent_haloID = int(payload.get("AHF_parent_haloID", -1))
+        gal.AHF_top_haloID = int(payload.get("AHF_top_haloID", -1))
+        gal.AHF_depth = int(payload.get("AHF_depth", 0))
+        gal.AHF_ancestor_haloIDs = np.asarray(payload.get("AHF_ancestor_haloIDs", []), dtype=np.int64)
+        gal.glist = np.asarray(payload.get("glist", []), dtype=np.int32)
+        gal.slist = np.asarray(payload.get("slist", []), dtype=np.int32)
+        gal.dmlist = np.asarray(payload.get("dmlist", []), dtype=np.int32)
+        gal.bhlist = np.asarray(payload.get("bhlist", []), dtype=np.int32)
+        gal.dlist = np.asarray(payload.get("dlist", []), dtype=np.int32)
+        gal.parent_halo_index = int(ahf_to_halo_index.get(int(gal.AHF_top_haloID), -1))
+        gal._ahf_host_halo_index = int(gal.parent_halo_index)
+        if "_merge_id" in payload:
+            gal._merge_id = int(payload["_merge_id"])
+        gal.global_indexes = _direct_group_global_indexes(sim, gal)
+        galaxy_list.append(gal)
+
+    for halo in halo_list:
+        halo.galaxy_index_list = []
+    for gi, gal in enumerate(galaxy_list):
+        host_index = int(getattr(gal, "parent_halo_index", -1))
+        if 0 <= host_index < len(halo_list):
+            halo_list[host_index].galaxy_index_list.append(int(gi))
+    for halo in halo_list:
+        halo.galaxy_index_list = np.asarray(getattr(halo, "galaxy_index_list", []), dtype=np.int32)
+
+    sim.halo_list = halo_list
+    sim.halos = halo_list
+    sim.nhalos = len(halo_list)
+    sim.galaxy_list = galaxy_list
+    sim.galaxies = galaxy_list
+    sim.ngalaxies = len(galaxy_list)
+    sim._ahf_galaxy_hosts = [int(getattr(gal, "parent_halo_index", -1)) for gal in galaxy_list]
+    sim._ahf_galaxy_ahf_ids = [int(getattr(gal, "AHF_haloID", -1)) for gal in galaxy_list]
+    sim._ahf_galaxy_top_ahf_ids = [int(getattr(gal, "AHF_top_haloID", -1)) for gal in galaxy_list]
+    for gal in galaxy_list:
+        idx = int(getattr(gal, "parent_halo_index", -1))
+        gal.halo = halo_list[idx] if 0 <= idx < len(halo_list) else None
+    return sim
+
+
+def _complete_finalization_after_properties_direct(sim):
+    import caesar.assignment as assign
+    import caesar.linking as link
+    from caesar.group import sort_groups
+    from caesar.halo_matching import _update_ahf_galaxy_maps
+    from caesar.utils import calculate_local_densities
+
+    for idx, halo in enumerate(sim.halo_list):
+        halo._old_halo_index = int(idx)
+    sort_groups(sim.halo_list, "total")
+    sim.halos = sim.halo_list
+    sim.nhalos = len(sim.halo_list)
+    old_to_new = {int(getattr(halo, "_old_halo_index", -1)): int(halo.GroupID) for halo in sim.halo_list}
+    for halo in sim.halo_list:
+        if hasattr(halo, "_old_halo_index"):
+            delattr(halo, "_old_halo_index")
+    for gal in sim.galaxy_list:
+        old = int(getattr(gal, "parent_halo_index", -1))
+        new = int(old_to_new.get(old, -1))
+        gal.parent_halo_index = new
+        gal._ahf_host_halo_index = new
+
+    calculate_local_densities(sim, sim.halo_list)
+
+    sort_groups(sim.galaxy_list, "stellar")
+    sim.galaxies = sim.galaxy_list
+    sim.ngalaxies = len(sim.galaxy_list)
+    calculate_local_densities(sim, sim.galaxy_list)
+
+    sim._ahf_galaxy_hosts = [int(getattr(gal, "parent_halo_index", -1)) for gal in sim.galaxy_list]
+    sim._ahf_galaxy_ahf_ids = [int(getattr(gal, "AHF_haloID", -1)) for gal in sim.galaxy_list]
+    sim._ahf_galaxy_top_ahf_ids = [int(getattr(gal, "AHF_top_haloID", -1)) for gal in sim.galaxy_list]
+    _update_ahf_galaxy_maps(sim, sim._ahf_galaxy_ahf_ids)
+
+    assign.assign_galaxies_to_halos(sim)
+    assign.assign_clouds_to_galaxies(sim)
+    link.link_galaxies_and_halos(sim)
+    link.link_clouds_and_galaxies(sim)
+    assign.assign_central_galaxies(sim)
+    link.create_sublists(sim)
+
+    try:
+        if "galaxy" not in sim.group_types:
+            sim.group_types.append("galaxy")
+    except Exception:
+        pass
+
+    load_global_lists(sim)
+
+
+def _adopt_caesar_runtime(target, source) -> None:
+    original_args = getattr(target, "_args", ())
+    original_kwargs = dict(getattr(target, "_kwargs", {}))
+    target.__dict__.clear()
+    target.__dict__.update(source.__dict__)
+    target._args = original_args
+    target._kwargs = original_kwargs
+
+    if hasattr(target, "global_particle_lists") and hasattr(target.global_particle_lists, "obj"):
+        target.global_particle_lists.obj = target
+
+    for halo in getattr(target, "halo_list", []):
+        halo.obj = target
+    for gal in getattr(target, "galaxy_list", []):
+        gal.obj = target
+        host_index = int(getattr(gal, "parent_halo_index", -1))
+        if 0 <= host_index < len(getattr(target, "halo_list", [])):
+            gal.halo = target.halo_list[host_index]
+        else:
+            gal.halo = None
+
+
+def _run_ahf_subhalo_direct(
+    snapshot_file: str,
+    ahf_particles_file: str,
+    *,
+    kwargs: Optional[Dict[str, object]] = None,
+    nproc: int = 1,
+    min_stars: int,
+):
+    from caesar.ahf_subhalo_hdf5 import build_direct_state, build_task_payload
+
+    state = build_direct_state(snapshot_file, ahf_particles_file)
+    tasks, tasks_by_root = _build_task_manifest_from_direct_state(state, min_stars=int(min_stars))
+
+    fof_ll = _direct_fof_linking_length(state.snapshot, kwargs=kwargs)
+    fof_vel_ll = 1.0
+    try:
+        _vel_env = os.environ.get("CAESAR_FOF6D_VEL_LL")
+        if _vel_env not in (None, ""):
+            fof_vel_ll = float(_vel_env)
+    except Exception:
+        pass
+    if os.environ.get("CAESAR_FOF6D_DISABLE_VEL", "0") == "1":
+        fof_vel_ll = None
+
+    fof_nHlim = _env_float("CAESAR_AHF_FAST_FOF_NHLIM", 0.13)
+    fof_Tlim = _env_float("CAESAR_AHF_FAST_FOF_TLIM", 1.0e5)
+    fof_use_sfr_gate = os.environ.get("CAESAR_AHF_FAST_FOF_USE_SFR", "1") == "1"
+    backend = _env_str("CAESAR_AHF_SUBHALO_BACKEND", "auto").lower()
+    if backend == "cpu":
+        backend = "numpy"
+    elif backend == "gpu":
+        backend = "cupy"
+    cc_backend = _env_str("CAESAR_AHF_SUBHALO_CC_BACKEND", "auto").lower()
+    max_pairs_per_batch = max(1, _env_int("CAESAR_AHF_SUBHALO_MAX_PAIRS_PER_BATCH", 5_000_000))
+    tiny_star_threshold = max(int(min_stars), _env_int("CAESAR_AHF_SUBHALO_TINY_STARS", 32))
+    tiny_max_nodes_per_batch = max(1, _env_int("CAESAR_AHF_SUBHALO_TINY_MAX_NODES", 64))
+    tiny_max_fof_candidates_per_batch = max(
+        1,
+        _env_int("CAESAR_AHF_SUBHALO_TINY_MAX_FOF_CANDIDATES", 250_000),
+    )
+
+    task_payloads_by_node: Dict[int, Dict[str, object]] = {}
+    filtered_tasks: List[AHFSubhaloTask] = []
+    filtered_tasks_by_root: Dict[int, List[AHFSubhaloTask]] = {}
+    for task in tasks:
+        payload = build_task_payload(
+            state,
+            task=task,
+            fof_nHlim=float(fof_nHlim),
+            fof_Tlim=float(fof_Tlim),
+            fof_use_sfr_gate=bool(fof_use_sfr_gate),
+        )
+        if payload is None or int(np.asarray(payload["star_sel"]).size) < int(min_stars):
+            continue
+        payload["task"] = _serialize_task(task)
+        task_payloads_by_node[int(task.node_id)] = payload
+        filtered_tasks.append(task)
+        filtered_tasks_by_root.setdefault(int(task.top_id), []).append(task)
+
+    tiny_tasks = [task for task in filtered_tasks if int(task.star_count) <= int(tiny_star_threshold)]
+    regular_tasks = [task for task in filtered_tasks if int(task.star_count) > int(tiny_star_threshold)]
+    work_batches = [
+        AHFSubhaloBatch(tasks=(task,), is_tiny_batch=False, estimated_cost=int(task.fof_candidates))
+        for task in sorted(regular_tasks, key=lambda task: int(task.fof_candidates), reverse=True)
+    ]
+    work_batches.extend(
+        _build_tiny_batches(
+            tiny_tasks,
+            max_nodes_per_batch=int(tiny_max_nodes_per_batch),
+            max_fof_candidates_per_batch=int(tiny_max_fof_candidates_per_batch),
+        )
+    )
+
+    initial_candidates_by_node: Dict[int, List[Dict[str, np.ndarray | int]]] = {
+        int(task.node_id): [] for task in filtered_tasks
+    }
+    for batch in work_batches:
+        batch_payload = {
+            "batch": _serialize_batch(batch),
+            "task_payloads": [task_payloads_by_node[int(task.node_id)] for task in batch.tasks],
+        }
+        batch_results = _fof_on_batch_payload(
+            batch_payload=batch_payload,
+            min_stars=int(min_stars),
+            fof_ll=float(fof_ll),
+            fof_vel_ll=fof_vel_ll,
+            backend=backend,
+            cc_backend=cc_backend,
+            max_pairs_per_batch=int(max_pairs_per_batch),
+        )
+        for node_id, records in batch_results.items():
+            initial_candidates_by_node[int(node_id)].extend(list(records))
+
+    final_galaxies: List[Dict[str, np.ndarray | int]] = []
+    for root_id, root_tasks in sorted(filtered_tasks_by_root.items(), key=lambda kv: int(kv[0])):
+        final_galaxies.extend(
+            _reconcile_root_payload(
+                tasks=root_tasks,
+                initial_candidates_by_node=initial_candidates_by_node,
+                task_payloads_by_node=task_payloads_by_node,
+                min_stars=int(min_stars),
+                fof_ll=float(fof_ll),
+                fof_vel_ll=fof_vel_ll,
+                backend=backend,
+                cc_backend=cc_backend,
+                max_pairs_per_batch=int(max_pairs_per_batch),
+            )
+        )
+
+    sim = _build_direct_stage3_runtime(
+        state,
+        galaxy_payloads=final_galaxies,
+        nproc=int(max(1, nproc)),
+        kwargs=dict(kwargs or {}),
+    )
+    _compute_group_properties_subset(sim, group_type="halo", groups=list(sim.halo_list))
+    _compute_group_properties_subset(sim, group_type="galaxy", groups=list(sim.galaxy_list))
+    _complete_finalization_after_properties_direct(sim)
+    return sim
 
 
 def build_galaxies_from_ahf_subhalo(
@@ -2725,21 +3242,18 @@ def run(obj):
             obj.nproc = joblib.cpu_count()
     mylog.info("member_search() running on %d cores" % obj.nproc)
 
-    from caesar.AHF_FAST_halos import build_halos_from_ahf_fast
-
     if not obj._kwargs.get("haloid_file"):
         raise ValueError("AHF-subhalo requires an AHF_particles file via haloid_file.")
-
-    halos = build_halos_from_ahf_fast(obj, obj._kwargs["haloid_file"])
-    if halos is None:
-        return
-    if not obj.simulation.baryons_present:
-        return
 
     from caesar.group import get_min_stars
 
     ms = get_min_stars(obj)
-    build_galaxies_from_ahf_subhalo(obj, obj._kwargs["haloid_file"], min_stars=ms)
-
-    reset_global_particle_IDs(obj)
-    load_global_lists(obj)
+    snapshot_file = _snapshot_file_from_obj(obj)
+    runtime = _run_ahf_subhalo_direct(
+        snapshot_file,
+        obj._kwargs["haloid_file"],
+        kwargs=dict(getattr(obj, "_kwargs", {})),
+        nproc=int(obj.nproc),
+        min_stars=int(ms),
+    )
+    _adopt_caesar_runtime(obj, runtime)
