@@ -111,6 +111,77 @@ def test_run_uses_direct_runtime_entrypoint(monkeypatch, tmp_path):
     assert getattr(calls["adopt_runtime"], "marker", "") == "direct-runtime"
 
 
+def test_rank0_prepare_stage12_sets_velocity_linking_length(monkeypatch, tmp_path):
+    class DummyNodes:
+        def __init__(self):
+            self.halo_id = np.asarray([10], dtype=np.int64)
+            self.dm_count = np.asarray([64], dtype=np.int64)
+
+        def __len__(self):
+            return 1
+
+    direct_state = SimpleNamespace(
+        snapshot=SimpleNamespace(ptypes=("gas", "dm", "star"), boxsize=100.0, particle_counts={"dm": 1000}),
+        nodes=DummyNodes(),
+    )
+    task = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 16, 32)
+
+    monkeypatch.setattr(mpi_mod, "build_direct_state", lambda *_args, **_kwargs: direct_state)
+    monkeypatch.setattr(mpi_mod, "_prepare_manifest", lambda **_kwargs: ([task], {10: [task]}, {}, {}))
+    monkeypatch.setattr(
+        mpi_mod,
+        "_build_direct_task_payload",
+        lambda *_args, **_kwargs: {"star_sel": np.arange(16, dtype=np.int32)},
+    )
+    monkeypatch.setattr(mpi_mod, "get_min_stars", lambda *_args, **_kwargs: 16)
+    monkeypatch.delenv("CAESAR_FOF6D_VEL_LL", raising=False)
+    monkeypatch.delenv("CAESAR_FOF6D_DISABLE_VEL", raising=False)
+
+    state, pid_maps_sel, min_stars, fof_ll, fof_vel_ll, tasks, tasks_by_root, payloads = mpi_mod._rank0_prepare_stage12(
+        snapshot_file="snap.hdf5",
+        ahf_particles_file="ahf.AHF_particles",
+        shard_root=tmp_path,
+        nproc=1,
+        min_stars=None,
+        log_fn=None,
+        log_label="stage1",
+    )
+
+    assert state is direct_state
+    assert pid_maps_sel is None
+    assert min_stars == 16
+    assert fof_ll > 0.0
+    assert fof_vel_ll == 1.0
+    assert tasks == [task]
+    assert set(tasks_by_root.keys()) == {10}
+    assert 10 in payloads
+    assert payloads[10]["task"]["node_id"] == 10
+
+
+def test_stage2_shard_payload_uses_table_format():
+    records = [
+        {
+            "AHF_haloID": 10,
+            "AHF_parent_haloID": 0,
+            "AHF_top_haloID": 10,
+            "AHF_depth": 0,
+            "AHF_ancestor_haloIDs": np.asarray([], dtype=np.int64),
+            "glist": np.asarray([1], dtype=np.int32),
+            "slist": np.asarray([2, 3], dtype=np.int32),
+            "dmlist": np.asarray([], dtype=np.int32),
+            "bhlist": np.asarray([], dtype=np.int32),
+            "dlist": np.asarray([], dtype=np.int32),
+        }
+    ]
+    payload = mpi_mod._stage2_shard_payload(records)
+    assert isinstance(payload, dict)
+    assert "ahf_halo_id" in payload
+    restored = mpi_mod.candidate_records_from_table_payload(payload)
+    assert len(restored) == 1
+    assert restored[0]["AHF_haloID"] == 10
+    assert np.array_equal(restored[0]["slist"], np.asarray([2, 3], dtype=np.int32))
+
+
 def test_ancestor_chain_and_task_manifest():
     parent_of = {10: 0, 11: 10, 12: 11, 20: 0, 21: 20}
     host_to_nodes = {10: {10, 11, 12}, 20: {20, 21}}

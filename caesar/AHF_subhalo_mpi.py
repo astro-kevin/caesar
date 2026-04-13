@@ -817,6 +817,15 @@ def _rank0_prepare_stage12(
         log_fn(f"{log_label}: loading direct-HDF5 snapshot tables and AHF node manifest")
     direct_state = build_direct_state(snapshot_file, ahf_particles_file)
     fof_ll = _direct_fof_linking_length(direct_state.snapshot)
+    fof_vel_ll = 1.0
+    try:
+        _vel_env = os.environ.get("CAESAR_FOF6D_VEL_LL")
+        if _vel_env not in (None, ""):
+            fof_vel_ll = float(_vel_env)
+    except Exception:
+        pass
+    if os.environ.get("CAESAR_FOF6D_DISABLE_VEL", "0") == "1":
+        fof_vel_ll = None
     pid_maps_sel = None
     if log_fn is not None:
         log_fn(
