@@ -1077,6 +1077,36 @@ def test_stage3_property_payload_roundtrip():
     assert local_sim.galaxy_list[0].masses["stellar"].value > 0.0
 
 
+def test_populate_caesar_ahf_lineage_indexes_maps_parent_and_top_host():
+    root = SimpleNamespace(
+        AHF_haloID=10,
+        AHF_parent_haloID=0,
+        AHF_top_haloID=10,
+        GroupID=0,
+    )
+    child = SimpleNamespace(
+        AHF_haloID=11,
+        AHF_parent_haloID=10,
+        AHF_top_haloID=10,
+        GroupID=1,
+    )
+    gal = SimpleNamespace(
+        AHF_haloID=12,
+        AHF_parent_haloID=11,
+        AHF_top_haloID=10,
+    )
+    sim = SimpleNamespace(halo_list=[root, child], galaxy_list=[gal])
+
+    subhalo_mod._populate_caesar_ahf_lineage_indexes(sim)
+
+    assert root.caesar_parent_halo_index == -1
+    assert root.caesar_top_halo_index == 0
+    assert child.caesar_parent_halo_index == 0
+    assert child.caesar_top_halo_index == 0
+    assert gal.caesar_parent_halo_index == 1
+    assert gal.caesar_top_halo_index == 0
+
+
 def test_group_funcs_loader_falls_back_to_local_extension(monkeypatch):
     monkeypatch.setitem(sys.modules, "caesar.group_funcs", SimpleNamespace())
     funcs = group_loader_mod.load_group_funcs(

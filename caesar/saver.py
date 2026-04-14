@@ -1,4 +1,5 @@
 import os
+import tempfile
 import h5py
 import numpy as np
 import pdb
@@ -226,6 +227,93 @@ def serialize_global_attribs(obj, hd):
             uhd.attrs.create(k, str(v).encode('utf8'))
             
 ######################################################################
+
+def _stream_group_id_dataset(
+    *,
+    hd,
+    dataset_name: str,
+    size: int,
+    groups,
+    list_attr: str,
+    temp_dir: str,
+):
+    size = int(size)
+    if size <= 0:
+        return
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f"caesar_{dataset_name}_",
+        suffix=".tmp",
+        dir=temp_dir,
+    )
+    os.close(fd)
+    try:
+        arr = np.memmap(tmp_path, dtype=np.int32, mode="w+", shape=(size,))
+        arr[:] = -1
+        for group in groups:
+            if not hasattr(group, list_attr):
+                continue
+            idx = np.asarray(getattr(group, list_attr), dtype=np.int64)
+            if idx.size == 0:
+                continue
+            arr[idx] = int(getattr(group, "GroupID", -1))
+        arr.flush()
+        hd.create_dataset(dataset_name, data=arr, compression=1)
+        del arr
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _write_streaming_global_lists(obj, hd, *, filename: str):
+    from yt.funcs import mylog
+
+    temp_dir = os.environ.get("CAESAR_STREAM_SAVE_TMPDIR")
+    if not temp_dir:
+        temp_dir = os.path.dirname(os.path.abspath(filename)) or "."
+    os.makedirs(temp_dir, exist_ok=True)
+
+    groups = [
+        ("halo", getattr(obj, "halos", []), "dmlist", int(getattr(obj.simulation, "ndm", 0))),
+        ("halo", getattr(obj, "halos", []), "glist", int(getattr(obj.simulation, "ngas", 0))),
+        ("halo", getattr(obj, "halos", []), "slist", int(getattr(obj.simulation, "nstar", 0))),
+        ("galaxy", getattr(obj, "galaxies", []), "glist", int(getattr(obj.simulation, "ngas", 0))),
+        ("galaxy", getattr(obj, "galaxies", []), "slist", int(getattr(obj.simulation, "nstar", 0))),
+        ("cloud", getattr(obj, "clouds", []), "glist", int(getattr(obj.simulation, "ngas", 0))),
+    ]
+
+    if getattr(getattr(obj, "data_manager", None), "blackholes", False):
+        groups.extend(
+            [
+                ("halo", getattr(obj, "halos", []), "bhlist", int(getattr(obj.simulation, "nbh", 0))),
+                ("galaxy", getattr(obj, "galaxies", []), "bhlist", int(getattr(obj.simulation, "nbh", 0))),
+            ]
+        )
+    if getattr(getattr(obj, "data_manager", None), "dust", False):
+        groups.extend(
+            [
+                ("halo", getattr(obj, "halos", []), "dlist", int(getattr(obj.simulation, "ndust", 0))),
+                ("galaxy", getattr(obj, "galaxies", []), "dlist", int(getattr(obj.simulation, "ndust", 0))),
+            ]
+        )
+
+    for group_type, group_list, list_attr, size in groups:
+        dataset_name = f"{group_type}_{list_attr}"
+        if not group_list or size <= 0:
+            continue
+        mylog.info("Streaming %s to global_lists/%s", dataset_name, dataset_name)
+        _stream_group_id_dataset(
+            hd=hd,
+            dataset_name=dataset_name,
+            size=size,
+            groups=group_list,
+            list_attr=list_attr,
+            temp_dir=temp_dir,
+        )
+    
+######################################################################
     
 def save(obj, filename='test.hdf5'):
     """Function to save a CAESAR file to disk.
@@ -319,16 +407,19 @@ def save(obj, filename='test.hdf5'):
     if hasattr(obj, 'global_particle_lists'):
         hd = outfile.create_group('global_lists')
 
-        # gather
-        global_index_lists = ['halo_dmlist','halo_glist','halo_slist',
-                              'galaxy_glist','galaxy_slist','cloud_glist']
-        if obj.data_manager.blackholes:
-            global_index_lists.extend(['halo_bhlist','galaxy_bhlist'])
-        if obj.data_manager.dust:
-            global_index_lists.extend(['halo_dlist','galaxy_dlist'])
+        if getattr(obj, '_ahf_subhalo_streaming_save', False):
+            _write_streaming_global_lists(obj, hd, filename=filename)
+        else:
+            # gather
+            global_index_lists = ['halo_dmlist','halo_glist','halo_slist',
+                                  'galaxy_glist','galaxy_slist','cloud_glist']
+            if obj.data_manager.blackholes:
+                global_index_lists.extend(['halo_bhlist','galaxy_bhlist'])
+            if obj.data_manager.dust:
+                global_index_lists.extend(['halo_dlist','galaxy_dlist'])
 
-        # write
-        for vals in global_index_lists:
-            check_and_write_dataset(obj.global_particle_lists, vals, hd)
+            # write
+            for vals in global_index_lists:
+                check_and_write_dataset(obj.global_particle_lists, vals, hd)
             
     outfile.close()

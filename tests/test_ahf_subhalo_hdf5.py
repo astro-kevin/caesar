@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import pickle
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +29,9 @@ def _load_module(name: str, filename: str):
 tables_mod = _load_module("ahf_subhalo_tables_mod", "ahf_subhalo_tables.py")
 hdf5_mod = _load_module("ahf_subhalo_hdf5_mod", "ahf_subhalo_hdf5.py")
 subhalo_mod = _load_module("ahf_subhalo_runtime_mod", "AHF_subhalo.py")
+loader_mod = _load_module("ahf_subhalo_loader_mod", "loader.py")
+export_mod = _load_module("ahf_subhalo_export_mod", "ahf_subhalo_export.py")
+pipeline_utils_mod = _load_module("pipeline_utils_subhalo_mod", "pipeline_utils.py")
 
 
 def _write_test_snapshot(path: Path) -> None:
@@ -76,6 +80,52 @@ def _write_test_snapshot(path: Path) -> None:
         bh["Masses"] = np.asarray([7.0], dtype=np.float32)
         bh["BH_Mass"] = np.asarray([8.0], dtype=np.float32)
         bh["BH_Mdot"] = np.asarray([0.25], dtype=np.float32)
+
+
+def _assert_hdf5_equal(path_a: Path, path_b: Path) -> None:
+    def _cmp(a, b, prefix: str = ""):
+        assert set(a.keys()) == set(b.keys()), prefix or "/"
+        for key in a.keys():
+            aa = a[key]
+            bb = b[key]
+            here = f"{prefix}/{key}"
+            assert type(aa) is type(bb), here
+            if isinstance(aa, h5py.Group):
+                assert set(aa.attrs.keys()) == set(bb.attrs.keys()), f"{here} attrs"
+                for attr in aa.attrs.keys():
+                    va = aa.attrs[attr]
+                    vb = bb.attrs[attr]
+                    if isinstance(va, np.ndarray) or isinstance(vb, np.ndarray):
+                        assert np.array_equal(np.asarray(va), np.asarray(vb)), f"{here} attr {attr}"
+                    else:
+                        assert va == vb, f"{here} attr {attr}"
+                _cmp(aa, bb, here)
+            else:
+                assert aa.shape == bb.shape, here
+                assert aa.dtype == bb.dtype, here
+                assert set(aa.attrs.keys()) == set(bb.attrs.keys()), f"{here} attrs"
+                for attr in aa.attrs.keys():
+                    va = aa.attrs[attr]
+                    vb = bb.attrs[attr]
+                    if isinstance(va, np.ndarray) or isinstance(vb, np.ndarray):
+                        assert np.array_equal(np.asarray(va), np.asarray(vb)), f"{here} attr {attr}"
+                    else:
+                        assert va == vb, f"{here} attr {attr}"
+                if aa.dtype.kind in {"f"}:
+                    assert np.allclose(aa[:], bb[:]), here
+                else:
+                    assert np.array_equal(aa[:], bb[:]), here
+
+    with h5py.File(path_a, "r") as fa, h5py.File(path_b, "r") as fb:
+        assert set(fa.attrs.keys()) == set(fb.attrs.keys()), "/ attrs"
+        for attr in fa.attrs.keys():
+            va = fa.attrs[attr]
+            vb = fb.attrs[attr]
+            if isinstance(va, np.ndarray) or isinstance(vb, np.ndarray):
+                assert np.array_equal(np.asarray(va), np.asarray(vb)), f"/ attr {attr}"
+            else:
+                assert va == vb, f"/ attr {attr}"
+        _cmp(fa, fb, "")
 
 
 def test_ragged_index_block_round_trip():
@@ -283,6 +333,7 @@ def test_direct_stage3_runtime_can_compute_and_save(monkeypatch, tmp_path):
         galaxy_payloads=galaxy_payloads,
         nproc=1,
     )
+    assert getattr(sim, "_ahf_subhalo_streaming_save", False) is True
     subhalo_mod._compute_group_properties_subset(sim, group_type="halo", groups=list(sim.halo_list))
     subhalo_mod._compute_group_properties_subset(sim, group_type="galaxy", groups=list(sim.galaxy_list))
     subhalo_mod._complete_finalization_after_properties_direct(sim)
@@ -295,3 +346,112 @@ def test_direct_stage3_runtime_can_compute_and_save(monkeypatch, tmp_path):
         assert int(handle.attrs["ngalaxies"]) == 1
         assert np.array_equal(handle["halo_data/AHF_haloID"][:], np.asarray([10], dtype=np.int64))
         assert np.array_equal(handle["galaxy_data/AHF_haloID"][:], np.asarray([10], dtype=np.int64))
+        assert np.array_equal(handle["halo_data/caesar_parent_halo_index"][:], np.asarray([-1], dtype=np.int64))
+        assert np.array_equal(handle["halo_data/caesar_top_halo_index"][:], np.asarray([0], dtype=np.int64))
+        assert np.array_equal(handle["galaxy_data/parent_halo_index"][:], np.asarray([0], dtype=np.int64))
+        assert np.array_equal(handle["galaxy_data/caesar_parent_halo_index"][:], np.asarray([-1], dtype=np.int64))
+        assert np.array_equal(handle["galaxy_data/caesar_top_halo_index"][:], np.asarray([0], dtype=np.int64))
+        assert "global_lists" in handle
+        assert np.array_equal(handle["global_lists/halo_dmlist"][:], np.asarray([0, -1], dtype=np.int32))
+        assert np.array_equal(handle["global_lists/halo_glist"][:], np.asarray([-1, 0], dtype=np.int32))
+        assert np.array_equal(handle["global_lists/halo_slist"][:], np.asarray([0, -1], dtype=np.int32))
+        assert np.array_equal(handle["global_lists/galaxy_glist"][:], np.asarray([-1, 0], dtype=np.int32))
+        assert np.array_equal(handle["global_lists/galaxy_slist"][:], np.asarray([0, -1], dtype=np.int32))
+
+    loaded = loader_mod.load(str(outfile), skip_hash_check=True)
+    assert int(loaded.nhalos) == 1
+    assert int(loaded.ngalaxies) == 1
+    assert int(loaded.halos[0].AHF_haloID) == 10
+    assert int(loaded.galaxies[0].AHF_haloID) == 10
+    assert int(loaded.halos[0].caesar_parent_halo_index) == -1
+    assert int(loaded.halos[0].caesar_top_halo_index) == 0
+    assert int(loaded.galaxies[0].parent_halo_index) == 0
+    assert int(loaded.galaxies[0].caesar_parent_halo_index) == -1
+    assert int(loaded.galaxies[0].caesar_top_halo_index) == 0
+
+
+def test_streaming_export_matches_original_caesar_format(monkeypatch, tmp_path):
+    snapshot = tmp_path / "snap.hdf5"
+    _write_test_snapshot(snapshot)
+
+    hierarchy = SimpleNamespace(
+        parent_of={10: 0},
+        children_of={10: []},
+    )
+    halos_df = pd.DataFrame(
+        {
+            "hid": np.asarray([10], dtype=np.int64),
+            "host_hid": np.asarray([0], dtype=np.int64),
+            "npart": np.asarray([4], dtype=np.int64),
+            "n_star": np.asarray([1], dtype=np.int64),
+        }
+    )
+    memberships = {
+        10: np.asarray([[1002, 0], [2001, 1], [3001, 4], [4001, 5]], dtype=np.int64),
+    }
+
+    monkeypatch.setattr(hdf5_mod, "load_ahf_hierarchy", lambda _: hierarchy)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_halos_dataframe", lambda _: halos_df)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_particle_blocks", lambda *args, **kwargs: memberships)
+
+    state = hdf5_mod.build_direct_state(str(snapshot), "dummy.AHF_particles")
+    galaxy_payloads = [
+        {
+            "AHF_haloID": 10,
+            "AHF_parent_haloID": 0,
+            "AHF_top_haloID": 10,
+            "AHF_depth": 0,
+            "AHF_ancestor_haloIDs": np.asarray([], dtype=np.int64),
+            "glist": np.asarray([1], dtype=np.int32),
+            "slist": np.asarray([0], dtype=np.int32),
+            "dmlist": np.asarray([], dtype=np.int32),
+            "bhlist": np.asarray([0], dtype=np.int32),
+            "dlist": np.asarray([], dtype=np.int32),
+        }
+    ]
+
+    sim_ref = subhalo_mod._build_direct_stage3_runtime(
+        state,
+        galaxy_payloads=galaxy_payloads,
+        nproc=1,
+    )
+    for idx, halo in enumerate(sim_ref.halo_list):
+        halo._merge_id = idx
+    for idx, gal in enumerate(sim_ref.galaxy_list):
+        gal._merge_id = idx
+    subhalo_mod._compute_group_properties_subset(sim_ref, group_type="halo", groups=list(sim_ref.halo_list))
+    subhalo_mod._compute_group_properties_subset(sim_ref, group_type="galaxy", groups=list(sim_ref.galaxy_list))
+
+    shard_path = tmp_path / "stage3_rank00000.pkl"
+    with shard_path.open("wb") as fh:
+        pickle.dump(
+            {
+                "halos": [subhalo_mod._serialize_group_state(group, id_key="_merge_id") for group in sim_ref.halo_list],
+                "galaxies": [subhalo_mod._serialize_group_state(group, id_key="_merge_id") for group in sim_ref.galaxy_list],
+            },
+            fh,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+    sim_old = subhalo_mod._build_direct_stage3_runtime(
+        state,
+        galaxy_payloads=galaxy_payloads,
+        nproc=1,
+    )
+    subhalo_mod._compute_group_properties_subset(sim_old, group_type="halo", groups=list(sim_old.halo_list))
+    subhalo_mod._compute_group_properties_subset(sim_old, group_type="galaxy", groups=list(sim_old.galaxy_list))
+    subhalo_mod._complete_finalization_after_properties_direct(sim_old)
+    pipeline_utils_mod.load_global_lists(sim_old)
+    setattr(sim_old, "_ahf_subhalo_streaming_save", False)
+
+    ref_out = tmp_path / "ref_caesar.hdf5"
+    sim_old.save(str(ref_out))
+
+    stream_out = tmp_path / "stream_caesar.hdf5"
+    export_mod.stream_save_stage3_catalogue(
+        snapshot_meta=state.snapshot,
+        stage3_results=[{"shard_path": str(shard_path), "count_halos": 1, "count_galaxies": 1}],
+        output_file=str(stream_out),
+    )
+
+    _assert_hdf5_equal(ref_out, stream_out)

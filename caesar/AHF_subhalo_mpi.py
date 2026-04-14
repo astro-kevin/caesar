@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+import gc
 import os
 import pickle
 import tempfile
@@ -59,6 +60,7 @@ from caesar.ahf_subhalo_tables import (
     candidate_records_from_table_payload,
     candidate_records_to_table,
 )
+from caesar.ahf_subhalo_export import stream_save_stage3_catalogue
 from caesar.fubar import get_b as _get_b
 from caesar.fubar import get_mean_interparticle_separation as _get_mean_interparticle_separation
 from caesar.group import get_min_stars
@@ -1338,6 +1340,12 @@ def _rank0_run_stage3_and_save(
         _dump_pickle(payload_path, _build_stage3_property_payload(sim, batch))
         stage3_cpu_items.append({"payload_path": str(payload_path)})
 
+    snapshot_meta = direct_state.snapshot
+    del final_galaxies
+    del sim
+    del direct_state
+    gc.collect()
+
     stage3_results = _dispatch_stage(
         comm,
         worker_caps=worker_caps,
@@ -1349,56 +1357,12 @@ def _rank0_run_stage3_and_save(
         worker_threads=worker_threads,
         worker_roles={int(cap.rank): "prop_worker" for cap in worker_caps},
     )
-
-    halo_by_id = {int(getattr(halo, "_merge_id", -1)): halo for halo in sim.halo_list}
-    gal_by_id = {int(getattr(gal, "_merge_id", -1)): gal for gal in sim.galaxy_list}
-    seen_halo_ids = set()
-    seen_gal_ids = set()
-
-    for result in stage3_results:
-        shard = _load_pickle(Path(result["shard_path"]))
-        for state in shard.get("halos", []):
-            hid = int(state["id"])
-            halo = halo_by_id[hid]
-            _apply_group_state(halo, state)
-            seen_halo_ids.add(hid)
-        for state in shard.get("galaxies", []):
-            gid = int(state["id"])
-            gal = gal_by_id[gid]
-            _apply_group_state(gal, state)
-            seen_gal_ids.add(gid)
-
-    expected_halo_ids = {int(getattr(halo, "_merge_id", -1)) for halo in sim.halo_list}
-    expected_gal_ids = {int(getattr(gal, "_merge_id", -1)) for gal in sim.galaxy_list}
-    missing_halo_ids = sorted(expected_halo_ids - seen_halo_ids)
-    missing_gal_ids = sorted(expected_gal_ids - seen_gal_ids)
-    if missing_halo_ids or missing_gal_ids:
-        raise RuntimeError(
-            "Stage-3 shard merge incomplete: "
-            f"missing_halos={missing_halo_ids[:10]} (count={len(missing_halo_ids)}), "
-            f"missing_galaxies={missing_gal_ids[:10]} (count={len(missing_gal_ids)})"
-        )
-
-    bad_halos = [
-        int(getattr(halo, "AHF_haloID", -1))
-        for halo in sim.halo_list
-        if not hasattr(halo, "masses") or "total" not in getattr(halo, "masses", {})
-    ]
-    bad_gals = [
-        int(getattr(gal, "AHF_haloID", -1))
-        for gal in sim.galaxy_list
-        if not hasattr(gal, "masses") or "stellar" not in getattr(gal, "masses", {})
-    ]
-    if bad_halos or bad_gals:
-        raise RuntimeError(
-            "Stage-3 properties incomplete before finalization: "
-            f"halos_missing_total={bad_halos[:10]} (count={len(bad_halos)}), "
-            f"galaxies_missing_stellar={bad_gals[:10]} (count={len(bad_gals)})"
-        )
-
-    _complete_finalization_after_properties_direct(sim)
-    sim.save(output_file)
-    _rank0_log(f"stage3: saved catalogue to {output_file}")
+    stream_save_stage3_catalogue(
+        snapshot_meta=snapshot_meta,
+        stage3_results=stage3_results,
+        output_file=output_file,
+        log_fn=_rank0_log,
+    )
 
 
 def _stage2_manifest_path(shard_root: Path) -> Path:

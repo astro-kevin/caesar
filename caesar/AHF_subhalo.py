@@ -2485,6 +2485,39 @@ def _prepare_final_subhalo_galaxies(
         gal.global_indexes = _compute_global_indexes(gal)
 
 
+def _populate_caesar_ahf_lineage_indexes(sim) -> None:
+    ahf_to_groupid: Dict[int, int] = {}
+    for halo in getattr(sim, "halo_list", []):
+        try:
+            ahf_to_groupid[int(getattr(halo, "AHF_haloID", -1))] = int(getattr(halo, "GroupID", -1))
+        except Exception:
+            continue
+
+    for halo in getattr(sim, "halo_list", []):
+        try:
+            parent_ahf = int(getattr(halo, "AHF_parent_haloID", -1))
+        except Exception:
+            parent_ahf = -1
+        try:
+            top_ahf = int(getattr(halo, "AHF_top_haloID", getattr(halo, "AHF_haloID", -1)))
+        except Exception:
+            top_ahf = -1
+        halo.caesar_parent_halo_index = int(ahf_to_groupid.get(parent_ahf, -1))
+        halo.caesar_top_halo_index = int(ahf_to_groupid.get(top_ahf, -1))
+
+    for gal in getattr(sim, "galaxy_list", []):
+        try:
+            parent_ahf = int(getattr(gal, "AHF_parent_haloID", -1))
+        except Exception:
+            parent_ahf = -1
+        try:
+            top_ahf = int(getattr(gal, "AHF_top_haloID", -1))
+        except Exception:
+            top_ahf = -1
+        gal.caesar_parent_halo_index = int(ahf_to_groupid.get(parent_ahf, -1))
+        gal.caesar_top_halo_index = int(ahf_to_groupid.get(top_ahf, -1))
+
+
 def _complete_finalization_after_properties(sim):
     import caesar.assignment as assign
     import caesar.linking as link
@@ -2506,6 +2539,7 @@ def _complete_finalization_after_properties(sim):
         new = int(old_to_new.get(old, -1))
         gal.parent_halo_index = new
         gal._ahf_host_halo_index = new
+    _populate_caesar_ahf_lineage_indexes(sim)
 
     calculate_local_densities(sim, sim.halo_list)
 
@@ -2683,6 +2717,9 @@ def _build_direct_stage3_runtime(
     sim.group_types = ["halo", "galaxy"]
     setattr(sim, "_ahf_matched", True)
     setattr(sim, "_include_dm_in_galaxies", True)
+    # Save the full CAESAR schema, but stream global reverse maps at write time
+    # instead of materializing them all in RAM on rank 0.
+    setattr(sim, "_ahf_subhalo_streaming_save", True)
 
     def _keep_halo(node_index: int, required_host_ids: set[int]) -> bool:
         halo_id = int(state.nodes.halo_id[node_index])
@@ -2778,6 +2815,7 @@ def _complete_finalization_after_properties_direct(sim):
         new = int(old_to_new.get(old, -1))
         gal.parent_halo_index = new
         gal._ahf_host_halo_index = new
+    _populate_caesar_ahf_lineage_indexes(sim)
 
     calculate_local_densities(sim, sim.halo_list)
 
@@ -2803,8 +2841,6 @@ def _complete_finalization_after_properties_direct(sim):
             sim.group_types.append("galaxy")
     except Exception:
         pass
-
-    load_global_lists(sim)
 
 
 def _adopt_caesar_runtime(target, source) -> None:
