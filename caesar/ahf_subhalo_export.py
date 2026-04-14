@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import pickle
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -197,6 +198,28 @@ def _compute_starts_ends(lengths: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return starts, ends
 
 
+def _progress_style() -> str:
+    style = os.environ.get("CAESAR_AHF_SUBHALO_PROGRESS_STYLE", "text").strip().lower()
+    if style in {"bar", "bars", "progress", "progressbar"}:
+        return "bar"
+    return "text"
+
+
+def _progress_bar(completed: int, total: int) -> str:
+    try:
+        width = max(10, int(os.environ.get("CAESAR_AHF_SUBHALO_PROGRESS_BAR_WIDTH", "28")))
+    except Exception:
+        width = 28
+    total_int = max(0, int(total))
+    done_int = max(0, int(completed))
+    if total_int <= 0:
+        filled = 0
+    else:
+        filled = int(round(min(1.0, max(0.0, float(done_int) / float(total_int))) * float(width)))
+    filled = max(0, min(int(width), int(filled)))
+    return "[" + "#" * filled + "-" * (int(width) - filled) + "]"
+
+
 def _find_state_by_id(
     shard_paths: Sequence[Path],
     *,
@@ -354,6 +377,7 @@ def stream_save_stage3_catalogue(
     stage3_results: Sequence[Mapping[str, object]],
     output_file: str,
     log_fn=None,
+    stage_label: str = "stage4",
 ) -> None:
     shard_paths = [Path(str(result["shard_path"])) for result in stage3_results]
     nhalos = int(sum(int(result.get("count_halos", 0)) for result in stage3_results))
@@ -450,22 +474,68 @@ def stream_save_stage3_catalogue(
     galaxy_total_mass = np.zeros(ngalaxies, dtype=np.float64)
     galaxy_pos = np.zeros((ngalaxies, 3), dtype=np.float64)
     galaxy_top_halo_id = np.full(ngalaxies, -1, dtype=np.int64)
+    summary_ready = all(isinstance(result.get("summary"), Mapping) for result in stage3_results)
+    top_halo_state = None
+    top_halo_mass = None
+    top_galaxy_state = None
+    top_galaxy_stellar_mass = None
+    if summary_ready:
+        for result in stage3_results:
+            summary = result.get("summary", {})
+            halo_summary = summary.get("halos", {})
+            halo_ids = np.asarray(halo_summary.get("id", []), dtype=np.int64)
+            if halo_ids.size > 0:
+                halo_total_mass[halo_ids] = np.asarray(halo_summary.get("total_mass", []), dtype=np.float64)
+                halo_pos[halo_ids] = np.asarray(halo_summary.get("pos", []), dtype=np.float64)
+                halo_ahf_id[halo_ids] = np.asarray(halo_summary.get("ahf_halo_id", []), dtype=np.int64)
+                for name, lengths in dict(halo_summary.get("list_lengths", {})).items():
+                    if name in halo_schema.list_lengths:
+                        halo_schema.list_lengths[name][halo_ids] = np.asarray(lengths, dtype=np.int64)
+                for name, dtype_str in dict(halo_summary.get("list_dtypes", {})).items():
+                    if name in halo_schema.list_lengths and name not in halo_schema.list_dtypes:
+                        halo_schema.list_dtypes[name] = np.dtype(dtype_str)
 
-    for shard_path in shard_paths:
-        shard = _load_pickle(shard_path)
-        for state in shard.get("halos", []):
-            hid = int(state["id"])
-            halo_total_mass[hid] = float(_raw_value(state["masses"]["total"]))
-            halo_pos[hid] = np.asarray(_raw_value(state["pos"]), dtype=np.float64)
-            halo_ahf_id[hid] = int(state.get("AHF_haloID", -1))
-            _scan_state_schema(state, schema=halo_schema, skip_attrs=halo_skip, list_lengths_index=hid)
-        for state in shard.get("galaxies", []):
-            gid = int(state["id"])
-            galaxy_stellar_mass[gid] = float(_raw_value(state["masses"]["stellar"]))
-            galaxy_total_mass[gid] = float(_raw_value(state["masses"]["total"]))
-            galaxy_pos[gid] = np.asarray(_raw_value(state["pos"]), dtype=np.float64)
-            galaxy_top_halo_id[gid] = int(state.get("AHF_top_haloID", -1))
-            _scan_state_schema(state, schema=galaxy_schema, skip_attrs=galaxy_skip, list_lengths_index=gid)
+            galaxy_summary = summary.get("galaxies", {})
+            galaxy_ids = np.asarray(galaxy_summary.get("id", []), dtype=np.int64)
+            if galaxy_ids.size > 0:
+                galaxy_stellar_mass[galaxy_ids] = np.asarray(galaxy_summary.get("stellar_mass", []), dtype=np.float64)
+                galaxy_total_mass[galaxy_ids] = np.asarray(galaxy_summary.get("total_mass", []), dtype=np.float64)
+                galaxy_pos[galaxy_ids] = np.asarray(galaxy_summary.get("pos", []), dtype=np.float64)
+                galaxy_top_halo_id[galaxy_ids] = np.asarray(galaxy_summary.get("top_halo_id", []), dtype=np.int64)
+                for name, lengths in dict(galaxy_summary.get("list_lengths", {})).items():
+                    if name in galaxy_schema.list_lengths:
+                        galaxy_schema.list_lengths[name][galaxy_ids] = np.asarray(lengths, dtype=np.int64)
+                for name, dtype_str in dict(galaxy_summary.get("list_dtypes", {})).items():
+                    if name in galaxy_schema.list_lengths and name not in galaxy_schema.list_dtypes:
+                        galaxy_schema.list_dtypes[name] = np.dtype(dtype_str)
+
+            candidate_halo_mass = summary.get("top_halo_mass")
+            if candidate_halo_mass is not None and (top_halo_mass is None or float(candidate_halo_mass) > float(top_halo_mass)):
+                top_halo_mass = float(candidate_halo_mass)
+                top_halo_state = summary.get("top_halo_state")
+
+            candidate_gal_mass = summary.get("top_galaxy_stellar_mass")
+            if candidate_gal_mass is not None and (
+                top_galaxy_stellar_mass is None or float(candidate_gal_mass) > float(top_galaxy_stellar_mass)
+            ):
+                top_galaxy_stellar_mass = float(candidate_gal_mass)
+                top_galaxy_state = summary.get("top_galaxy_state")
+    else:
+        for shard_path in shard_paths:
+            shard = _load_pickle(shard_path)
+            for state in shard.get("halos", []):
+                hid = int(state["id"])
+                halo_total_mass[hid] = float(_raw_value(state["masses"]["total"]))
+                halo_pos[hid] = np.asarray(_raw_value(state["pos"]), dtype=np.float64)
+                halo_ahf_id[hid] = int(state.get("AHF_haloID", -1))
+                _scan_state_schema(state, schema=halo_schema, skip_attrs=halo_skip, list_lengths_index=hid)
+            for state in shard.get("galaxies", []):
+                gid = int(state["id"])
+                galaxy_stellar_mass[gid] = float(_raw_value(state["masses"]["stellar"]))
+                galaxy_total_mass[gid] = float(_raw_value(state["masses"]["total"]))
+                galaxy_pos[gid] = np.asarray(_raw_value(state["pos"]), dtype=np.float64)
+                galaxy_top_halo_id[gid] = int(state.get("AHF_top_haloID", -1))
+                _scan_state_schema(state, schema=galaxy_schema, skip_attrs=galaxy_skip, list_lengths_index=gid)
 
     halo_order = np.argsort(-halo_total_mass, kind="stable")
     halo_new_index = np.empty(nhalos, dtype=np.int64)
@@ -477,21 +547,26 @@ def stream_save_stage3_catalogue(
     galaxy_new_index[galaxy_order] = np.arange(ngalaxies, dtype=np.int64)
     galaxy_parent_halo_new = np.asarray([int(halo_ahf_to_new.get(int(hid), -1)) for hid in galaxy_top_halo_id], dtype=np.int64)
 
-    halo_schema.attr_specs, halo_schema.dict_specs = _legacy_schema_from_state(
-        _find_state_by_id(
+    if top_halo_state is None:
+        top_halo_state = _find_state_by_id(
             shard_paths,
             group_key="halos",
             target_id=int(halo_order[0]) if nhalos > 0 else None,
-        ),
+        )
+    if top_galaxy_state is None:
+        top_galaxy_state = _find_state_by_id(
+            shard_paths,
+            group_key="galaxies",
+            target_id=int(galaxy_order[0]) if ngalaxies > 0 else None,
+        )
+
+    halo_schema.attr_specs, halo_schema.dict_specs = _legacy_schema_from_state(
+        top_halo_state,
         list_attrs=halo_schema.list_attrs,
         skip_attrs=halo_skip,
     )
     galaxy_schema.attr_specs, galaxy_schema.dict_specs = _legacy_schema_from_state(
-        _find_state_by_id(
-            shard_paths,
-            group_key="galaxies",
-            target_id=int(galaxy_order[0]) if ngalaxies > 0 else None,
-        ),
+        top_galaxy_state,
         list_attrs=galaxy_schema.list_attrs,
         skip_attrs=galaxy_skip,
     )
@@ -608,7 +683,7 @@ def stream_save_stage3_catalogue(
 
     if log_fn is not None:
         log_fn(
-            f"stage3: streaming final save halos={nhalos} galaxies={ngalaxies} "
+            f"{stage_label}: starting final export halos={nhalos} galaxies={ngalaxies} "
             f"stage3_shards={len(shard_paths)}"
         )
 
@@ -709,9 +784,17 @@ def stream_save_stage3_catalogue(
 
         reverse_entries = {name: [] for name, _size in reverse_specs}
 
-        for shard_path in shard_paths:
+        write_progress_every = max(1, int(os.environ.get("CAESAR_AHF_SUBHALO_EXPORT_PROGRESS_EVERY", "4")))
+        write_progress_seconds = max(5.0, float(os.environ.get("CAESAR_AHF_SUBHALO_EXPORT_PROGRESS_SECONDS", "60.0")))
+        last_write_status = time.monotonic()
+        written_halos = 0
+        written_galaxies = 0
+
+        for shard_idx, shard_path in enumerate(shard_paths, start=1):
             shard = _load_pickle(shard_path)
-            for state in shard.get("halos", []):
+            halo_states = list(shard.get("halos", []))
+            galaxy_states = list(shard.get("galaxies", []))
+            for state in halo_states:
                 merge_id = int(state["id"])
                 new_idx = int(halo_new_index[merge_id])
                 for name, ds in halo_attr_dsets.items():
@@ -752,7 +835,7 @@ def stream_save_stage3_catalogue(
                             halo_schema.dict_specs[dict_name][subkey],
                         )
 
-            for state in shard.get("galaxies", []):
+            for state in galaxy_states:
                 merge_id = int(state["id"])
                 new_idx = int(galaxy_new_index[merge_id])
                 for name, ds in galaxy_attr_dsets.items():
@@ -793,11 +876,39 @@ def stream_save_stage3_catalogue(
                             galaxy_schema.dict_specs[dict_name][subkey],
                         )
 
+            written_halos += len(halo_states)
+            written_galaxies += len(galaxy_states)
+            now = time.monotonic()
+            if log_fn is not None and (
+                shard_idx == len(shard_paths)
+                or shard_idx % write_progress_every == 0
+                or now - last_write_status >= write_progress_seconds
+            ):
+                if _progress_style() == "bar":
+                    log_fn(
+                        f"{stage_label}: write shards {_progress_bar(shard_idx, len(shard_paths))} "
+                        f"{shard_idx}/{len(shard_paths)} | halos={written_halos}/{nhalos} "
+                        f"| galaxies={written_galaxies}/{ngalaxies}"
+                    )
+                else:
+                    log_fn(
+                        f"{stage_label}: writing shards {shard_idx}/{len(shard_paths)}; "
+                        f"halos={written_halos}/{nhalos}, galaxies={written_galaxies}/{ngalaxies}"
+                    )
+                last_write_status = now
+
         halo_list_dsets["galaxy_index_list"][:] = halo_galaxy_data
 
-        for name, size in reverse_specs:
+        reverse_total = len(reverse_specs)
+        for reverse_idx, (name, size) in enumerate(reverse_specs, start=1):
             if log_fn is not None:
-                log_fn(f"stage3: streaming global_lists/{name}")
+                if _progress_style() == "bar":
+                    log_fn(
+                        f"{stage_label}: global_lists "
+                        f"{_progress_bar(reverse_idx, reverse_total)} {reverse_idx}/{reverse_total}"
+                    )
+                else:
+                    log_fn(f"{stage_label}: streaming global_lists/{name}")
             _stream_reverse_map_dataset(
                 global_group,
                 dataset_name=name,
@@ -807,4 +918,4 @@ def stream_save_stage3_catalogue(
             )
 
     if log_fn is not None:
-        log_fn(f"stage3: saved catalogue to {output_file}")
+        log_fn(f"{stage_label}: saved catalogue to {output_file}")

@@ -14,6 +14,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+try:
+    from tqdm import tqdm as _tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    _tqdm = None
+
 
 try:
     from mpi4py import MPI  # type: ignore
@@ -82,6 +87,13 @@ class WorkerCapability:
     gpu_device: Optional[int]
     threads: int
     visible_cores: int = 0
+
+
+@dataclass(frozen=True)
+class ProgressMetric:
+    label: str
+    result_key: str
+    total: Optional[int] = None
 
 
 @dataclass
@@ -582,6 +594,84 @@ def _rank0_log(message: str) -> None:
     print(f"[AHF-subhalo][rank0] {message}", flush=True)
 
 
+def _progress_style() -> str:
+    style = _env_str("CAESAR_AHF_SUBHALO_PROGRESS_STYLE", "text").strip().lower()
+    if style in {"bar", "bars", "progress", "progressbar"}:
+        return "bar"
+    return "text"
+
+
+def _progress_bar(completed: int, total: int) -> str:
+    width = max(10, _env_int("CAESAR_AHF_SUBHALO_PROGRESS_BAR_WIDTH", 28))
+    total_int = max(0, int(total))
+    done_int = max(0, int(completed))
+    if total_int <= 0:
+        filled = 0
+    else:
+        frac = min(1.0, max(0.0, float(done_int) / float(total_int)))
+        filled = int(round(frac * float(width)))
+    filled = max(0, min(int(width), int(filled)))
+    return "[" + "#" * filled + "-" * (int(width) - filled) + "]"
+
+
+def _progress_metric_text(label: str, value: int, total: Optional[int] = None) -> str:
+    if total is None:
+        return f"{label}={int(value)}"
+    return f"{label}={int(value)}/{int(total)}"
+
+
+def _progress_message(
+    *,
+    label: str,
+    completed: int,
+    total: int,
+    unit: str,
+    elapsed: float,
+    metrics: Optional[Sequence[Tuple[str, int, Optional[int]]]] = None,
+    active: Optional[int] = None,
+    remaining: Optional[int] = None,
+    detail: Optional[str] = None,
+) -> str:
+    metric_parts = [_progress_metric_text(name, value, total_value) for name, value, total_value in (metrics or [])]
+    if _progress_style() == "bar":
+        total_int = max(0, int(total))
+        done_int = max(0, int(completed))
+        if _tqdm is not None and total_int > 0:
+            meter = _tqdm.format_meter(
+                n=done_int,
+                total=total_int,
+                elapsed=max(0.0, float(elapsed)),
+                prefix=f"{label} ({unit}) ",
+                ascii=True,
+                unit=str(unit),
+                bar_format="{desc}{percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}",
+            )
+        else:
+            meter = f"{label} {_progress_bar(done_int, total_int)} {done_int}/{total_int} {unit}"
+        parts = [meter]
+        parts.extend(metric_parts)
+        if active is not None:
+            parts.append(f"active={int(active)}")
+        if remaining is not None:
+            parts.append(f"remaining={int(remaining)}")
+        if detail:
+            parts.append(str(detail))
+        parts.append(f"elapsed={float(elapsed):.1f}s")
+        return " | ".join(parts)
+
+    parts = [f"{label}; completed={int(completed)}/{int(total)} {unit}"]
+    if metric_parts:
+        parts.append(", ".join(metric_parts))
+    if active is not None:
+        parts.append(f"active={int(active)}")
+    if remaining is not None:
+        parts.append(f"remaining={int(remaining)}")
+    if detail:
+        parts.append(str(detail))
+    parts.append(f"elapsed={float(elapsed):.1f}s")
+    return ", ".join(parts)
+
+
 def _stage_queue(source, *, total: Optional[int] = None) -> _StageQueue:
     if hasattr(source, "next_front") and hasattr(source, "next_back"):
         return source
@@ -653,6 +743,8 @@ def _dispatch_stage(
     small_total: Optional[int] = None,
     worker_threads: Optional[Dict[int, int]] = None,
     worker_roles: Optional[Dict[int, str]] = None,
+    progress_unit: str = "items",
+    progress_metrics: Optional[Sequence[ProgressMetric]] = None,
 ):
     regular_state = _stage_queue(regular_queue, total=regular_total)
     small_state = _stage_queue(small_queue, total=small_total)
@@ -675,17 +767,36 @@ def _dispatch_stage(
     }
     has_gpu_workers = any(str(role_for.get(int(cap.rank), cap.role)) == "gpu_worker" for cap in worker_caps)
     has_cpu_workers = any(str(role_for.get(int(cap.rank), cap.role)) == "cpu_worker" for cap in worker_caps)
+    metric_defs = list(progress_metrics or [])
+    metric_totals = {str(metric.label): (None if metric.total is None else int(metric.total)) for metric in metric_defs}
+    metric_counts = {str(metric.label): 0 for metric in metric_defs}
 
     def log_progress(prefix: str) -> None:
         elapsed = time.monotonic() - start_time
         queued_remaining = int(regular_state.remaining) + int(small_state.remaining)
+        metrics = [
+            (str(metric.label), int(metric_counts[str(metric.label)]), metric_totals[str(metric.label)])
+            for metric in metric_defs
+        ]
+        detail = (
+            f"regular_front_assigned={regular_state.front_assigned}, "
+            f"regular_back_assigned={regular_state.back_assigned}, "
+            f"small_assigned={small_state.front_assigned}, "
+            f"regular_remaining={regular_state.remaining}, "
+            f"small_remaining={small_state.remaining}"
+        )
         _rank0_log(
-            f"{stage_name}: {prefix}; completed={completed}/{total_items}, "
-            f"active={active}, regular_front_assigned={regular_state.front_assigned}, "
-            f"regular_back_assigned={regular_state.back_assigned}, small_assigned={small_state.front_assigned}, "
-            f"regular_remaining={regular_state.remaining}, small_remaining={small_state.remaining}, "
-            f"queued_remaining={queued_remaining}, "
-            f"elapsed={elapsed:.1f}s"
+            _progress_message(
+                label=f"{stage_name}: {prefix}",
+                completed=completed,
+                total=total_items,
+                unit=progress_unit,
+                elapsed=elapsed,
+                metrics=metrics,
+                active=active,
+                remaining=queued_remaining,
+                detail=detail if _progress_style() != "bar" else None,
+            )
         )
 
     def assign_next(rank: int, cap: WorkerCapability):
@@ -748,6 +859,8 @@ def _dispatch_stage(
         active -= 1
         results.append(msg)
         completed += int(msg.get("completed_count", 1))
+        for metric in metric_defs:
+            metric_counts[str(metric.label)] += int(msg.get(metric.result_key, 0))
         cap = next(cap for cap in worker_caps if int(cap.rank) == int(src))
         assign_next(src, cap)
         if completed == total_items or completed - last_completion_log >= progress_every:
@@ -904,8 +1017,17 @@ def _rank0_prepare_stage12(
             )
         ):
             log_fn(
-                f"{log_label}: payload prep {idx}/{len(tasks)}; kept={len(filtered_tasks)}, "
-                f"dropped={dropped_tasks}, elapsed={now - start_time:.1f}s"
+                _progress_message(
+                    label=f"{log_label}: payload prep",
+                    completed=idx,
+                    total=len(tasks),
+                    unit="tasks",
+                    elapsed=now - start_time,
+                    metrics=[
+                        ("kept", len(filtered_tasks), None),
+                        ("dropped", dropped_tasks, None),
+                    ],
+                )
             )
             last_status = now
 
@@ -986,8 +1108,13 @@ def _write_stage2_root_payloads(
             )
         ):
             log_fn(
-                f"{progress_label}: wrote root payloads {idx}/{total_roots}; "
-                f"elapsed={now - start_time:.1f}s"
+                _progress_message(
+                    label=f"{progress_label}: wrote root payloads",
+                    completed=idx,
+                    total=total_roots,
+                    unit="roots",
+                    elapsed=now - start_time,
+                )
             )
             last_status = now
     return root_payload_paths
@@ -1054,6 +1181,7 @@ def _worker_run_stage1(
         "stage": "stage1",
         "shard_path": str(shard_path),
         "node_ids": sorted(set(int(v) for v in node_ids)),
+        "count_nodes": int(len(set(int(v) for v in node_ids))),
         "root_ids": sorted(root_ids),
         "input_payload_paths": input_payload_paths,
         "completed_count": len(items),
@@ -1177,6 +1305,113 @@ def _build_stage3_batches(sim, worker_count: int) -> List[List]:
     return [list(rec["halos"]) for rec in bins if rec["halos"]]
 
 
+def _stage3_state_list_data(state: Dict, name: str):
+    if name in state:
+        return state[name]
+    return state.get(f"_{name}", [])
+
+
+def _build_stage3_summary(halo_states: Sequence[Dict], galaxy_states: Sequence[Dict]) -> Dict[str, object]:
+    halo_list_names = ("dmlist", "glist", "slist", "bhlist", "dlist")
+    galaxy_list_names = ("glist", "slist", "bhlist", "dlist", "cloud_index_list", "AHF_ancestor_haloIDs")
+
+    halo_ids = np.asarray([int(state["id"]) for state in halo_states], dtype=np.int64)
+    galaxy_ids = np.asarray([int(state["id"]) for state in galaxy_states], dtype=np.int64)
+
+    halo_list_lengths = {}
+    halo_list_dtypes = {}
+    for name in halo_list_names:
+        lengths = np.asarray(
+            [int(np.asarray(_stage3_state_list_data(state, name)).size) for state in halo_states],
+            dtype=np.int64,
+        )
+        halo_list_lengths[name] = lengths
+        for state in halo_states:
+            arr = np.asarray(_stage3_state_list_data(state, name))
+            if arr.size > 0:
+                halo_list_dtypes[name] = arr.dtype.str
+                break
+
+    galaxy_list_lengths = {}
+    galaxy_list_dtypes = {}
+    for name in galaxy_list_names:
+        lengths = np.asarray(
+            [int(np.asarray(_stage3_state_list_data(state, name)).size) for state in galaxy_states],
+            dtype=np.int64,
+        )
+        galaxy_list_lengths[name] = lengths
+        for state in galaxy_states:
+            arr = np.asarray(_stage3_state_list_data(state, name))
+            if arr.size > 0:
+                galaxy_list_dtypes[name] = arr.dtype.str
+                break
+
+    top_halo_state = None
+    top_halo_mass = None
+    if halo_states:
+        top_halo_state = max(
+            halo_states,
+            key=lambda state: float(getattr(state["masses"]["total"], "d", getattr(state["masses"]["total"], "value", state["masses"]["total"]))),
+        )
+        top_halo_mass = float(
+            getattr(top_halo_state["masses"]["total"], "d", getattr(top_halo_state["masses"]["total"], "value", top_halo_state["masses"]["total"]))
+        )
+
+    top_galaxy_state = None
+    top_galaxy_stellar_mass = None
+    if galaxy_states:
+        top_galaxy_state = max(
+            galaxy_states,
+            key=lambda state: float(getattr(state["masses"]["stellar"], "d", getattr(state["masses"]["stellar"], "value", state["masses"]["stellar"]))),
+        )
+        top_galaxy_stellar_mass = float(
+            getattr(
+                top_galaxy_state["masses"]["stellar"],
+                "d",
+                getattr(top_galaxy_state["masses"]["stellar"], "value", top_galaxy_state["masses"]["stellar"]),
+            )
+        )
+
+    return {
+        "halos": {
+            "id": halo_ids,
+            "total_mass": np.asarray(
+                [float(getattr(state["masses"]["total"], "d", getattr(state["masses"]["total"], "value", state["masses"]["total"]))) for state in halo_states],
+                dtype=np.float64,
+            ),
+            "pos": np.asarray(
+                [np.asarray(getattr(state["pos"], "d", getattr(state["pos"], "value", state["pos"])), dtype=np.float64) for state in halo_states],
+                dtype=np.float64,
+            ) if halo_states else np.empty((0, 3), dtype=np.float64),
+            "ahf_halo_id": np.asarray([int(state.get("AHF_haloID", -1)) for state in halo_states], dtype=np.int64),
+            "list_lengths": halo_list_lengths,
+            "list_dtypes": halo_list_dtypes,
+        },
+        "galaxies": {
+            "id": galaxy_ids,
+            "stellar_mass": np.asarray(
+                [float(getattr(state["masses"]["stellar"], "d", getattr(state["masses"]["stellar"], "value", state["masses"]["stellar"]))) for state in galaxy_states],
+                dtype=np.float64,
+            ),
+            "total_mass": np.asarray(
+                [float(getattr(state["masses"]["total"], "d", getattr(state["masses"]["total"], "value", state["masses"]["total"]))) for state in galaxy_states],
+                dtype=np.float64,
+            ),
+            "pos": np.asarray(
+                [np.asarray(getattr(state["pos"], "d", getattr(state["pos"], "value", state["pos"])), dtype=np.float64) for state in galaxy_states],
+                dtype=np.float64,
+            ) if galaxy_states else np.empty((0, 3), dtype=np.float64),
+            "top_halo_id": np.asarray([int(state.get("AHF_top_haloID", -1)) for state in galaxy_states], dtype=np.int64),
+            "list_lengths": galaxy_list_lengths,
+            "list_dtypes": galaxy_list_dtypes,
+        },
+        "top_halo_state": top_halo_state,
+        "top_halo_mass": top_halo_mass,
+        "top_galaxy_state": top_galaxy_state,
+        "top_galaxy_stellar_mass": top_galaxy_stellar_mass,
+    }
+
+
 def _worker_run_stage3(
     *,
     item: Dict,
@@ -1190,12 +1425,14 @@ def _worker_run_stage3(
     _compute_group_properties_subset(sim, group_type="halo", groups=list(sim.halo_list))
     _compute_group_properties_subset(sim, group_type="galaxy", groups=list(sim.galaxy_list))
 
+    halo_states = [_serialize_group_state(group, id_key="_merge_id") for group in sim.halo_list]
+    galaxy_states = [_serialize_group_state(group, id_key="_merge_id") for group in sim.galaxy_list]
     shard_path = shard_dir / f"stage3_rank{os.getpid()}_{abs(hash(str(item.get('payload_path'))))}.pkl"
     _dump_pickle(
         shard_path,
         {
-            "halos": [_serialize_group_state(group, id_key="_merge_id") for group in sim.halo_list],
-            "galaxies": [_serialize_group_state(group, id_key="_merge_id") for group in sim.galaxy_list],
+            "halos": halo_states,
+            "galaxies": galaxy_states,
         },
     )
     return {
@@ -1203,6 +1440,7 @@ def _worker_run_stage3(
         "shard_path": str(shard_path),
         "count_halos": int(len(sim.halo_list)),
         "count_galaxies": int(len(sim.galaxy_list)),
+        "summary": _build_stage3_summary(halo_states, galaxy_states),
     }
 
 
@@ -1356,12 +1594,19 @@ def _rank0_run_stage3_and_save(
         small_total=len(stage3_cpu_items),
         worker_threads=worker_threads,
         worker_roles={int(cap.rank): "prop_worker" for cap in worker_caps},
+        progress_unit="batches",
+        progress_metrics=[
+            ProgressMetric("halos", "count_halos", total=len(sim.halo_list)),
+            ProgressMetric("galaxies", "count_galaxies", total=len(sim.galaxy_list)),
+        ],
     )
+    _rank0_log("stage4: coordinator beginning final export")
     stream_save_stage3_catalogue(
         snapshot_meta=snapshot_meta,
         stage3_results=stage3_results,
         output_file=output_file,
         log_fn=_rank0_log,
+        stage_label="stage4",
     )
 
 
@@ -1649,6 +1894,10 @@ def run_mpi(
                 regular_total=len(stage1_regular_specs),
                 small_total=len(stage1_small_specs),
                 worker_threads=stage1_thread_map,
+                progress_unit="batches",
+                progress_metrics=[
+                    ProgressMetric("nodes", "count_nodes", total=len(tasks)),
+                ],
             )
 
             root_to_shards: Dict[int, List[str]] = {int(root): [] for root in tasks_by_root}
@@ -1741,6 +1990,10 @@ def run_mpi(
                 small_total=len(stage2_small_roots),
                 worker_threads=stage2_thread_map,
                 worker_roles=stage2_worker_roles,
+                progress_unit="roots",
+                progress_metrics=[
+                    ProgressMetric("galaxies_out", "count"),
+                ],
             )
             final_shards = [str(result["shard_path"]) for result in stage2_results]
             _rank0_log(f"stage2: complete; final_shards={len(final_shards)}")
@@ -1893,6 +2146,10 @@ def run_mpi(
                 small_total=len(stage2_small_roots),
                 worker_threads=stage2_thread_map,
                 worker_roles={int(cap.rank): "cpu_worker" for cap in worker_caps},
+                progress_unit="roots",
+                progress_metrics=[
+                    ProgressMetric("galaxies_out", "count"),
+                ],
             )
             _stop_workers(comm, worker_caps=worker_caps)
             final_shards = [str(result["shard_path"]) for result in stage2_results]
