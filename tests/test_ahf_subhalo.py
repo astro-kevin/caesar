@@ -182,6 +182,21 @@ def test_stage2_shard_payload_uses_table_format():
     assert np.array_equal(restored[0]["slist"], np.asarray([2, 3], dtype=np.int32))
 
 
+def test_rank0_log_includes_total_and_stage_elapsed(monkeypatch, capsys):
+    ticks = iter([100.0, 105.0, 112.0])
+    monkeypatch.setattr(mpi_mod.time, "monotonic", lambda: next(ticks))
+    mpi_mod._reset_rank0_log_context(now=100.0)
+
+    mpi_mod._rank0_log("stage1: start")
+    mpi_mod._rank0_log("stage1: progress")
+    mpi_mod._rank0_log("stage2: start")
+
+    lines = [line for line in capsys.readouterr().out.strip().splitlines() if line]
+    assert "[total=0.0s][stage1=0.0s] stage1: start" in lines[0]
+    assert "[total=5.0s][stage1=5.0s] stage1: progress" in lines[1]
+    assert "[total=12.0s][stage2=0.0s] stage2: start" in lines[2]
+
+
 def test_ancestor_chain_and_task_manifest():
     parent_of = {10: 0, 11: 10, 12: 11, 20: 0, 21: 20}
     host_to_nodes = {10: {10, 11, 12}, 20: {20, 21}}

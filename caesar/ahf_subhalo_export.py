@@ -648,10 +648,23 @@ def stream_save_stage3_catalogue(
     halo_list_names = tuple(name for name in ("dmlist", "glist", "slist", "bhlist", "dlist", "galaxy_index_list") if name in halo_schema.list_lengths)
     galaxy_list_names = tuple(name for name in ("glist", "slist", "bhlist", "dlist", "cloud_index_list", "AHF_ancestor_haloIDs") if name in galaxy_schema.list_lengths)
 
-    halo_starts = {name: _compute_starts_ends(halo_schema.list_lengths[name])[0] for name in halo_list_names}
-    halo_ends = {name: _compute_starts_ends(halo_schema.list_lengths[name])[1] for name in halo_list_names}
-    galaxy_starts = {name: _compute_starts_ends(galaxy_schema.list_lengths[name])[0] for name in galaxy_list_names}
-    galaxy_ends = {name: _compute_starts_ends(galaxy_schema.list_lengths[name])[1] for name in galaxy_list_names}
+    halo_ordered_lengths = {}
+    for name in halo_list_names:
+        lengths = np.asarray(halo_schema.list_lengths[name], dtype=np.int64)
+        if name == "galaxy_index_list":
+            halo_ordered_lengths[name] = lengths
+        else:
+            halo_ordered_lengths[name] = lengths[halo_order]
+
+    galaxy_ordered_lengths = {
+        name: np.asarray(galaxy_schema.list_lengths[name], dtype=np.int64)[galaxy_order]
+        for name in galaxy_list_names
+    }
+
+    halo_starts = {name: _compute_starts_ends(halo_ordered_lengths[name])[0] for name in halo_list_names}
+    halo_ends = {name: _compute_starts_ends(halo_ordered_lengths[name])[1] for name in halo_list_names}
+    galaxy_starts = {name: _compute_starts_ends(galaxy_ordered_lengths[name])[0] for name in galaxy_list_names}
+    galaxy_ends = {name: _compute_starts_ends(galaxy_ordered_lengths[name])[1] for name in galaxy_list_names}
 
     units_seen: set[str] = set()
     for spec in halo_schema.attr_specs.values():

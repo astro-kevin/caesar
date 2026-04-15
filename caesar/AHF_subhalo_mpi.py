@@ -136,6 +136,10 @@ class _StageQueue:
         return int(self.front_assigned) + int(self.back_assigned)
 
 
+_RANK0_LOG_TOTAL_START: Optional[float] = None
+_RANK0_LOG_STAGE_STARTS: Dict[str, float] = {}
+
+
 @dataclass
 class _BufferedPreparedQueue:
     specs: List[object]
@@ -590,8 +594,37 @@ def _classify_stage2_roots(
     return ordered_roots, []
 
 
+def _reset_rank0_log_context(*, now: Optional[float] = None) -> None:
+    global _RANK0_LOG_TOTAL_START, _RANK0_LOG_STAGE_STARTS
+    _RANK0_LOG_TOTAL_START = float(time.monotonic() if now is None else now)
+    _RANK0_LOG_STAGE_STARTS = {}
+
+
+def _rank0_log_stage_name(message: str) -> Optional[str]:
+    if ":" not in str(message):
+        return None
+    token = str(message).split(":", 1)[0].strip()
+    if not token or " " in token:
+        return None
+    normalized = token.replace("_", "").replace("-", "")
+    return token if normalized.isalnum() else None
+
+
 def _rank0_log(message: str) -> None:
-    print(f"[AHF-subhalo][rank0] {message}", flush=True)
+    global _RANK0_LOG_TOTAL_START, _RANK0_LOG_STAGE_STARTS
+    now = float(time.monotonic())
+    if _RANK0_LOG_TOTAL_START is None:
+        _reset_rank0_log_context(now=now)
+    total_elapsed = now - float(_RANK0_LOG_TOTAL_START)
+    parts = [f"[AHF-subhalo][rank0][total={total_elapsed:.1f}s]"]
+    stage_name = _rank0_log_stage_name(message)
+    if stage_name is not None:
+        stage_start = _RANK0_LOG_STAGE_STARTS.get(stage_name)
+        if stage_start is None:
+            stage_start = now
+            _RANK0_LOG_STAGE_STARTS[stage_name] = stage_start
+        parts.append(f"[{stage_name}={now - float(stage_start):.1f}s]")
+    print("".join(parts) + f" {message}", flush=True)
 
 
 def _progress_style() -> str:
@@ -1737,6 +1770,8 @@ def run_mpi(
         coordinator_rank = int(declared_roles.index("coordinator"))
     else:
         coordinator_rank = 0
+    if int(rank) == int(coordinator_rank):
+        _reset_rank0_log_context()
 
     effective_role = role
     if role == "auto":
