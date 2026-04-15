@@ -1579,6 +1579,8 @@ def _rank0_run_stage3_and_save(
         stage3_cpu_items.append({"payload_path": str(payload_path)})
 
     snapshot_meta = direct_state.snapshot
+    total_stage3_halos = int(len(sim.halo_list))
+    total_stage3_galaxies = int(len(sim.galaxy_list))
     del final_galaxies
     del sim
     del direct_state
@@ -1596,8 +1598,8 @@ def _rank0_run_stage3_and_save(
         worker_roles={int(cap.rank): "prop_worker" for cap in worker_caps},
         progress_unit="batches",
         progress_metrics=[
-            ProgressMetric("halos", "count_halos", total=len(sim.halo_list)),
-            ProgressMetric("galaxies", "count_galaxies", total=len(sim.galaxy_list)),
+            ProgressMetric("halos", "count_halos", total=total_stage3_halos),
+            ProgressMetric("galaxies", "count_galaxies", total=total_stage3_galaxies),
         ],
     )
     _rank0_log("stage4: coordinator beginning final export")
