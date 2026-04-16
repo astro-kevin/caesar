@@ -808,6 +808,28 @@ def test_uniform_stage_thread_map_uses_all_worker_cores():
     assert max(vals) == 4
 
 
+def test_stage3_batches_group_complete_top_level_hosts():
+    halos = [
+        SimpleNamespace(AHF_haloID=11, AHF_top_haloID=10, global_indexes=np.arange(5, dtype=np.int64)),
+        SimpleNamespace(AHF_haloID=10, AHF_top_haloID=10, global_indexes=np.arange(20, dtype=np.int64), galaxy_index_list=np.asarray([0, 1], dtype=np.int32)),
+        SimpleNamespace(AHF_haloID=20, AHF_top_haloID=20, global_indexes=np.arange(7, dtype=np.int64), galaxy_index_list=np.asarray([2], dtype=np.int32)),
+    ]
+    galaxies = [
+        SimpleNamespace(global_indexes=np.arange(3, dtype=np.int64)),
+        SimpleNamespace(global_indexes=np.arange(4, dtype=np.int64)),
+        SimpleNamespace(global_indexes=np.arange(2, dtype=np.int64)),
+    ]
+    sim = SimpleNamespace(halo_list=halos, galaxy_list=galaxies)
+
+    batches = mpi_mod._build_stage3_batches(sim, worker_count=2)
+
+    assert len(batches) == 2
+    assert {int(getattr(halo, "AHF_haloID", -1)) for halo in batches[0]} == {10, 11}
+    assert {int(getattr(halo, "AHF_haloID", -1)) for halo in batches[1]} == {20}
+    assert {int(getattr(halo, "AHF_top_haloID", -1)) for halo in batches[0]} == {10}
+    assert {int(getattr(halo, "AHF_top_haloID", -1)) for halo in batches[1]} == {20}
+
+
 def test_stage1_thread_map_preserves_gpu_support_threads():
     worker_caps = [
         mpi_mod.WorkerCapability(rank=1, role="gpu_worker", hostname="nodeA", local_rank=1, gpu_device=0, threads=2),
@@ -1093,6 +1115,226 @@ def test_stage3_property_payload_roundtrip():
     subhalo_mod._compute_group_properties_subset(local_sim, group_type="galaxy", groups=list(local_sim.galaxy_list))
     assert local_sim.halo_list[0].masses["total"].value > 0.0
     assert local_sim.galaxy_list[0].masses["stellar"].value > 0.0
+
+
+def test_galaxy_hydrogen_masses_sanitize_invalid_hi_h2_fractions():
+    from caesar.group import create_new_group
+
+    sim = SimpleNamespace()
+    sim.units = {
+        "mass": "Msun",
+        "length": "kpccm",
+        "velocity": "km/s",
+        "time": "yr",
+        "temperature": "K",
+    }
+    sim._kwargs = {}
+    sim.load_pot = True
+    sim.yt_dataset = subhalo_mod._ShardYTUnitHelper(redshift=0.0)
+    sim._ds = sim.yt_dataset
+    sim.simulation = SimpleNamespace(
+        XH=0.76,
+        redshift=0.0,
+        omega_baryon=0.05,
+        omega_matter=0.3,
+        omega_lambda=0.7,
+        Om_z=0.3,
+        boxsize=sim.yt_dataset.quan(100.0, "kpccm"),
+        H_z=sim.yt_dataset.quan(1.0, "1/s"),
+        G=sim.yt_dataset.quan(4.51691362044e-39, "kpc**3/(Msun * s**2)"),
+        critical_density=sim.yt_dataset.quan(1.0, "Msun/kpc**3"),
+        Densities=sim.yt_dataset.arr(np.asarray([200.0, 500.0, 2500.0], dtype=np.float64), "Msun/kpc**3"),
+    )
+    sim.data_manager = SimpleNamespace(
+        ptypes=["gas", "star", "dm"],
+        blackholes=False,
+        pos=np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        vel=np.zeros((4, 3), dtype=np.float32),
+        mass=np.asarray([10.0, 10.0, 5.0, 20.0], dtype=np.float32),
+        pot=np.zeros(4, dtype=np.float32),
+        ptype=np.asarray([0, 0, 4, 1], dtype=np.int32),
+        glist=np.asarray([0, 1], dtype=np.int64),
+        slist=np.asarray([2], dtype=np.int64),
+        dmlist=np.asarray([3], dtype=np.int64),
+        gnh=np.asarray([1.0, 0.01], dtype=np.float32),
+        gsfr=np.asarray([0.0, 0.0], dtype=np.float32),
+        gZ=np.asarray([0.01, 0.01], dtype=np.float32),
+        gT=np.asarray([1.0e4, 1.0e4], dtype=np.float32),
+        gfH2=np.asarray([0.4, 0.5], dtype=np.float32),
+        gfHI=np.asarray([0.9, 0.7], dtype=np.float32),
+        dustmass=np.asarray([0.0, 0.0], dtype=np.float32),
+        sZ=np.asarray([0.02], dtype=np.float32),
+        age=np.asarray([1.0], dtype=np.float32),
+    )
+    sim._ds_type = subhalo_mod._ShardDatasetType(
+        ptypes=sim.data_manager.ptypes,
+        data_manager_attrs=set(sim.data_manager.__dict__.keys()),
+    )
+    sim.group_types = ["halo", "galaxy"]
+
+    halo = create_new_group(sim, "halo")
+    halo.AHF_haloID = 100
+    halo.global_indexes = np.asarray([0, 1, 2, 3], dtype=np.int64)
+    halo.glist = np.asarray([0, 1], dtype=np.int64)
+    halo.slist = np.asarray([0], dtype=np.int64)
+    halo.dmlist = np.asarray([0], dtype=np.int64)
+    halo.bhlist = np.asarray([], dtype=np.int64)
+    halo.dlist = np.asarray([], dtype=np.int64)
+    halo.galaxy_index_list = np.asarray([0], dtype=np.int32)
+
+    gal = create_new_group(sim, "galaxy")
+    gal.AHF_haloID = 101
+    gal.AHF_parent_haloID = 100
+    gal.AHF_top_haloID = 100
+    gal.AHF_depth = 1
+    gal.AHF_ancestor_haloIDs = np.asarray([100], dtype=np.int64)
+    gal.global_indexes = np.asarray([0, 1, 2], dtype=np.int64)
+    gal.glist = np.asarray([0, 1], dtype=np.int64)
+    gal.slist = np.asarray([0], dtype=np.int64)
+    gal.dmlist = np.asarray([], dtype=np.int64)
+    gal.bhlist = np.asarray([], dtype=np.int64)
+    gal.dlist = np.asarray([], dtype=np.int64)
+    gal.parent_halo_index = 0
+    gal._ahf_host_halo_index = 0
+    gal.halo = halo
+
+    sim.halo_list = [halo]
+    sim.galaxy_list = [gal]
+
+    subhalo_mod._compute_group_properties_subset(sim, group_type="halo", groups=list(sim.halo_list))
+    subhalo_mod._compute_group_properties_subset(sim, group_type="galaxy", groups=list(sim.galaxy_list))
+
+    total_h = float(gal.masses["H"].value)
+    total_hi = float(gal.masses["HI"].value)
+    total_h2 = float(gal.masses["H2"].value)
+    assert np.isclose(total_h, 15.2)
+    assert np.isclose(total_hi, 9.88)
+    assert np.isclose(total_h2, 3.04)
+    assert total_hi + total_h2 <= total_h + 1.0e-8
+
+    gas_30 = float(gal.masses["gas_30kpc"].value)
+    hi_30 = float(gal.masses["HI_30kpc"].value)
+    h2_30 = float(gal.masses["H2_30kpc"].value)
+    assert hi_30 + h2_30 <= gas_30 * 0.76 + 1.0e-8
+
+
+def test_host_local_hydrogen_assignment_uses_mass_weighted_distance():
+    from caesar.group import create_new_group
+
+    sim = SimpleNamespace()
+    sim.units = {
+        "mass": "Msun",
+        "length": "kpccm",
+        "velocity": "km/s",
+        "time": "yr",
+        "temperature": "K",
+    }
+    sim._kwargs = {}
+    sim.load_pot = True
+    sim.yt_dataset = subhalo_mod._ShardYTUnitHelper(redshift=0.0)
+    sim._ds = sim.yt_dataset
+    sim.simulation = SimpleNamespace(
+        XH=0.76,
+        redshift=0.0,
+        omega_baryon=0.05,
+        omega_matter=0.3,
+        omega_lambda=0.7,
+        Om_z=0.3,
+        boxsize=sim.yt_dataset.quan(100.0, "kpccm"),
+        H_z=sim.yt_dataset.quan(1.0, "1/s"),
+        G=sim.yt_dataset.quan(4.51691362044e-39, "kpc**3/(Msun * s**2)"),
+        critical_density=sim.yt_dataset.quan(1.0, "Msun/kpc**3"),
+        Densities=sim.yt_dataset.arr(np.asarray([200.0, 500.0, 2500.0], dtype=np.float64), "Msun/kpc**3"),
+    )
+    sim.data_manager = SimpleNamespace(
+        ptypes=["gas", "star"],
+        blackholes=False,
+        pos=np.asarray([[4.0, 0.0, 0.0], [0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=np.float32),
+        vel=np.zeros((3, 3), dtype=np.float32),
+        mass=np.asarray([10.0, 5.0, 20.0], dtype=np.float32),
+        pot=np.zeros(3, dtype=np.float32),
+        ptype=np.asarray([0, 4, 4], dtype=np.int32),
+        glist=np.asarray([0], dtype=np.int64),
+        slist=np.asarray([1, 2], dtype=np.int64),
+        gnh=np.asarray([1.0], dtype=np.float32),
+        gsfr=np.asarray([0.0], dtype=np.float32),
+        gZ=np.asarray([0.01], dtype=np.float32),
+        gT=np.asarray([1.0e4], dtype=np.float32),
+        gfH2=np.asarray([0.1], dtype=np.float32),
+        gfHI=np.asarray([0.5], dtype=np.float32),
+        dustmass=np.asarray([0.0], dtype=np.float32),
+        sZ=np.asarray([0.02, 0.02], dtype=np.float32),
+        age=np.asarray([1.0, 1.0], dtype=np.float32),
+    )
+    sim._ds_type = subhalo_mod._ShardDatasetType(
+        ptypes=sim.data_manager.ptypes,
+        data_manager_attrs=set(sim.data_manager.__dict__.keys()),
+    )
+    sim.group_types = ["halo", "galaxy"]
+
+    host = create_new_group(sim, "halo")
+    host.AHF_haloID = 100
+    host.AHF_top_haloID = 100
+    host.global_indexes = np.asarray([0, 1, 2], dtype=np.int64)
+    host.glist = np.asarray([0], dtype=np.int64)
+    host.slist = np.asarray([0, 1], dtype=np.int64)
+    host.dmlist = np.asarray([], dtype=np.int64)
+    host.bhlist = np.asarray([], dtype=np.int64)
+    host.dlist = np.asarray([], dtype=np.int64)
+    host.galaxy_index_list = np.asarray([0, 1], dtype=np.int32)
+
+    gal_a = create_new_group(sim, "galaxy")
+    gal_a.AHF_haloID = 101
+    gal_a.AHF_parent_haloID = 100
+    gal_a.AHF_top_haloID = 100
+    gal_a.AHF_depth = 1
+    gal_a.AHF_ancestor_haloIDs = np.asarray([100], dtype=np.int64)
+    gal_a.global_indexes = np.asarray([1], dtype=np.int64)
+    gal_a.glist = np.asarray([], dtype=np.int64)
+    gal_a.slist = np.asarray([0], dtype=np.int64)
+    gal_a.dmlist = np.asarray([], dtype=np.int64)
+    gal_a.bhlist = np.asarray([], dtype=np.int64)
+    gal_a.dlist = np.asarray([], dtype=np.int64)
+    gal_a.parent_halo_index = 0
+    gal_a._ahf_host_halo_index = 0
+    gal_a.halo = host
+
+    gal_b = create_new_group(sim, "galaxy")
+    gal_b.AHF_haloID = 102
+    gal_b.AHF_parent_haloID = 100
+    gal_b.AHF_top_haloID = 100
+    gal_b.AHF_depth = 1
+    gal_b.AHF_ancestor_haloIDs = np.asarray([100], dtype=np.int64)
+    gal_b.global_indexes = np.asarray([2], dtype=np.int64)
+    gal_b.glist = np.asarray([], dtype=np.int64)
+    gal_b.slist = np.asarray([1], dtype=np.int64)
+    gal_b.dmlist = np.asarray([], dtype=np.int64)
+    gal_b.bhlist = np.asarray([], dtype=np.int64)
+    gal_b.dlist = np.asarray([], dtype=np.int64)
+    gal_b.parent_halo_index = 0
+    gal_b._ahf_host_halo_index = 0
+    gal_b.halo = host
+
+    sim.halo_list = [host]
+    sim.galaxy_list = [gal_a, gal_b]
+
+    subhalo_mod._compute_group_properties_subset(sim, group_type="halo", groups=list(sim.halo_list))
+    subhalo_mod._compute_group_properties_subset(sim, group_type="galaxy", groups=list(sim.galaxy_list))
+
+    assert np.isclose(float(gal_a.masses["HI"].value), 0.0)
+    assert np.isclose(float(gal_a.masses["H2"].value), 0.0)
+    assert np.isclose(float(gal_b.masses["HI"].value), 3.8)
+    assert np.isclose(float(gal_b.masses["H2"].value), 0.76)
+    assert np.isclose(float(gal_a.masses["HI_30kpc"].value), 3.8)
+    assert np.isclose(float(gal_b.masses["HI_30kpc"].value), 3.8)
 
 
 def test_populate_caesar_ahf_lineage_indexes_maps_parent_and_top_host():

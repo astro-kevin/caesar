@@ -10,7 +10,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -31,6 +31,8 @@ from caesar.AHF_FAST_loader import load_ahf_halos_dataframe, load_ahf_hierarchy
 from caesar.AHF_subhalo import (
     AHFSubhaloBatch,
     AHFSubhaloTask,
+    MINIMUM_DM_PER_AHF_SUBHALO,
+    MINIMUM_DM_PER_TOPLEVEL_AHF_HALO,
     _available_gpu_device_ids,
     _build_node_dm_counts,
     _build_stage3_property_payload,
@@ -59,6 +61,7 @@ from caesar.AHF_subhalo import (
 from caesar.ahf_subhalo_hdf5 import (
     AHFSubhaloDirectState,
     build_direct_state,
+    load_snapshot_meta,
     build_task_payload as _build_direct_task_payload,
 )
 from caesar.ahf_subhalo_tables import (
@@ -465,6 +468,33 @@ def _log_thread_map(stage_name: str, worker_caps: Sequence[WorkerCapability], th
     if cpu_threads:
         parts.append(f"cpu_threads_total={sum(cpu_threads)}")
     _rank0_log(f"{stage_name}: thread budget " + ", ".join(parts))
+
+
+_PROPERTY_DIRECT_STATE_CACHE: Dict[Tuple[str, str], AHFSubhaloDirectState] = {}
+
+
+def _stage3_host_halo_count(state: AHFSubhaloDirectState, root_id: int) -> int:
+    root_int = int(root_id)
+    count = 0
+    for node_index in range(len(state.nodes)):
+        if int(state.nodes.top_halo_id[node_index]) != root_int:
+            continue
+        halo_id = int(state.nodes.halo_id[node_index])
+        parent_id = int(state.nodes.parent_halo_id[node_index])
+        dm_count = int(state.nodes.dm_count[node_index])
+        min_dm = int(MINIMUM_DM_PER_TOPLEVEL_AHF_HALO) if parent_id <= 0 else int(MINIMUM_DM_PER_AHF_SUBHALO)
+        if dm_count >= min_dm or halo_id == root_int:
+            count += 1
+    return int(count)
+
+
+def _worker_property_direct_state(snapshot_file: str, ahf_particles_file: str) -> AHFSubhaloDirectState:
+    key = (str(snapshot_file), str(ahf_particles_file))
+    cached = _PROPERTY_DIRECT_STATE_CACHE.get(key)
+    if cached is None:
+        cached = build_direct_state(str(snapshot_file), str(ahf_particles_file))
+        _PROPERTY_DIRECT_STATE_CACHE[key] = cached
+    return cached
 
 
 def _dump_pickle(path: Path, payload) -> None:
@@ -1284,20 +1314,23 @@ def _worker_run_reconciling_subhalos(
     else:
         outputs = [run_one(one_item) for one_item in items]
 
-    galaxies_payload = []
-    root_ids = []
+    root_results = []
     total_count = 0
     for out in outputs:
-        galaxies_payload.extend(list(out["galaxies"]))
-        root_ids.append(int(out["root_id"]))
+        root_id = int(out["root_id"])
+        shard_path = shard_dir / f"stage2_root{root_id:08d}.pkl"
+        _dump_pickle(shard_path, _reconciled_galaxy_shard_payload(out["galaxies"]))
+        root_results.append(
+            {
+                "root_id": int(root_id),
+                "shard_path": str(shard_path),
+                "count": int(out["count"]),
+            }
+        )
         total_count += int(out["count"])
-
-    shard_path = shard_dir / f"stage2_rank{os.getpid()}_{abs(hash(tuple(sorted(root_ids))))}.pkl"
-    _dump_pickle(shard_path, _reconciled_galaxy_shard_payload(galaxies_payload))
     return {
         "stage": "stage2",
-        "shard_path": str(shard_path),
-        "root_ids": sorted(root_ids),
+        "root_results": sorted(root_results, key=lambda rec: int(rec["root_id"])),
         "count": int(total_count),
         "completed_count": len(items),
     }
@@ -1325,18 +1358,40 @@ def _stage3_halo_cost(halo) -> int:
         return 1
 
 
+def _stage3_galaxy_cost(galaxy) -> int:
+    try:
+        return max(1, int(len(getattr(galaxy, "global_indexes", []))))
+    except Exception:
+        return 1
+
+
 def _build_stage3_batches(sim, worker_count: int) -> List[List]:
     halos = list(getattr(sim, "halo_list", []))
     if not halos:
         return []
-    multiplier = max(1, _env_int("CAESAR_AHF_SUBHALO_STAGE3_BATCH_MULTIPLIER", 4))
-    target_batches = max(int(worker_count), int(worker_count) * int(multiplier))
-    bins = [{"cost": 0, "halos": []} for _ in range(max(1, target_batches))]
-    for halo in sorted(halos, key=_stage3_halo_cost, reverse=True):
-        slot = min(bins, key=lambda rec: int(rec["cost"]))
-        slot["halos"].append(halo)
-        slot["cost"] += int(_stage3_halo_cost(halo))
-    return [list(rec["halos"]) for rec in bins if rec["halos"]]
+
+    host_records: List[Tuple[int, int, List[object]]] = []
+    halos_by_top: Dict[int, List[object]] = {}
+    for halo in halos:
+        top_id = int(getattr(halo, "AHF_top_haloID", getattr(halo, "AHF_haloID", -1)))
+        halos_by_top.setdefault(top_id, []).append(halo)
+
+    for top_id, host_halos in halos_by_top.items():
+        host_cost = int(sum(_stage3_halo_cost(halo) for halo in host_halos))
+        top_halo = next(
+            (
+                halo for halo in host_halos
+                if int(getattr(halo, "AHF_haloID", -1)) == int(top_id)
+            ),
+            host_halos[0],
+        )
+        for gi in np.asarray(getattr(top_halo, "galaxy_index_list", []), dtype=np.int64).tolist():
+            if 0 <= int(gi) < len(getattr(sim, "galaxy_list", [])):
+                host_cost += int(_stage3_galaxy_cost(sim.galaxy_list[int(gi)]))
+        host_records.append((int(host_cost), int(top_id), list(host_halos)))
+
+    host_records.sort(key=lambda rec: (int(rec[0]), int(rec[1])), reverse=True)
+    return [halos_for_host for _cost, _top_id, halos_for_host in host_records]
 
 
 def _stage3_state_list_data(state: Dict, name: str):
@@ -1486,8 +1541,45 @@ def _worker_run_calculating_properties(
     nproc: int,
 ) -> Dict:
     nproc = int(item.get("nproc", nproc))
-    payload = _load_pickle(Path(item["payload_path"]))
-    sim = _build_stage3_property_runtime(payload, nproc=int(nproc))
+    if "payload_path" in item:
+        payload = _load_pickle(Path(item["payload_path"]))
+        sim = _build_stage3_property_runtime(payload, nproc=int(nproc))
+    else:
+        root_id = int(item["root_id"])
+        payload = _load_pickle(Path(item["reconciled_shard_path"]))
+        galaxy_payloads = (
+            candidate_records_from_table_payload(payload)
+            if isinstance(payload, dict) and "ahf_halo_id" in payload
+            else list(payload)
+        )
+        direct_state = _worker_property_direct_state(
+            str(item["snapshot_file"]),
+            str(item["ahf_particles_file"]),
+        )
+        sim = _build_direct_stage3_runtime(
+            direct_state,
+            galaxy_payloads=galaxy_payloads,
+            nproc=int(nproc),
+            host_filter_ids={int(root_id)},
+        )
+        halo_offset = int(item.get("halo_id_offset", 0))
+        galaxy_offset = int(item.get("galaxy_id_offset", 0))
+        for idx, halo in enumerate(sim.halo_list):
+            halo._merge_id = int(halo_offset + idx)
+        for idx, gal in enumerate(sim.galaxy_list):
+            gal._merge_id = int(galaxy_offset + idx)
+        expected_halos = int(item.get("expected_halos", len(sim.halo_list)))
+        expected_galaxies = int(item.get("expected_galaxies", len(sim.galaxy_list)))
+        if int(len(sim.halo_list)) != int(expected_halos):
+            raise RuntimeError(
+                f"Host {root_id} halo count mismatch during property repack: "
+                f"expected {expected_halos}, got {len(sim.halo_list)}"
+            )
+        if int(len(sim.galaxy_list)) != int(expected_galaxies):
+            raise RuntimeError(
+                f"Host {root_id} galaxy count mismatch during property repack: "
+                f"expected {expected_galaxies}, got {len(sim.galaxy_list)}"
+            )
 
     _compute_group_properties_subset(sim, group_type="halo", groups=list(sim.halo_list))
     _compute_group_properties_subset(sim, group_type="galaxy", groups=list(sim.galaxy_list))
@@ -1500,7 +1592,8 @@ def _worker_run_calculating_properties(
         galaxy_states,
         ("glist", "slist", "bhlist", "dlist", "cloud_index_list", "AHF_ancestor_haloIDs"),
     )
-    shard_path = shard_dir / f"stage3_rank{os.getpid()}_{abs(hash(str(item.get('payload_path'))))}.pkl"
+    shard_source = str(item.get("payload_path", item.get("reconciled_shard_path", item.get("root_id", ""))))
+    shard_path = shard_dir / f"stage3_rank{os.getpid()}_{abs(hash(shard_source))}.pkl"
     _dump_pickle(
         shard_path,
         {
@@ -1607,7 +1700,7 @@ def _rank0_calculate_properties_and_write(
     snapshot_file: str,
     ahf_particles_file: str,
     output_file: str,
-    final_shards: Sequence[str],
+    root_results: Sequence[Mapping[str, object]],
     nproc: int,
     shard_root: Path,
     snapshot_hash: Optional[str] = None,
@@ -1616,80 +1709,50 @@ def _rank0_calculate_properties_and_write(
     worker_threads: Optional[Dict[int, int]] = None,
 ):
     if isinstance(sim, AHFSubhaloDirectState):
-        direct_state = sim
-        _rank0_log("calculating properties: reusing in-memory direct shard runtime")
+        snapshot_meta = sim.snapshot
+        _rank0_log("calculating properties: using in-memory direct snapshot metadata")
     else:
-        _rank0_log("calculating properties: rebuilding in-memory direct shard runtime")
-        direct_state = build_direct_state(snapshot_file, ahf_particles_file)
+        snapshot_meta = load_snapshot_meta(snapshot_file)
+        _rank0_log("calculating properties: loading snapshot metadata")
 
-    final_galaxies = []
-    for path in final_shards:
-        payload = _load_pickle(Path(path))
-        records = (
-            candidate_records_from_table_payload(payload)
-            if isinstance(payload, dict) and "ahf_halo_id" in payload
-            else list(payload)
-        )
-        final_galaxies.extend(records)
-
-    sim = _build_direct_stage3_runtime(
-        direct_state,
-        galaxy_payloads=final_galaxies,
-        nproc=int(nproc),
+    ordered_root_results = sorted(
+        [
+            {
+                "root_id": int(rec["root_id"]),
+                "shard_path": str(rec["shard_path"]),
+                "count": int(rec.get("count", 0)),
+                "cost": int(rec.get("cost", 0)),
+                "halo_count": int(rec.get("halo_count", 0)),
+            }
+            for rec in root_results
+        ],
+        key=lambda rec: (int(rec["cost"]), int(rec["root_id"])),
+        reverse=True,
     )
-
-    for idx, halo in enumerate(sim.halo_list):
-        halo._merge_id = int(idx)
-    for idx, gal in enumerate(sim.galaxy_list):
-        gal._merge_id = int(idx)
 
     stage3_cpu_items = []
-    halo_batches = _build_stage3_batches(sim, len(worker_caps))
+    halo_offset = 0
+    galaxy_offset = 0
+    for rec in ordered_root_results:
+        stage3_cpu_items.append(
+            {
+                "root_id": int(rec["root_id"]),
+                "reconciled_shard_path": str(rec["shard_path"]),
+                "snapshot_file": str(snapshot_file),
+                "ahf_particles_file": str(ahf_particles_file),
+                "halo_id_offset": int(halo_offset),
+                "galaxy_id_offset": int(galaxy_offset),
+                "expected_halos": int(rec.get("halo_count", 0)),
+                "expected_galaxies": int(rec.get("count", 0)),
+            }
+        )
+        halo_offset += int(rec.get("halo_count", 0))
+        galaxy_offset += int(rec.get("count", 0))
+
     _rank0_log(
-        f"calculating properties: prepared property batches count={len(halo_batches)} halos={len(sim.halo_list)} galaxies={len(sim.galaxy_list)}"
+        f"calculating properties: prepared property host tasks count={len(stage3_cpu_items)} "
+        f"halos={halo_offset} galaxies={galaxy_offset}"
     )
-    prep_start = time.monotonic()
-
-    def _materialize_stage3_payload(spec):
-        ibatch, batch = spec
-        payload_path = shard_root / f"stage3_input_{int(ibatch):05d}.pkl"
-        _dump_pickle(payload_path, _build_stage3_property_payload(sim, batch))
-        return int(ibatch), {"payload_path": str(payload_path)}
-
-    prep_workers = max(
-        1,
-        _env_int(
-            "CAESAR_AHF_SUBHALO_STAGE3_PREP_WORKERS",
-            min(8, max(1, len(halo_batches))),
-        ),
-    )
-    if len(halo_batches) > 1 and prep_workers > 1:
-        prepared = {}
-        with ThreadPoolExecutor(max_workers=int(prep_workers)) as executor:
-            futures = [
-                executor.submit(_materialize_stage3_payload, (ibatch, batch))
-                for ibatch, batch in enumerate(halo_batches)
-            ]
-            for fut in as_completed(futures):
-                ibatch, item = fut.result()
-                prepared[int(ibatch)] = item
-        stage3_cpu_items = [prepared[idx] for idx in range(len(halo_batches))]
-    else:
-        for ibatch, batch in enumerate(halo_batches):
-            _idx, item = _materialize_stage3_payload((ibatch, batch))
-            stage3_cpu_items.append(item)
-    _rank0_log(
-        f"calculating properties: payload materialization complete batches={len(stage3_cpu_items)} "
-        f"elapsed={time.monotonic() - prep_start:.1f}s workers={prep_workers}"
-    )
-
-    snapshot_meta = direct_state.snapshot
-    total_stage3_halos = int(len(sim.halo_list))
-    total_stage3_galaxies = int(len(sim.galaxy_list))
-    del final_galaxies
-    del sim
-    del direct_state
-    gc.collect()
 
     stage3_results = _dispatch_stage(
         comm,
@@ -1704,8 +1767,8 @@ def _rank0_calculate_properties_and_write(
         worker_roles={int(cap.rank): "property_worker" for cap in worker_caps},
         progress_unit="batches",
         progress_metrics=[
-            ProgressMetric("halos", "count_halos", total=total_stage3_halos),
-            ProgressMetric("galaxies", "count_galaxies", total=total_stage3_galaxies),
+            ProgressMetric("halos", "count_halos", total=int(halo_offset) if halo_offset > 0 else None),
+            ProgressMetric("galaxies", "count_galaxies", total=int(galaxy_offset) if galaxy_offset > 0 else None),
         ],
     )
     _rank0_log("writing: coordinator beginning final export")
@@ -1735,6 +1798,7 @@ def _write_stage2_manifest(
     root_payload_paths: Dict[int, str],
     root_to_shards: Dict[int, List[str]],
     root_costs: Dict[int, int],
+    root_halo_counts: Optional[Dict[int, int]] = None,
 ) -> Path:
     path = _stage2_manifest_path(shard_root)
     _dump_pickle(
@@ -1750,6 +1814,7 @@ def _write_stage2_manifest(
             "root_payload_paths": {int(k): str(v) for k, v in root_payload_paths.items()},
             "root_to_shards": {int(k): [str(x) for x in v] for k, v in root_to_shards.items()},
             "root_costs": {int(k): int(v) for k, v in root_costs.items()},
+            "root_halo_counts": {int(k): int(v) for k, v in dict(root_halo_counts or {}).items()},
         },
     )
     return path
@@ -1776,6 +1841,7 @@ def _write_stage3_manifest(
     ahf_particles_file: str,
     output_file: str,
     final_shards: Sequence[str],
+    root_results: Optional[Sequence[Mapping[str, object]]] = None,
     snapshot_hash: Optional[str] = None,
 ) -> Path:
     path = _stage3_manifest_path(shard_root)
@@ -1786,6 +1852,16 @@ def _write_stage3_manifest(
             "ahf_particles_file": str(ahf_particles_file),
             "output_file": str(output_file),
             "final_shards": [str(v) for v in final_shards],
+            "root_results": [
+                {
+                    "root_id": int(rec["root_id"]),
+                    "shard_path": str(rec["shard_path"]),
+                    "count": int(rec.get("count", 0)),
+                    "cost": int(rec.get("cost", 0)),
+                    "halo_count": int(rec.get("halo_count", 0)),
+                }
+                for rec in (root_results or [])
+            ],
             "snapshot_hash": None if snapshot_hash in (None, "") else str(snapshot_hash),
         },
     )
@@ -2038,6 +2114,14 @@ def run_mpi(
                 int(root_id): int(sum(int(task.fof_candidates) for task in root_tasks))
                 for root_id, root_tasks in tasks_by_root.items()
             }
+            root_halo_counts = (
+                {
+                    int(root_id): int(_stage3_host_halo_count(sim_runtime, int(root_id)))
+                    for root_id in tasks_by_root.keys()
+                }
+                if isinstance(sim_runtime, AHFSubhaloDirectState)
+                else {}
+            )
             _write_stage2_manifest(
                 shard_root=shard_root,
                 snapshot_file=snapshot_file,
@@ -2050,6 +2134,7 @@ def run_mpi(
                 root_payload_paths=root_payload_paths,
                 root_to_shards=root_to_shards,
                 root_costs=root_costs,
+                root_halo_counts=root_halo_counts,
             )
             _rank0_log("finding galaxies: wrote reconciliation manifest")
 
@@ -2113,7 +2198,21 @@ def run_mpi(
                     ProgressMetric("galaxies_out", "count"),
                 ],
             )
-            final_shards = [str(result["shard_path"]) for result in stage2_results]
+            root_results = []
+            for result in stage2_results:
+                root_results.extend(list(result.get("root_results", [])))
+            root_results = sorted(root_results, key=lambda rec: int(rec["root_id"]))
+            root_results_enriched = [
+                {
+                    "root_id": int(rec["root_id"]),
+                    "shard_path": str(rec["shard_path"]),
+                    "count": int(rec.get("count", 0)),
+                    "cost": int(root_costs.get(int(rec["root_id"]), 0)),
+                    "halo_count": int(root_halo_counts.get(int(rec["root_id"]), 0)),
+                }
+                for rec in root_results
+            ]
+            final_shards = [str(rec["shard_path"]) for rec in root_results_enriched]
             _rank0_log(f"reconciling subhalos: complete; final_shards={len(final_shards)}")
 
             if phase == "pipeline":
@@ -2129,7 +2228,7 @@ def run_mpi(
                     snapshot_file=snapshot_file,
                     ahf_particles_file=ahf_particles_file,
                     output_file=output_file,
-                    final_shards=final_shards,
+                    root_results=root_results_enriched,
                     nproc=int(nproc),
                     shard_root=shard_root,
                     snapshot_hash=getattr(sim_runtime, "hash", None),
@@ -2147,6 +2246,7 @@ def run_mpi(
                 ahf_particles_file=ahf_particles_file,
                 output_file=output_file,
                 final_shards=final_shards,
+                root_results=root_results_enriched,
                 snapshot_hash=getattr(sim_runtime, "hash", None),
             )
             _rank0_log("grouping pipeline: wrote property manifest")
@@ -2223,6 +2323,9 @@ def run_mpi(
             root_costs = {
                 int(k): int(v) for k, v in dict(manifest.get("root_costs", {})).items()
             }
+            root_halo_counts = {
+                int(k): int(v) for k, v in dict(manifest.get("root_halo_counts", {})).items()
+            }
 
             stage2_regular_roots, stage2_small_roots = _classify_stage2_roots(
                 root_costs=root_costs,
@@ -2271,7 +2374,21 @@ def run_mpi(
                 ],
             )
             _stop_workers(comm, worker_caps=worker_caps)
-            final_shards = [str(result["shard_path"]) for result in stage2_results]
+            root_results = []
+            for result in stage2_results:
+                root_results.extend(list(result.get("root_results", [])))
+            root_results = sorted(root_results, key=lambda rec: int(rec["root_id"]))
+            root_results_enriched = [
+                {
+                    "root_id": int(rec["root_id"]),
+                    "shard_path": str(rec["shard_path"]),
+                    "count": int(rec.get("count", 0)),
+                    "cost": int(root_costs.get(int(rec["root_id"]), 0)),
+                    "halo_count": int(root_halo_counts.get(int(rec["root_id"]), 0)),
+                }
+                for rec in root_results
+            ]
+            final_shards = [str(rec["shard_path"]) for rec in root_results_enriched]
             _rank0_log(f"reconciling subhalos: complete; final_shards={len(final_shards)}")
             _write_stage3_manifest(
                 shard_root=shard_root,
@@ -2279,6 +2396,7 @@ def run_mpi(
                 ahf_particles_file=str(manifest.get("ahf_particles_file", ahf_particles_file)),
                 output_file=str(manifest.get("output_file", output_file)),
                 final_shards=final_shards,
+                root_results=root_results_enriched,
                 snapshot_hash=manifest.get("snapshot_hash"),
             )
             _rank0_log("reconciling subhalos: wrote property manifest")
@@ -2330,7 +2448,7 @@ def run_mpi(
             snapshot_file=str(manifest.get("snapshot_file", snapshot_file)),
             ahf_particles_file=str(manifest.get("ahf_particles_file", ahf_particles_file)),
             output_file=str(manifest.get("output_file", output_file)),
-            final_shards=[str(v) for v in manifest.get("final_shards", [])],
+            root_results=[dict(v) for v in manifest.get("root_results", [])],
             nproc=int(nproc),
             shard_root=shard_root,
             snapshot_hash=manifest.get("snapshot_hash"),

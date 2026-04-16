@@ -1063,6 +1063,26 @@ def _component_local_indices(group, component: str) -> np.ndarray:
     return np.asarray(getattr(group, attr_map[component], []), dtype=np.int64)
 
 
+def _sanitized_hydrogen_fractions(sim, gas_local: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    dm = sim.data_manager
+    hi_frac = np.clip(_raw_array(dm.gfHI[gas_local], dtype=np.float64), 0.0, 1.0)
+    h2_frac = np.clip(_raw_array(dm.gfH2[gas_local], dtype=np.float64), 0.0, 1.0)
+    if gas_local.size == 0:
+        return hi_frac, h2_frac
+
+    if hasattr(dm, "gnh"):
+        gas_nh = _raw_array(dm.gnh[gas_local], dtype=np.float64)
+        h2_frac = np.asarray(h2_frac, dtype=np.float64, copy=True)
+        h2_frac[gas_nh < 0.13] = 0.0
+
+    total_frac = hi_frac + h2_frac
+    if np.any(total_frac > 1.0):
+        hi_frac = np.asarray(hi_frac, dtype=np.float64, copy=True)
+        hi_frac[total_frac > 1.0] = 1.0 - h2_frac[total_frac > 1.0]
+        hi_frac = np.clip(hi_frac, 0.0, 1.0)
+    return hi_frac, h2_frac
+
+
 def _group_aperture_properties(sim, galaxy, aperture: float, *, gal_pos_raw: Optional[np.ndarray] = None) -> Tuple[Dict[str, object], Dict[str, object]]:
     dm = sim.data_manager
     halo = getattr(galaxy, "halo", None)
@@ -1124,8 +1144,9 @@ def _group_aperture_properties(sim, galaxy, aperture: float, *, gal_pos_raw: Opt
         gas_r = np.linalg.norm(_periodic_delta(gas_pos, gal_pos_raw, boxsize), axis=1)
         inside = gas_r <= float(aperture)
         if np.any(inside):
-            hi_frac = _raw_array(dm.gfHI[gas_local], dtype=np.float64)[inside]
-            h2_frac = _raw_array(dm.gfH2[gas_local], dtype=np.float64)[inside]
+            hi_frac, h2_frac = _sanitized_hydrogen_fractions(sim, gas_local)
+            hi_frac = hi_frac[inside]
+            h2_frac = h2_frac[inside]
             gas_mass = gas_mass[inside]
             xh = float(getattr(sim.simulation, "XH", 0.76))
             hi_mass = float(np.sum(gas_mass * hi_frac) * xh)
@@ -1136,15 +1157,105 @@ def _group_aperture_properties(sim, galaxy, aperture: float, *, gal_pos_raw: Opt
     return masses_out, sigmas_out
 
 
-def _compute_single_group_properties_selfcontained(sim, group, group_type: str) -> Dict[str, object]:
-    from astropy import constants as const
-
+def _apply_host_local_hydrogen_assignment(sim, galaxies: Sequence) -> None:
     dm = sim.data_manager
-    boxsize = _boxsize_raw(sim)
-    mass_unit = sim.units["mass"]
-    vel_unit = sim.units["velocity"]
-    len_unit = sim.units["length"]
+    if not galaxies or not hasattr(dm, "gfHI") or not hasattr(dm, "gfH2"):
+        return
 
+    aperture = float(sim._kwargs.get("aperture", 30.0))
+    aperture2 = float(aperture * aperture) if aperture == aperture else None
+    aperture_suffix = f"{int(aperture)}kpc" if float(aperture).is_integer() else f"{aperture:g}kpc"
+    mass_unit = sim.units["mass"]
+    boxsize = _boxsize_raw(sim)
+    hydrogen_fraction = float(getattr(sim.simulation, "XH", 0.76))
+    processed_hosts = set()
+
+    for galaxy in galaxies:
+        host = getattr(galaxy, "halo", None)
+        if host is None:
+            continue
+        host_key = int(getattr(host, "AHF_haloID", id(host)))
+        if host_key in processed_hosts:
+            continue
+        processed_hosts.add(host_key)
+
+        galaxy_ids = [
+            int(gi)
+            for gi in np.asarray(getattr(host, "galaxy_index_list", []), dtype=np.int64).tolist()
+            if 0 <= int(gi) < len(getattr(sim, "galaxy_list", []))
+        ]
+        if not galaxy_ids:
+            continue
+        host_galaxies = [sim.galaxy_list[gi] for gi in galaxy_ids]
+
+        gas_local = _component_local_indices(host, "gas")
+        gas_global = _component_global_indices(sim, host, "gas")
+        if gas_local.size == 0 or gas_global.size == 0:
+            zero_mass = _quantity(sim, 0.0, mass_unit)
+            for gal in host_galaxies:
+                gal.masses["HI"] = zero_mass
+                gal.masses["H2"] = zero_mass
+                if aperture2 is not None:
+                    gal.masses[f"HI_{aperture_suffix}"] = zero_mass
+                    gal.masses[f"H2_{aperture_suffix}"] = zero_mass
+            if hasattr(host, "masses"):
+                host.masses["HI"] = zero_mass
+                host.masses["H2"] = zero_mass
+            continue
+
+        hi_frac, h2_frac = _sanitized_hydrogen_fractions(sim, gas_local)
+        gas_mass = _raw_array(dm.mass[gas_global], dtype=np.float64) * hydrogen_fraction
+        hi_particle_mass = gas_mass * hi_frac
+        h2_particle_mass = gas_mass * h2_frac
+
+        galaxy_pos = np.asarray([_raw_array(gal.pos, dtype=np.float64) for gal in host_galaxies], dtype=np.float64)
+        galaxy_mass = np.asarray(
+            [_raw_scalar(getattr(gal, "masses", {}).get("total", 0.0)) for gal in host_galaxies],
+            dtype=np.float64,
+        )
+        galaxy_hi_mass = np.zeros(len(host_galaxies), dtype=np.float64)
+        galaxy_h2_mass = np.zeros(len(host_galaxies), dtype=np.float64)
+        galaxy_hi_aperture = np.zeros(len(host_galaxies), dtype=np.float64)
+        galaxy_h2_aperture = np.zeros(len(host_galaxies), dtype=np.float64)
+
+        gas_pos = _raw_array(dm.pos[gas_global], dtype=np.float64)
+        for idx in range(len(gas_global)):
+            hi_mass = float(hi_particle_mass[idx])
+            h2_mass = float(h2_particle_mass[idx])
+            if hi_mass == 0.0 and h2_mass == 0.0:
+                continue
+
+            delta = _periodic_delta(galaxy_pos, gas_pos[idx], boxsize)
+            d2 = np.sum(delta * delta, axis=1)
+            zero_sep = d2 <= 0.0
+            if np.any(zero_sep):
+                candidate = np.where(zero_sep)[0]
+                assign_idx = int(candidate[np.argmax(galaxy_mass[candidate])])
+            else:
+                assign_idx = int(np.argmax(galaxy_mass / d2))
+            galaxy_hi_mass[assign_idx] += hi_mass
+            galaxy_h2_mass[assign_idx] += h2_mass
+
+            if aperture2 is not None:
+                inside = d2 < aperture2
+                if np.any(inside):
+                    galaxy_hi_aperture[inside] += hi_mass
+                    galaxy_h2_aperture[inside] += h2_mass
+
+        for idx, gal in enumerate(host_galaxies):
+            gal.masses["HI"] = _quantity(sim, galaxy_hi_mass[idx], mass_unit)
+            gal.masses["H2"] = _quantity(sim, galaxy_h2_mass[idx], mass_unit)
+            if aperture2 is not None:
+                gal.masses[f"HI_{aperture_suffix}"] = _quantity(sim, galaxy_hi_aperture[idx], mass_unit)
+                gal.masses[f"H2_{aperture_suffix}"] = _quantity(sim, galaxy_h2_aperture[idx], mass_unit)
+
+        if hasattr(host, "masses"):
+            host.masses["HI"] = _quantity(sim, float(np.sum(hi_particle_mass)), mass_unit)
+            host.masses["H2"] = _quantity(sim, float(np.sum(h2_particle_mass)), mass_unit)
+
+
+def _build_group_property_context(sim, group, group_type: str):
+    dm = sim.data_manager
     global_idx = np.asarray(getattr(group, "global_indexes", []), dtype=np.int64)
     pos_all = _raw_array(dm.pos[global_idx], dtype=np.float64) if global_idx.size > 0 else np.empty((0, 3), dtype=np.float64)
     vel_all = _raw_array(dm.vel[global_idx], dtype=np.float64) if global_idx.size > 0 else np.empty((0, 3), dtype=np.float64)
@@ -1161,22 +1272,6 @@ def _compute_single_group_properties_selfcontained(sim, group, group_type: str) 
     dust_local = _component_local_indices(group, "dust")
     dust_global = _component_global_indices(sim, group, "dust")
 
-    state: Dict[str, object] = {}
-    state["ngas"] = int(len(gas_local))
-    state["nstar"] = int(len(star_local))
-    state["ndm"] = int(len(dm_local))
-    state["nbh"] = int(len(bh_local))
-    state["ndust"] = int(len(dust_local))
-
-    masses = {}
-    radii = {}
-    velocity_dispersions = {}
-    metallicities = {}
-    temperatures = {}
-    rotation = {}
-    virial_quantities = {}
-
-    total_mass = float(np.sum(mass_all)) if mass_all.size > 0 else 0.0
     gas_mass = float(np.sum(_raw_array(dm.mass[gas_global], dtype=np.float64))) if gas_global.size > 0 else 0.0
     stellar_mass = float(np.sum(_raw_array(dm.mass[star_global], dtype=np.float64))) if star_global.size > 0 else 0.0
     dm_mass = float(np.sum(_raw_array(dm.mass[dm_global], dtype=np.float64))) if dm_global.size > 0 else 0.0
@@ -1194,20 +1289,8 @@ def _compute_single_group_properties_selfcontained(sim, group, group_type: str) 
     else:
         dust_mass = 0.0
 
-    masses["total"] = _quantity(sim, total_mass, mass_unit)
-    masses["gas"] = _quantity(sim, gas_mass, mass_unit)
-    masses["stellar"] = _quantity(sim, stellar_mass, mass_unit)
-    masses["dm"] = _quantity(sim, dm_mass, mass_unit)
-    masses["baryon"] = _quantity(sim, baryon_mass, mass_unit)
-    masses["H"] = _quantity(sim, gas_mass * float(getattr(sim.simulation, "XH", 0.76)), mass_unit)
-    masses["dust"] = _quantity(sim, dust_mass, mass_unit)
-    if bh_local.size > 0 or getattr(dm, "blackholes", False):
-        masses["bh"] = _quantity(sim, bh_mass, mass_unit)
-
-    state["gas_fraction"] = float(gas_mass / baryon_mass) if baryon_mass > 0.0 else 0.0
-
-    if global_idx.size > 0 and total_mass > 0.0:
-        pos_center = _weighted_periodic_center(pos_all, mass_all, boxsize)
+    if global_idx.size > 0 and mass_all.size > 0 and np.sum(mass_all) > 0.0:
+        pos_center = _weighted_periodic_center(pos_all, mass_all, _boxsize_raw(sim))
         vel_center = _weighted_velocity_center(vel_all, mass_all)
         if hasattr(dm, "pot") and getattr(sim, "load_pot", True):
             pot = _raw_array(dm.pot[global_idx], dtype=np.float64)
@@ -1223,75 +1306,138 @@ def _compute_single_group_properties_selfcontained(sim, group, group_type: str) 
         minpot_pos = np.zeros(3, dtype=np.float64)
         minpot_vel = np.zeros(3, dtype=np.float64)
 
-    state["pos"] = _array_from_key(sim, pos_center, "length")
-    state["vel"] = _array_from_key(sim, vel_center, "velocity")
-    state["minpotpos"] = _array_from_key(sim, minpot_pos, "length")
-    state["minpotvel"] = _array_from_key(sim, minpot_vel, "velocity")
-
-    rel_pos_center = _periodic_delta(pos_all, pos_center, boxsize)
-    rel_pos_minpot = _periodic_delta(pos_all, minpot_pos, boxsize)
+    rel_pos_center = _periodic_delta(pos_all, pos_center, _boxsize_raw(sim))
+    rel_pos_minpot = _periodic_delta(pos_all, minpot_pos, _boxsize_raw(sim))
     radii_center = np.linalg.norm(rel_pos_center, axis=1) if rel_pos_center.size > 0 else np.empty(0, dtype=np.float64)
     radii_minpot = np.linalg.norm(rel_pos_minpot, axis=1) if rel_pos_minpot.size > 0 else np.empty(0, dtype=np.float64)
 
+    return SimpleNamespace(
+        sim=sim,
+        group=group,
+        group_type=str(group_type),
+        dm=dm,
+        boxsize=_boxsize_raw(sim),
+        mass_unit=sim.units["mass"],
+        vel_unit=sim.units["velocity"],
+        len_unit=sim.units["length"],
+        global_idx=global_idx,
+        pos_all=pos_all,
+        vel_all=vel_all,
+        mass_all=mass_all,
+        gas_local=gas_local,
+        gas_global=gas_global,
+        star_local=star_local,
+        star_global=star_global,
+        dm_local=dm_local,
+        dm_global=dm_global,
+        bh_local=bh_local,
+        bh_global=bh_global,
+        dust_local=dust_local,
+        dust_global=dust_global,
+        total_mass=float(np.sum(mass_all)) if mass_all.size > 0 else 0.0,
+        gas_mass=gas_mass,
+        stellar_mass=stellar_mass,
+        dm_mass=dm_mass,
+        baryon_mass=baryon_mass,
+        bh_mass=bh_mass,
+        dust_mass=dust_mass,
+        pos_center=pos_center,
+        vel_center=vel_center,
+        minpot_pos=minpot_pos,
+        minpot_vel=minpot_vel,
+        rel_pos_center=rel_pos_center,
+        rel_pos_minpot=rel_pos_minpot,
+        radii_center=radii_center,
+        radii_minpot=radii_minpot,
+    )
+
+
+def _apply_common_property_pass(context, state: Dict[str, object], masses: Dict[str, object], radii: Dict[str, object], velocity_dispersions: Dict[str, object]) -> None:
+    sim = context.sim
+    dm = context.dm
+
+    state["ngas"] = int(len(context.gas_local))
+    state["nstar"] = int(len(context.star_local))
+    state["ndm"] = int(len(context.dm_local))
+    state["nbh"] = int(len(context.bh_local))
+    state["ndust"] = int(len(context.dust_local))
+
+    masses["total"] = _quantity(sim, context.total_mass, context.mass_unit)
+    masses["gas"] = _quantity(sim, context.gas_mass, context.mass_unit)
+    masses["stellar"] = _quantity(sim, context.stellar_mass, context.mass_unit)
+    masses["dm"] = _quantity(sim, context.dm_mass, context.mass_unit)
+    masses["baryon"] = _quantity(sim, context.baryon_mass, context.mass_unit)
+    masses["H"] = _quantity(sim, context.gas_mass * float(getattr(sim.simulation, "XH", 0.76)), context.mass_unit)
+    masses["dust"] = _quantity(sim, context.dust_mass, context.mass_unit)
+    if context.bh_local.size > 0 or getattr(dm, "blackholes", False):
+        masses["bh"] = _quantity(sim, context.bh_mass, context.mass_unit)
+
+    state["gas_fraction"] = float(context.gas_mass / context.baryon_mass) if context.baryon_mass > 0.0 else 0.0
+    state["pos"] = _array_from_key(sim, context.pos_center, "length")
+    state["vel"] = _array_from_key(sim, context.vel_center, "velocity")
+    state["minpotpos"] = _array_from_key(sim, context.minpot_pos, "length")
+    state["minpotvel"] = _array_from_key(sim, context.minpot_vel, "velocity")
+
     component_specs = {
-        "total": (global_idx, mass_all, pos_all, vel_all),
+        "total": (context.mass_all, context.pos_all, context.vel_all),
         "baryon": (
-            np.concatenate([gas_global, star_global]) if gas_global.size or star_global.size else np.empty(0, dtype=np.int64),
             np.concatenate([
-                _raw_array(dm.mass[gas_global], dtype=np.float64) if gas_global.size > 0 else np.empty(0, dtype=np.float64),
-                _raw_array(dm.mass[star_global], dtype=np.float64) if star_global.size > 0 else np.empty(0, dtype=np.float64),
+                _raw_array(dm.mass[context.gas_global], dtype=np.float64) if context.gas_global.size > 0 else np.empty(0, dtype=np.float64),
+                _raw_array(dm.mass[context.star_global], dtype=np.float64) if context.star_global.size > 0 else np.empty(0, dtype=np.float64),
             ]),
             np.concatenate([
-                _raw_array(dm.pos[gas_global], dtype=np.float64) if gas_global.size > 0 else np.empty((0, 3), dtype=np.float64),
-                _raw_array(dm.pos[star_global], dtype=np.float64) if star_global.size > 0 else np.empty((0, 3), dtype=np.float64),
-            ], axis=0) if gas_global.size or star_global.size else np.empty((0, 3), dtype=np.float64),
+                _raw_array(dm.pos[context.gas_global], dtype=np.float64) if context.gas_global.size > 0 else np.empty((0, 3), dtype=np.float64),
+                _raw_array(dm.pos[context.star_global], dtype=np.float64) if context.star_global.size > 0 else np.empty((0, 3), dtype=np.float64),
+            ], axis=0) if context.gas_global.size or context.star_global.size else np.empty((0, 3), dtype=np.float64),
             np.concatenate([
-                _raw_array(dm.vel[gas_global], dtype=np.float64) if gas_global.size > 0 else np.empty((0, 3), dtype=np.float64),
-                _raw_array(dm.vel[star_global], dtype=np.float64) if star_global.size > 0 else np.empty((0, 3), dtype=np.float64),
-            ], axis=0) if gas_global.size or star_global.size else np.empty((0, 3), dtype=np.float64),
+                _raw_array(dm.vel[context.gas_global], dtype=np.float64) if context.gas_global.size > 0 else np.empty((0, 3), dtype=np.float64),
+                _raw_array(dm.vel[context.star_global], dtype=np.float64) if context.star_global.size > 0 else np.empty((0, 3), dtype=np.float64),
+            ], axis=0) if context.gas_global.size or context.star_global.size else np.empty((0, 3), dtype=np.float64),
         ),
         "gas": (
-            gas_global,
-            _raw_array(dm.mass[gas_global], dtype=np.float64) if gas_global.size > 0 else np.empty(0, dtype=np.float64),
-            _raw_array(dm.pos[gas_global], dtype=np.float64) if gas_global.size > 0 else np.empty((0, 3), dtype=np.float64),
-            _raw_array(dm.vel[gas_global], dtype=np.float64) if gas_global.size > 0 else np.empty((0, 3), dtype=np.float64),
+            _raw_array(dm.mass[context.gas_global], dtype=np.float64) if context.gas_global.size > 0 else np.empty(0, dtype=np.float64),
+            _raw_array(dm.pos[context.gas_global], dtype=np.float64) if context.gas_global.size > 0 else np.empty((0, 3), dtype=np.float64),
+            _raw_array(dm.vel[context.gas_global], dtype=np.float64) if context.gas_global.size > 0 else np.empty((0, 3), dtype=np.float64),
         ),
         "stellar": (
-            star_global,
-            _raw_array(dm.mass[star_global], dtype=np.float64) if star_global.size > 0 else np.empty(0, dtype=np.float64),
-            _raw_array(dm.pos[star_global], dtype=np.float64) if star_global.size > 0 else np.empty((0, 3), dtype=np.float64),
-            _raw_array(dm.vel[star_global], dtype=np.float64) if star_global.size > 0 else np.empty((0, 3), dtype=np.float64),
+            _raw_array(dm.mass[context.star_global], dtype=np.float64) if context.star_global.size > 0 else np.empty(0, dtype=np.float64),
+            _raw_array(dm.pos[context.star_global], dtype=np.float64) if context.star_global.size > 0 else np.empty((0, 3), dtype=np.float64),
+            _raw_array(dm.vel[context.star_global], dtype=np.float64) if context.star_global.size > 0 else np.empty((0, 3), dtype=np.float64),
         ),
         "dm": (
-            dm_global,
-            _raw_array(dm.mass[dm_global], dtype=np.float64) if dm_global.size > 0 else np.empty(0, dtype=np.float64),
-            _raw_array(dm.pos[dm_global], dtype=np.float64) if dm_global.size > 0 else np.empty((0, 3), dtype=np.float64),
-            _raw_array(dm.vel[dm_global], dtype=np.float64) if dm_global.size > 0 else np.empty((0, 3), dtype=np.float64),
+            _raw_array(dm.mass[context.dm_global], dtype=np.float64) if context.dm_global.size > 0 else np.empty(0, dtype=np.float64),
+            _raw_array(dm.pos[context.dm_global], dtype=np.float64) if context.dm_global.size > 0 else np.empty((0, 3), dtype=np.float64),
+            _raw_array(dm.vel[context.dm_global], dtype=np.float64) if context.dm_global.size > 0 else np.empty((0, 3), dtype=np.float64),
         ),
     }
 
-    for name, (_idx, comp_mass, comp_pos, comp_vel) in component_specs.items():
+    for name, (comp_mass, comp_pos, comp_vel) in component_specs.items():
         if comp_mass.size == 0 or np.sum(comp_mass) <= 0.0:
-            radii[name] = _quantity(sim, 0.0, len_unit)
-            radii[f"{name}_r20"] = _quantity(sim, 0.0, len_unit)
-            radii[f"{name}_half_mass"] = _quantity(sim, 0.0, len_unit)
-            radii[f"{name}_r80"] = _quantity(sim, 0.0, len_unit)
-            velocity_dispersions[name] = _quantity(sim, 0.0, vel_unit)
+            radii[name] = _quantity(sim, 0.0, context.len_unit)
+            radii[f"{name}_r20"] = _quantity(sim, 0.0, context.len_unit)
+            radii[f"{name}_half_mass"] = _quantity(sim, 0.0, context.len_unit)
+            radii[f"{name}_r80"] = _quantity(sim, 0.0, context.len_unit)
+            velocity_dispersions[name] = _quantity(sim, 0.0, context.vel_unit)
             continue
-        comp_r = np.linalg.norm(_periodic_delta(comp_pos, pos_center, boxsize), axis=1)
+        comp_r = np.linalg.norm(_periodic_delta(comp_pos, context.pos_center, context.boxsize), axis=1)
         full_r, r20, half_r, r80 = _radius_summary(comp_r, comp_mass)
-        radii[name] = _quantity(sim, full_r, len_unit)
-        radii[f"{name}_r20"] = _quantity(sim, r20, len_unit)
-        radii[f"{name}_half_mass"] = _quantity(sim, half_r, len_unit)
-        radii[f"{name}_r80"] = _quantity(sim, r80, len_unit)
-        velocity_dispersions[name] = _quantity(sim, _velocity_dispersion(comp_vel, comp_mass), vel_unit)
+        radii[name] = _quantity(sim, full_r, context.len_unit)
+        radii[f"{name}_r20"] = _quantity(sim, r20, context.len_unit)
+        radii[f"{name}_half_mass"] = _quantity(sim, half_r, context.len_unit)
+        radii[f"{name}_r80"] = _quantity(sim, r80, context.len_unit)
+        velocity_dispersions[name] = _quantity(sim, _velocity_dispersion(comp_vel, comp_mass), context.vel_unit)
 
     velocity_dispersions["all"] = velocity_dispersions["total"]
 
-    gas_sfr = _raw_array(dm.gsfr[gas_local], dtype=np.float64) if gas_local.size > 0 and hasattr(dm, "gsfr") else np.empty(0, dtype=np.float64)
-    gas_Z = _raw_array(dm.gZ[gas_local], dtype=np.float64) if gas_local.size > 0 and hasattr(dm, "gZ") else np.empty(0, dtype=np.float64)
-    gas_T = _raw_array(dm.gT[gas_local], dtype=np.float64) if gas_local.size > 0 and hasattr(dm, "gT") else np.empty(0, dtype=np.float64)
-    gas_mass_arr = _raw_array(dm.mass[gas_global], dtype=np.float64) if gas_global.size > 0 else np.empty(0, dtype=np.float64)
+
+def _apply_gas_property_pass(context, state: Dict[str, object], masses: Dict[str, object], metallicities: Dict[str, object], temperatures: Dict[str, object]) -> None:
+    sim = context.sim
+    dm = context.dm
+
+    gas_sfr = _raw_array(dm.gsfr[context.gas_local], dtype=np.float64) if context.gas_local.size > 0 and hasattr(dm, "gsfr") else np.empty(0, dtype=np.float64)
+    gas_Z = _raw_array(dm.gZ[context.gas_local], dtype=np.float64) if context.gas_local.size > 0 and hasattr(dm, "gZ") else np.empty(0, dtype=np.float64)
+    gas_T = _raw_array(dm.gT[context.gas_local], dtype=np.float64) if context.gas_local.size > 0 and hasattr(dm, "gT") else np.empty(0, dtype=np.float64)
+    gas_mass_arr = _raw_array(dm.mass[context.gas_global], dtype=np.float64) if context.gas_global.size > 0 else np.empty(0, dtype=np.float64)
     gas_mass_sum = float(np.sum(gas_mass_arr)) if gas_mass_arr.size > 0 else 0.0
     gas_sfr_sum = float(np.sum(gas_sfr)) if gas_sfr.size > 0 else 0.0
     state["sfr"] = _quantity(sim, gas_sfr_sum, f"{sim.units['mass']}/{sim.units['time']}")
@@ -1310,26 +1456,32 @@ def _compute_single_group_properties_selfcontained(sim, group, group_type: str) 
 
     hi_mass = 0.0
     h2_mass = 0.0
-    if gas_local.size > 0 and hasattr(dm, "gfHI") and hasattr(dm, "gfH2"):
-        hi_mass = float(np.sum(gas_mass_arr * _raw_array(dm.gfHI[gas_local], dtype=np.float64)) * float(getattr(sim.simulation, "XH", 0.76)))
-        h2_mass = float(np.sum(gas_mass_arr * _raw_array(dm.gfH2[gas_local], dtype=np.float64)) * float(getattr(sim.simulation, "XH", 0.76)))
-    masses["HI"] = _quantity(sim, hi_mass, mass_unit)
-    masses["H2"] = _quantity(sim, h2_mass, mass_unit)
+    if context.gas_local.size > 0 and hasattr(dm, "gfHI") and hasattr(dm, "gfH2"):
+        hi_frac, h2_frac = _sanitized_hydrogen_fractions(sim, context.gas_local)
+        hi_mass = float(np.sum(gas_mass_arr * hi_frac) * float(getattr(sim.simulation, "XH", 0.76)))
+        h2_mass = float(np.sum(gas_mass_arr * h2_frac) * float(getattr(sim.simulation, "XH", 0.76)))
+    masses["HI"] = _quantity(sim, hi_mass, context.mass_unit)
+    masses["H2"] = _quantity(sim, h2_mass, context.mass_unit)
 
-    star_mass_arr = _raw_array(dm.mass[star_global], dtype=np.float64) if star_global.size > 0 else np.empty(0, dtype=np.float64)
-    if star_local.size > 0 and hasattr(dm, "sZ"):
-        star_Z = _raw_array(dm.sZ[star_local], dtype=np.float64)
+
+def _apply_star_property_pass(context, state: Dict[str, object], metallicities: Dict[str, object]) -> None:
+    sim = context.sim
+    dm = context.dm
+
+    star_mass_arr = _raw_array(dm.mass[context.star_global], dtype=np.float64) if context.star_global.size > 0 else np.empty(0, dtype=np.float64)
+    if context.star_local.size > 0 and hasattr(dm, "sZ"):
+        star_Z = _raw_array(dm.sZ[context.star_local], dtype=np.float64)
         zsum = float(np.sum(star_Z * star_mass_arr))
         metallicities["stellar"] = _quantity(sim, zsum / max(float(np.sum(star_mass_arr)), 1.0e-30), "")
     else:
         metallicities["stellar"] = _quantity(sim, 0.0, "")
 
-    if star_local.size > 0 and hasattr(dm, "age"):
-        star_age = _raw_array(dm.age[star_local], dtype=np.float64)
+    if context.star_local.size > 0 and hasattr(dm, "age"):
+        star_age = _raw_array(dm.age[context.star_local], dtype=np.float64)
         if star_mass_arr.size > 0 and np.sum(star_mass_arr) > 0.0:
             age_mass = float(np.sum(star_age * star_mass_arr) / np.sum(star_mass_arr))
-            if "stellar" in metallicities and np.sum(star_mass_arr * np.maximum(_raw_array(dm.sZ[star_local], dtype=np.float64), 0.0)) > 0.0 and hasattr(dm, "sZ"):
-                star_Z = _raw_array(dm.sZ[star_local], dtype=np.float64)
+            if "stellar" in metallicities and np.sum(star_mass_arr * np.maximum(_raw_array(dm.sZ[context.star_local], dtype=np.float64), 0.0)) > 0.0 and hasattr(dm, "sZ"):
+                star_Z = _raw_array(dm.sZ[context.star_local], dtype=np.float64)
                 zweight = np.sum(star_age * star_mass_arr * star_Z)
                 ztot = np.sum(star_mass_arr * star_Z)
                 age_metal = float(zweight / ztot) if ztot > 0.0 else age_mass
@@ -1341,28 +1493,49 @@ def _compute_single_group_properties_selfcontained(sim, group, group_type: str) 
             }
             state["sfr_100"] = _quantity(sim, float(np.sum(star_mass_arr[star_age < 0.1]) / 1.0e8), "Msun/yr")
 
-    if bh_local.size > 0:
-        bhmdot_arr = _raw_array(dm.bhmdot[bh_local], dtype=np.float64) if hasattr(dm, "bhmdot") else np.empty(0, dtype=np.float64)
-        bhmass_arr = _raw_array(dm.bhmass[bh_local], dtype=np.float64) if hasattr(dm, "bhmass") else _raw_array(dm.mass[bh_global], dtype=np.float64)
-        if bhmass_arr.size > 0:
-            imax = int(np.argmax(bhmass_arr))
-            bhmdot = float(bhmdot_arr[imax]) if bhmdot_arr.size > imax else 0.0
-            state["bhmdot"] = _quantity(sim, bhmdot, "Msun/yr")
-            FRAD = 0.1
-            edd_factor = (4 * np.pi * const.G * const.m_p / (FRAD * const.c * const.sigma_T)).to("1/yr").value
-            state["bh_fedd"] = _quantity(sim, bhmdot / (edd_factor * max(float(bhmass_arr[imax]), 1.0e-30)), "")
-        else:
-            state["bhmdot"] = _quantity(sim, 0.0, "Msun/yr")
-            state["bh_fedd"] = _quantity(sim, 0.0, "")
 
-    length_to_kpc = _unit_factor(sim, len_unit, "kpc")
-    mass_to_msun = _unit_factor(sim, mass_unit, "Msun")
-    pos_rel_kpc = rel_pos_center * length_to_kpc
-    radii_center_kpc = radii_center * length_to_kpc
-    radii_minpot_kpc = radii_minpot * length_to_kpc
-    vel_rel = vel_all - vel_center
-    vel_kms = vel_rel * _unit_factor(sim, vel_unit, "km/s")
-    mass_msun = mass_all * mass_to_msun
+def _apply_bh_property_pass(context, state: Dict[str, object]) -> None:
+    from astropy import constants as const
+
+    sim = context.sim
+    dm = context.dm
+    if context.bh_local.size == 0:
+        return
+    bhmdot_arr = _raw_array(dm.bhmdot[context.bh_local], dtype=np.float64) if hasattr(dm, "bhmdot") else np.empty(0, dtype=np.float64)
+    bhmass_arr = _raw_array(dm.bhmass[context.bh_local], dtype=np.float64) if hasattr(dm, "bhmass") else _raw_array(dm.mass[context.bh_global], dtype=np.float64)
+    if bhmass_arr.size > 0:
+        imax = int(np.argmax(bhmass_arr))
+        bhmdot = float(bhmdot_arr[imax]) if bhmdot_arr.size > imax else 0.0
+        state["bhmdot"] = _quantity(sim, bhmdot, "Msun/yr")
+        FRAD = 0.1
+        edd_factor = (4 * np.pi * const.G * const.m_p / (FRAD * const.c * const.sigma_T)).to("1/yr").value
+        state["bh_fedd"] = _quantity(sim, bhmdot / (edd_factor * max(float(bhmass_arr[imax]), 1.0e-30)), "")
+    else:
+        state["bhmdot"] = _quantity(sim, 0.0, "Msun/yr")
+        state["bh_fedd"] = _quantity(sim, 0.0, "")
+
+
+def _apply_rotation_and_virial_pass(context, state: Dict[str, object], masses: Dict[str, object], radii: Dict[str, object], velocity_dispersions: Dict[str, object], temperatures: Dict[str, object], rotation: Dict[str, object], virial_quantities: Dict[str, object]) -> None:
+    sim = context.sim
+    if context.rel_pos_center.size == 0 or context.mass_all.size == 0:
+        radii["r200"] = _quantity(sim, 0.0, context.len_unit)
+        temperatures["virial"] = _quantity(sim, 0.0, "K").to(sim.units["temperature"])
+        virial_quantities["r200"] = radii["r200"]
+        virial_quantities["r200c"] = radii.get("r200c", _quantity(sim, 0.0, context.len_unit))
+        virial_quantities["r500c"] = radii.get("r500c", _quantity(sim, 0.0, context.len_unit))
+        virial_quantities["r2500c"] = radii.get("r2500c", _quantity(sim, 0.0, context.len_unit))
+        virial_quantities["circular_velocity"] = _quantity(sim, 0.0, "km/s").to(sim.units["velocity"])
+        virial_quantities["temperature"] = temperatures["virial"]
+        virial_quantities["spin_param"] = _quantity(sim, 0.0, "")
+        return
+
+    length_to_kpc = _unit_factor(sim, context.len_unit, "kpc")
+    mass_to_msun = _unit_factor(sim, context.mass_unit, "Msun")
+    pos_rel_kpc = context.rel_pos_center * length_to_kpc
+    radii_minpot_kpc = context.radii_minpot * length_to_kpc
+    vel_rel = context.vel_all - context.vel_center
+    vel_kms = vel_rel * _unit_factor(sim, context.vel_unit, "km/s")
+    mass_msun = context.mass_all * mass_to_msun
 
     if pos_rel_kpc.size > 0 and mass_msun.size > 0:
         momentum = mass_msun[:, None] * vel_kms
@@ -1388,12 +1561,12 @@ def _compute_single_group_properties_selfcontained(sim, group, group_type: str) 
                 state["max_vr"] = _quantity_from_key(sim, float(np.max(vr)), "velocity")
                 l_part = np.cross(pos_rel_kpc, momentum)
                 ldot = np.einsum("ij,j->i", l_part, Lvec)
-                state["BoverT"] = _quantity(sim, float(2.0 * np.sum(mass_msun[ldot < 0.0]) / max(total_mass * mass_to_msun, 1.0e-30)), "")
+                state["BoverT"] = _quantity(sim, float(2.0 * np.sum(mass_msun[ldot < 0.0]) / max(context.total_mass * mass_to_msun, 1.0e-30)), "")
                 krot = 0.5 * (ldot[valid] / np.maximum(rxy[valid], 1.0e-30)) ** 2 / np.maximum(mass_msun[valid], 1.0e-30)
                 ktot = 0.5 * np.sum(vel_kms[valid] ** 2, axis=1) * mass_msun[valid]
                 rotation["kappa_rot_total"] = _quantity(sim, float(np.sum(krot) / max(np.sum(ktot), 1.0e-30)), "")
 
-    if radii_minpot_kpc.size > 0 and total_mass > 0.0:
+    if radii_minpot_kpc.size > 0 and context.total_mass > 0.0:
         order = np.argsort(radii_minpot_kpc)
         r_sorted = radii_minpot_kpc[order]
         m_sorted = np.cumsum(mass_msun[order])
@@ -1414,11 +1587,11 @@ def _compute_single_group_properties_selfcontained(sim, group, group_type: str) 
                 else:
                     rkpc = 0.0
                     mmsun = 0.0
-                    radii[f"r{factor}c"] = _quantity(sim, sim.yt_dataset.quan(rkpc, "kpc").to(len_unit).value, len_unit)
-                    masses[f"m{factor}c"] = _quantity(sim, sim.yt_dataset.quan(mmsun, "Msun").to(mass_unit).value, mass_unit)
+                radii[f"r{factor}c"] = _quantity(sim, sim.yt_dataset.quan(rkpc, "kpc").to(context.len_unit).value, context.len_unit)
+                masses[f"m{factor}c"] = _quantity(sim, sim.yt_dataset.quan(mmsun, "Msun").to(context.mass_unit).value, context.mass_unit)
 
     try:
-        total_mass_q = _quantity(sim, total_mass, mass_unit).to("Msun")
+        total_mass_q = _quantity(sim, context.total_mass, context.mass_unit).to("Msun")
         Om_z = float(getattr(sim.simulation, "Om_z", 0.0))
         if Om_z > 0.0:
             r200 = (sim.simulation.G.to("kpc**3/(Msun*s**2)") * total_mass_q / (100.0 * Om_z * sim.simulation.H_z.to("1/s") ** 2)) ** (1.0 / 3.0)
@@ -1432,43 +1605,67 @@ def _compute_single_group_properties_selfcontained(sim, group, group_type: str) 
         r200 = _quantity(sim, 0.0, "kpc")
         vc = _quantity(sim, 0.0, "km/s")
         vT = _quantity(sim, 0.0, "K")
-    radii["r200"] = r200.to(len_unit)
+        total_mass_q = _quantity(sim, 0.0, "Msun")
+    radii["r200"] = r200.to(context.len_unit)
     temperatures["virial"] = vT.to(sim.units["temperature"])
-    virial_quantities["r200"] = r200.to(len_unit)
-    virial_quantities["r200c"] = radii.get("r200c", _quantity(sim, 0.0, len_unit))
-    virial_quantities["r500c"] = radii.get("r500c", _quantity(sim, 0.0, len_unit))
-    virial_quantities["r2500c"] = radii.get("r2500c", _quantity(sim, 0.0, len_unit))
+    virial_quantities["r200"] = r200.to(context.len_unit)
+    virial_quantities["r200c"] = radii.get("r200c", _quantity(sim, 0.0, context.len_unit))
+    virial_quantities["r500c"] = radii.get("r500c", _quantity(sim, 0.0, context.len_unit))
+    virial_quantities["r2500c"] = radii.get("r2500c", _quantity(sim, 0.0, context.len_unit))
     virial_quantities["circular_velocity"] = vc.to(sim.units["velocity"])
     virial_quantities["temperature"] = temperatures["virial"]
-    if "angular_momentum_vector" in state and float(getattr(r200.to("km"), "value", r200.to("km").d)) > 0.0 and total_mass > 0.0 and float(getattr(vc.to("km/s"), "value", vc.to("km/s").d)) > 0.0:
+    if "angular_momentum_vector" in state and float(getattr(r200.to("km"), "value", r200.to("km").d)) > 0.0 and context.total_mass > 0.0 and float(getattr(vc.to("km/s"), "value", vc.to("km/s").d)) > 0.0:
         Lmag = np.linalg.norm(_raw_array(state["angular_momentum_vector"].to("Msun*km**2/s")))
         spin = Lmag / (np.sqrt(2.0) * float(total_mass_q.value) * float(vc.to("km/s").value) * float(r200.to("km").value))
     else:
         spin = 0.0
     virial_quantities["spin_param"] = _quantity(sim, spin, "")
 
-    if group_type == "galaxy":
-        aperture = float(sim._kwargs.get("aperture", 30.0))
-        masses_30, sigmas_30 = _group_aperture_properties(sim, group, aperture, gal_pos_raw=pos_center)
-        masses.update(masses_30)
-        velocity_dispersions.update(sigmas_30)
-        if "half_stellar_radius_property" in sim._kwargs:
-            stellar_half = _raw_scalar(radii.get("stellar_half_mass", _quantity(sim, 0.0, len_unit)))
-            masses_hmr, sigmas_hmr = _group_aperture_properties(sim, group, stellar_half, gal_pos_raw=pos_center)
-            renamed_masses = {}
-            renamed_sigmas = {}
-            for key, value in masses_hmr.items():
-                if key.endswith("kpc"):
-                    renamed_masses[key[:-3] + "stellar_half_mass_radius"] = value
-                else:
-                    renamed_masses[key] = value
-            for key, value in sigmas_hmr.items():
-                if key.endswith("kpc"):
-                    renamed_sigmas[key[:-3] + "stellar_half_mass_radius"] = value
-                else:
-                    renamed_sigmas[key] = value
-            masses.update(renamed_masses)
-            velocity_dispersions.update(renamed_sigmas)
+
+def _apply_galaxy_aperture_pass(context, masses: Dict[str, object], radii: Dict[str, object], velocity_dispersions: Dict[str, object]) -> None:
+    sim = context.sim
+    if context.group_type != "galaxy":
+        return
+    aperture = float(sim._kwargs.get("aperture", 30.0))
+    masses_30, sigmas_30 = _group_aperture_properties(sim, context.group, aperture, gal_pos_raw=context.pos_center)
+    masses.update(masses_30)
+    velocity_dispersions.update(sigmas_30)
+    if "half_stellar_radius_property" in sim._kwargs:
+        stellar_half = _raw_scalar(radii.get("stellar_half_mass", _quantity(sim, 0.0, context.len_unit)))
+        masses_hmr, sigmas_hmr = _group_aperture_properties(sim, context.group, stellar_half, gal_pos_raw=context.pos_center)
+        renamed_masses = {}
+        renamed_sigmas = {}
+        for key, value in masses_hmr.items():
+            if key.endswith("kpc"):
+                renamed_masses[key[:-3] + "stellar_half_mass_radius"] = value
+            else:
+                renamed_masses[key] = value
+        for key, value in sigmas_hmr.items():
+            if key.endswith("kpc"):
+                renamed_sigmas[key[:-3] + "stellar_half_mass_radius"] = value
+            else:
+                renamed_sigmas[key] = value
+        masses.update(renamed_masses)
+        velocity_dispersions.update(renamed_sigmas)
+
+
+def _compute_single_group_properties_selfcontained(sim, group, group_type: str) -> Dict[str, object]:
+    context = _build_group_property_context(sim, group, group_type)
+    state: Dict[str, object] = {}
+    masses: Dict[str, object] = {}
+    radii: Dict[str, object] = {}
+    velocity_dispersions: Dict[str, object] = {}
+    metallicities: Dict[str, object] = {}
+    temperatures: Dict[str, object] = {}
+    rotation: Dict[str, object] = {}
+    virial_quantities: Dict[str, object] = {}
+
+    _apply_common_property_pass(context, state, masses, radii, velocity_dispersions)
+    _apply_gas_property_pass(context, state, masses, metallicities, temperatures)
+    _apply_star_property_pass(context, state, metallicities)
+    _apply_bh_property_pass(context, state)
+    _apply_rotation_and_virial_pass(context, state, masses, radii, velocity_dispersions, temperatures, rotation, virial_quantities)
+    _apply_galaxy_aperture_pass(context, masses, radii, velocity_dispersions)
 
     state["masses"] = masses
     state["radii"] = radii
@@ -1500,6 +1697,9 @@ def _compute_group_properties_subset(sim, *, group_type: str, groups: Sequence) 
             state = _compute_single_group_properties_selfcontained(sim, group, group_type)
             for key, value in state.items():
                 setattr(group, key, value)
+
+    if str(group_type) == "galaxy":
+        _apply_host_local_hydrogen_assignment(sim, groups)
 
 
 def _resolve_node_membership(
@@ -2653,6 +2853,7 @@ def _build_direct_stage3_runtime(
     galaxy_payloads: Sequence[Dict[str, np.ndarray | int]],
     nproc: int,
     kwargs: Optional[Dict[str, object]] = None,
+    host_filter_ids: Optional[Set[int]] = None,
 ):
     import os
     from types import SimpleNamespace
@@ -2787,9 +2988,14 @@ def _build_direct_stage3_runtime(
     # instead of materializing them all in RAM on rank 0.
     setattr(sim, "_ahf_subhalo_streaming_save", True)
 
+    host_filter = None if host_filter_ids is None else {int(v) for v in host_filter_ids}
+
     def _keep_halo(node_index: int, required_host_ids: set[int]) -> bool:
         halo_id = int(state.nodes.halo_id[node_index])
         parent_id = int(state.nodes.parent_halo_id[node_index])
+        top_id = int(state.nodes.top_halo_id[node_index])
+        if host_filter is not None and int(top_id) not in host_filter:
+            return False
         dm_count = int(state.nodes.dm_count[node_index])
         min_dm = int(MINIMUM_DM_PER_TOPLEVEL_AHF_HALO) if parent_id <= 0 else int(MINIMUM_DM_PER_AHF_SUBHALO)
         return dm_count >= min_dm or halo_id in required_host_ids
