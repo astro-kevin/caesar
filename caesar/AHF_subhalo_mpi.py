@@ -6,6 +6,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed
 import gc
 import os
 import pickle
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -2040,6 +2041,22 @@ def _load_calculating_properties_manifest(shard_root: Path) -> Dict[str, object]
     return payload
 
 
+def _cleanup_intermediate_shards(*, shard_root: Path, log_fn=None) -> None:
+    root = Path(shard_root)
+    if not root.exists():
+        return
+    if log_fn is not None:
+        log_fn(f"cleanup: removing intermediate files from {root}")
+    try:
+        shutil.rmtree(root)
+    except Exception as exc:
+        if log_fn is not None:
+            log_fn(f"cleanup: warning; failed to remove intermediate files from {root}: {exc}")
+        return
+    if log_fn is not None:
+        log_fn("cleanup: complete")
+
+
 def run_mpi(
     *,
     snapshot_file: str,
@@ -2050,6 +2067,7 @@ def run_mpi(
     min_stars: Optional[int] = None,
     shard_dir: Optional[str] = None,
     phase: str = "finding_galaxies",
+    cleanup: bool = True,
 ) -> None:
     if MPI is None:
         raise RuntimeError("mpi4py is required for AHF-subhalo MPI execution")
@@ -2392,6 +2410,8 @@ def run_mpi(
                     property_results=property_results,
                     output_file=output_file,
                 )
+                if bool(cleanup):
+                    _cleanup_intermediate_shards(shard_root=shard_root, log_fn=_rank0_log)
                 return
 
             _stop_workers(comm, worker_caps=worker_caps)
@@ -2619,6 +2639,8 @@ def run_mpi(
             property_results=property_results,
             output_file=str(manifest.get("output_file", output_file)),
         )
+        if bool(cleanup):
+            _cleanup_intermediate_shards(shard_root=shard_root, log_fn=_rank0_log)
         return
 
     cap = _worker_capability(
@@ -2667,6 +2689,19 @@ def main():
     parser.add_argument("--nproc", type=int, default=1, help="Per-rank CAESAR nproc/thread budget")
     parser.add_argument("--min-stars", type=int, default=None, help="Minimum stars per galaxy")
     parser.add_argument("--shard-dir", type=str, default=None, help="Directory for intermediate shard files")
+    parser.add_argument(
+        "--cleanup",
+        dest="cleanup",
+        action="store_true",
+        default=True,
+        help="Delete intermediate shard files after a successful final export (default)",
+    )
+    parser.add_argument(
+        "--no-cleanup",
+        dest="cleanup",
+        action="store_false",
+        help="Keep intermediate shard files after a successful final export",
+    )
     args = parser.parse_args()
 
     run_mpi(
@@ -2678,6 +2713,7 @@ def main():
         min_stars=args.min_stars,
         shard_dir=args.shard_dir,
         phase=str(args.phase),
+        cleanup=bool(args.cleanup),
     )
 
 
