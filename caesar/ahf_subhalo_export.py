@@ -263,7 +263,7 @@ def _stream_reverse_map_dataset(
                 continue
             arr[idx] = int(gid)
         arr.flush()
-        hd.create_dataset(dataset_name, data=arr, compression=1)
+        hd.create_dataset(dataset_name, data=arr)
         del arr
     finally:
         try:
@@ -735,9 +735,9 @@ def write_catalogue_from_property_shards(
             list_dtype = schema_dtype = halo_schema.list_dtypes.get(name)
             if schema_dtype is None:
                 list_dtype = np.float64 if total_len == 0 else np.int64
-            halo_list_dsets[name] = halo_lists_group.create_dataset(name, shape=(total_len,), dtype=list_dtype, compression=1)
-            halo_group.create_dataset(f"{name}_start", data=halo_starts[name], compression=1)
-            halo_group.create_dataset(f"{name}_end", data=halo_ends[name], compression=1)
+            halo_list_dsets[name] = halo_lists_group.create_dataset(name, shape=(total_len,), dtype=list_dtype)
+            halo_group.create_dataset(f"{name}_start", data=halo_starts[name])
+            halo_group.create_dataset(f"{name}_end", data=halo_ends[name])
 
         galaxy_list_dsets = {}
         for name in galaxy_list_names:
@@ -745,14 +745,14 @@ def write_catalogue_from_property_shards(
             list_dtype = schema_dtype = galaxy_schema.list_dtypes.get(name)
             if schema_dtype is None:
                 list_dtype = np.float64 if total_len == 0 else np.int64
-            galaxy_list_dsets[name] = galaxy_lists_group.create_dataset(name, shape=(total_len,), dtype=list_dtype, compression=1)
-            galaxy_group.create_dataset(f"{name}_start", data=galaxy_starts[name], compression=1)
-            galaxy_group.create_dataset(f"{name}_end", data=galaxy_ends[name], compression=1)
+            galaxy_list_dsets[name] = galaxy_lists_group.create_dataset(name, shape=(total_len,), dtype=list_dtype)
+            galaxy_group.create_dataset(f"{name}_start", data=galaxy_starts[name])
+            galaxy_group.create_dataset(f"{name}_end", data=galaxy_ends[name])
 
         halo_attr_dsets = {}
         for name, spec in halo_schema.attr_specs.items():
             shape = (nhalos,) + spec.shape
-            ds = halo_group.create_dataset(name, shape=shape, dtype=spec.dtype, compression=1)
+            ds = halo_group.create_dataset(name, shape=shape, dtype=spec.dtype)
             if spec.unit is not None:
                 ds.attrs.create("unit", str(spec.unit).encode("utf8"))
             halo_attr_dsets[name] = ds
@@ -760,7 +760,7 @@ def write_catalogue_from_property_shards(
         galaxy_attr_dsets = {}
         for name, spec in galaxy_schema.attr_specs.items():
             shape = (ngalaxies,) + spec.shape
-            ds = galaxy_group.create_dataset(name, shape=shape, dtype=spec.dtype, compression=1)
+            ds = galaxy_group.create_dataset(name, shape=shape, dtype=spec.dtype)
             if spec.unit is not None:
                 ds.attrs.create("unit", str(spec.unit).encode("utf8"))
             galaxy_attr_dsets[name] = ds
@@ -770,7 +770,7 @@ def write_catalogue_from_property_shards(
             halo_dict_dsets[dict_name] = {}
             for subkey, spec in submap.items():
                 shape = (nhalos,) + spec.shape
-                ds = halo_dicts_group.create_dataset(f"{dict_name}.{subkey}", shape=shape, dtype=spec.dtype, compression=1)
+                ds = halo_dicts_group.create_dataset(f"{dict_name}.{subkey}", shape=shape, dtype=spec.dtype)
                 if spec.unit is not None:
                     ds.attrs.create("unit", str(spec.unit).encode("utf8"))
                 halo_dict_dsets[dict_name][subkey] = ds
@@ -780,7 +780,7 @@ def write_catalogue_from_property_shards(
             galaxy_dict_dsets[dict_name] = {}
             for subkey, spec in submap.items():
                 shape = (ngalaxies,) + spec.shape
-                ds = galaxy_dicts_group.create_dataset(f"{dict_name}.{subkey}", shape=shape, dtype=spec.dtype, compression=1)
+                ds = galaxy_dicts_group.create_dataset(f"{dict_name}.{subkey}", shape=shape, dtype=spec.dtype)
                 if spec.unit is not None:
                     ds.attrs.create("unit", str(spec.unit).encode("utf8"))
                 galaxy_dict_dsets[dict_name][subkey] = ds
@@ -1051,7 +1051,7 @@ def write_catalogue_from_property_shards(
                 else:
                     log_fn(f"{stage_label}: streaming global_lists/{name}")
             if int(size) > 0:
-                global_group.create_dataset(name, data=reverse_arrays[name], compression=1)
+                global_group.create_dataset(name, data=reverse_arrays[name])
 
     if log_fn is not None:
         log_fn(f"{stage_label}: saved catalogue to {output_file}")

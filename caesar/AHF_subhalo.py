@@ -638,6 +638,11 @@ def _build_stage3_property_payload(sim, halos: Sequence) -> Dict[str, object]:
         except Exception:
             return np.asarray(default, dtype=np.float64)
 
+    def _preserve_calculating_properties_global_lists(rec: Dict[str, object]) -> None:
+        for name in ("glist", "slist", "dmlist", "bhlist", "dlist"):
+            if name in rec:
+                rec[f"global_{name}"] = np.asarray(rec[name], dtype=np.int64)
+
     galaxy_list = []
     seen_galaxy_index = set()
     galaxy_index_map: Dict[int, int] = {}
@@ -721,6 +726,7 @@ def _build_stage3_property_payload(sim, halos: Sequence) -> Dict[str, object]:
     halo_payloads = []
     for halo in halos:
         rec = _serialize_stage3_group_input(halo, galaxy_index_map=galaxy_index_map)
+        _preserve_calculating_properties_global_lists(rec)
         rec["global_indexes"] = _remap_index_array(rec["global_indexes"], global_map, dtype=np.int64)
         rec["glist"] = _remap_index_array(rec["glist"], gas_map, dtype=np.int64)
         rec["slist"] = _remap_index_array(rec["slist"], star_map, dtype=np.int64)
@@ -732,6 +738,7 @@ def _build_stage3_property_payload(sim, halos: Sequence) -> Dict[str, object]:
     galaxy_payloads = []
     for gal in galaxy_list:
         rec = _serialize_stage3_group_input(gal)
+        _preserve_calculating_properties_global_lists(rec)
         rec["global_indexes"] = _remap_index_array(rec["global_indexes"], global_map, dtype=np.int64)
         rec["glist"] = _remap_index_array(rec["glist"], gas_map, dtype=np.int64)
         rec["slist"] = _remap_index_array(rec["slist"], star_map, dtype=np.int64)

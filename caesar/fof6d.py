@@ -506,10 +506,10 @@ class fof6d:
         if haloid_file is not None:
             memlog('Writing 3D FOF Halo IDs to %s' % haloid_file)
             with h5py.File(haloid_file,'w') as hf:
-                hf.create_dataset('all_haloids',data=haloid, compression=1)
+                hf.create_dataset('all_haloids',data=haloid)
                 for p in self.obj.data_manager.ptypes:  # write haloid arrays for each ptype
                     haloid_out = self.haloid[p]
-                    hf.create_dataset('haloids_%s'%p,data=haloid_out, compression=1)
+                    hf.create_dataset('haloids_%s'%p,data=haloid_out)
                 hf.close()
 
     def plist_init(self,parent=None):
@@ -969,8 +969,8 @@ class fof6d:
         all_tags = self.tags_fof6d
         group_parents = self.group_parents
         with h5py.File(fof6d_file,'w') as hf:  # overwrites existing fof6d group file
-            hf.create_dataset('fof6d_tags',data=all_tags, compression=1)
-            hf.create_dataset('group_parents',data=group_parents, compression=1)
+            hf.create_dataset('fof6d_tags',data=all_tags)
+            hf.create_dataset('group_parents',data=group_parents)
             hf.close()
 
     '''

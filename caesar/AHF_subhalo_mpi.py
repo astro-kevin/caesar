@@ -1365,45 +1365,117 @@ def _stage3_galaxy_cost(galaxy) -> int:
         return 1
 
 
-def _build_stage3_batches(sim, worker_count: int) -> List[List]:
+def _collect_calculating_properties_host_records(sim) -> List[Dict[str, object]]:
     halos = list(getattr(sim, "halo_list", []))
     if not halos:
         return []
 
-    host_records: List[Tuple[int, int, List[object]]] = []
     halos_by_top: Dict[int, List[object]] = {}
     for halo in halos:
         top_id = int(getattr(halo, "AHF_top_haloID", getattr(halo, "AHF_haloID", -1)))
         halos_by_top.setdefault(top_id, []).append(halo)
 
-    for top_id, host_halos in halos_by_top.items():
-        host_cost = int(sum(_stage3_halo_cost(halo) for halo in host_halos))
-        top_halo = next(
-            (
-                halo for halo in host_halos
-                if int(getattr(halo, "AHF_haloID", -1)) == int(top_id)
-            ),
-            host_halos[0],
-        )
-        for gi in np.asarray(getattr(top_halo, "galaxy_index_list", []), dtype=np.int64).tolist():
-            if 0 <= int(gi) < len(getattr(sim, "galaxy_list", [])):
-                host_cost += int(_stage3_galaxy_cost(sim.galaxy_list[int(gi)]))
-        host_records.append((int(host_cost), int(top_id), list(host_halos)))
+    halo_overhead = max(0, _env_int("CAESAR_AHF_SUBHALO_CALCULATING_PROPERTIES_HALO_OVERHEAD", 128))
+    galaxy_overhead = max(0, _env_int("CAESAR_AHF_SUBHALO_CALCULATING_PROPERTIES_GALAXY_OVERHEAD", 128))
 
-    host_records.sort(key=lambda rec: (int(rec[0]), int(rec[1])), reverse=True)
-    return [halos_for_host for _cost, _top_id, halos_for_host in host_records]
+    host_records: List[Dict[str, object]] = []
+    for top_id, host_halos in halos_by_top.items():
+        ordered_halos = sorted(
+            host_halos,
+            key=lambda halo: (
+                int(getattr(halo, "AHF_depth", 0)),
+                int(getattr(halo, "AHF_haloID", -1)),
+            ),
+        )
+        galaxy_ids: List[int] = []
+        seen_galaxy_ids = set()
+        for halo in ordered_halos:
+            for gi in np.asarray(getattr(halo, "galaxy_index_list", []), dtype=np.int64).tolist():
+                gi_int = int(gi)
+                if gi_int in seen_galaxy_ids:
+                    continue
+                if 0 <= gi_int < len(getattr(sim, "galaxy_list", [])):
+                    seen_galaxy_ids.add(gi_int)
+                    galaxy_ids.append(gi_int)
+
+        particle_cost = int(sum(_stage3_halo_cost(halo) for halo in ordered_halos))
+        particle_cost += int(sum(_stage3_galaxy_cost(sim.galaxy_list[gi]) for gi in galaxy_ids))
+        structure_cost = int(len(ordered_halos)) * int(halo_overhead)
+        structure_cost += int(len(galaxy_ids)) * int(galaxy_overhead)
+
+        host_records.append(
+            {
+                "top_id": int(top_id),
+                "halos": ordered_halos,
+                "halo_count": int(len(ordered_halos)),
+                "galaxy_count": int(len(galaxy_ids)),
+                "particle_cost": int(particle_cost),
+                "structure_cost": int(structure_cost),
+                "cost": int(particle_cost + structure_cost),
+            }
+        )
+
+    host_records.sort(
+        key=lambda rec: (
+            int(rec["cost"]),
+            int(rec["halo_count"]),
+            int(rec["galaxy_count"]),
+            int(rec["top_id"]),
+        ),
+        reverse=True,
+    )
+    return host_records
+
+
+def _build_stage3_batches(sim, worker_count: int) -> List[List]:
+    host_records = _collect_calculating_properties_host_records(sim)
+    if not host_records:
+        return []
+
+    multiplier = max(1, _env_int("CAESAR_AHF_SUBHALO_CALCULATING_PROPERTIES_BATCH_MULTIPLIER", 4))
+    target_batches = max(int(worker_count), int(worker_count) * int(multiplier))
+    target_batches = max(1, min(len(host_records), int(target_batches)))
+
+    bins = [
+        {
+            "cost": 0,
+            "hosts": [],
+            "halos": [],
+        }
+        for _ in range(target_batches)
+    ]
+
+    for rec in host_records:
+        slot = min(
+            bins,
+            key=lambda bucket: (
+                int(bucket["cost"]),
+                len(bucket["hosts"]),
+            ),
+        )
+        slot["hosts"].append(int(rec["top_id"]))
+        slot["halos"].extend(list(rec["halos"]))
+        slot["cost"] += int(rec["cost"])
+
+    return [list(bucket["halos"]) for bucket in bins if bucket["halos"]]
 
 
 def _stage3_state_list_data(state: Dict, name: str):
+    private = f"_{name}"
+    if private in state:
+        return state[private]
     if name in state:
         return state[name]
-    return state.get(f"_{name}", [])
+    return []
 
 
 def _stage3_pop_list_data(state: Dict, name: str) -> np.ndarray:
+    private = f"_{name}"
+    if private in state:
+        return np.asarray(state.pop(private))
     if name in state:
         return np.asarray(state.pop(name))
-    return np.asarray(state.pop(f"_{name}", []))
+    return np.asarray([], dtype=np.int64)
 
 
 def _build_property_list_blocks(states: Sequence[Dict], list_names: Sequence[str]) -> Dict[str, Dict[str, object]]:
@@ -1541,59 +1613,50 @@ def _worker_run_calculating_properties(
     nproc: int,
 ) -> Dict:
     nproc = int(item.get("nproc", nproc))
-    if "payload_path" in item:
-        payload = _load_pickle(Path(item["payload_path"]))
-        sim = _build_stage3_property_runtime(payload, nproc=int(nproc))
-    else:
-        root_id = int(item["root_id"])
-        payload = _load_pickle(Path(item["reconciled_shard_path"]))
-        galaxy_payloads = (
-            candidate_records_from_table_payload(payload)
-            if isinstance(payload, dict) and "ahf_halo_id" in payload
-            else list(payload)
-        )
-        direct_state = _worker_property_direct_state(
-            str(item["snapshot_file"]),
-            str(item["ahf_particles_file"]),
-        )
-        sim = _build_direct_stage3_runtime(
-            direct_state,
-            galaxy_payloads=galaxy_payloads,
-            nproc=int(nproc),
-            host_filter_ids={int(root_id)},
-        )
-        halo_offset = int(item.get("halo_id_offset", 0))
-        galaxy_offset = int(item.get("galaxy_id_offset", 0))
-        for idx, halo in enumerate(sim.halo_list):
-            halo._merge_id = int(halo_offset + idx)
-        for idx, gal in enumerate(sim.galaxy_list):
-            gal._merge_id = int(galaxy_offset + idx)
-        expected_halos = int(item.get("expected_halos", len(sim.halo_list)))
-        expected_galaxies = int(item.get("expected_galaxies", len(sim.galaxy_list)))
-        if int(len(sim.halo_list)) != int(expected_halos):
-            raise RuntimeError(
-                f"Host {root_id} halo count mismatch during property repack: "
-                f"expected {expected_halos}, got {len(sim.halo_list)}"
-            )
-        if int(len(sim.galaxy_list)) != int(expected_galaxies):
-            raise RuntimeError(
-                f"Host {root_id} galaxy count mismatch during property repack: "
-                f"expected {expected_galaxies}, got {len(sim.galaxy_list)}"
-            )
+    if "payload_path" not in item:
+        raise RuntimeError("Calculating properties worker requires a materialized payload")
+    payload = _load_pickle(Path(item["payload_path"]))
+    sim = _build_stage3_property_runtime(payload, nproc=int(nproc))
 
     _compute_group_properties_subset(sim, group_type="halo", groups=list(sim.halo_list))
     _compute_group_properties_subset(sim, group_type="galaxy", groups=list(sim.galaxy_list))
 
     halo_states = [_serialize_group_state(group, id_key="_merge_id") for group in sim.halo_list]
     galaxy_states = [_serialize_group_state(group, id_key="_merge_id") for group in sim.galaxy_list]
+    halo_payload_by_id = {
+        int(rec["_merge_id"]): rec
+        for rec in payload.get("halos", [])
+        if "_merge_id" in rec
+    }
+    galaxy_payload_by_id = {
+        int(rec["_merge_id"]): rec
+        for rec in payload.get("galaxies", [])
+        if "_merge_id" in rec
+    }
+    for state in halo_states:
+        rec = halo_payload_by_id.get(int(state["id"]))
+        if rec is None:
+            continue
+        for name in ("glist", "slist", "dmlist", "bhlist", "dlist"):
+            global_name = f"global_{name}"
+            if global_name in rec:
+                state[f"_{name}"] = np.asarray(rec[global_name], dtype=np.int64)
+    for state in galaxy_states:
+        rec = galaxy_payload_by_id.get(int(state["id"]))
+        if rec is None:
+            continue
+        for name in ("glist", "slist", "dmlist", "bhlist", "dlist"):
+            global_name = f"global_{name}"
+            if global_name in rec:
+                state[f"_{name}"] = np.asarray(rec[global_name], dtype=np.int64)
     summary = _build_property_shard_summary(halo_states, galaxy_states)
     halo_list_blocks = _build_property_list_blocks(halo_states, ("dmlist", "glist", "slist", "bhlist", "dlist"))
     galaxy_list_blocks = _build_property_list_blocks(
         galaxy_states,
         ("glist", "slist", "bhlist", "dlist", "cloud_index_list", "AHF_ancestor_haloIDs"),
     )
-    shard_source = str(item.get("payload_path", item.get("reconciled_shard_path", item.get("root_id", ""))))
-    shard_path = shard_dir / f"stage3_rank{os.getpid()}_{abs(hash(shard_source))}.pkl"
+    shard_source = str(item["payload_path"])
+    shard_path = shard_dir / f"calculating_properties_rank{os.getpid()}_{abs(hash(shard_source))}.pkl"
     _dump_pickle(
         shard_path,
         {
@@ -1604,7 +1667,7 @@ def _worker_run_calculating_properties(
         },
     )
     return {
-        "stage": "stage3",
+        "stage": "calculating_properties",
         "shard_path": str(shard_path),
         "count_halos": int(len(sim.halo_list)),
         "count_galaxies": int(len(sim.galaxy_list)),
@@ -1709,66 +1772,98 @@ def _rank0_calculate_properties_and_write(
     worker_threads: Optional[Dict[int, int]] = None,
 ):
     if isinstance(sim, AHFSubhaloDirectState):
-        snapshot_meta = sim.snapshot
-        _rank0_log("calculating properties: using in-memory direct snapshot metadata")
+        direct_state = sim
+        _rank0_log("calculating properties: reusing in-memory direct shard runtime")
     else:
-        snapshot_meta = load_snapshot_meta(snapshot_file)
-        _rank0_log("calculating properties: loading snapshot metadata")
+        _rank0_log("calculating properties: rebuilding in-memory direct shard runtime")
+        direct_state = build_direct_state(snapshot_file, ahf_particles_file)
 
-    ordered_root_results = sorted(
-        [
-            {
-                "root_id": int(rec["root_id"]),
-                "shard_path": str(rec["shard_path"]),
-                "count": int(rec.get("count", 0)),
-                "cost": int(rec.get("cost", 0)),
-                "halo_count": int(rec.get("halo_count", 0)),
-            }
-            for rec in root_results
-        ],
-        key=lambda rec: (int(rec["cost"]), int(rec["root_id"])),
-        reverse=True,
+    final_galaxies = []
+    for rec in root_results:
+        payload = _load_pickle(Path(str(rec["shard_path"])))
+        records = (
+            candidate_records_from_table_payload(payload)
+            if isinstance(payload, dict) and "ahf_halo_id" in payload
+            else list(payload)
+        )
+        final_galaxies.extend(records)
+
+    sim = _build_direct_stage3_runtime(
+        direct_state,
+        galaxy_payloads=final_galaxies,
+        nproc=int(nproc),
     )
 
-    stage3_cpu_items = []
-    halo_offset = 0
-    galaxy_offset = 0
-    for rec in ordered_root_results:
-        stage3_cpu_items.append(
-            {
-                "root_id": int(rec["root_id"]),
-                "reconciled_shard_path": str(rec["shard_path"]),
-                "snapshot_file": str(snapshot_file),
-                "ahf_particles_file": str(ahf_particles_file),
-                "halo_id_offset": int(halo_offset),
-                "galaxy_id_offset": int(galaxy_offset),
-                "expected_halos": int(rec.get("halo_count", 0)),
-                "expected_galaxies": int(rec.get("count", 0)),
-            }
-        )
-        halo_offset += int(rec.get("halo_count", 0))
-        galaxy_offset += int(rec.get("count", 0))
+    for idx, halo in enumerate(sim.halo_list):
+        halo._merge_id = int(idx)
+    for idx, gal in enumerate(sim.galaxy_list):
+        gal._merge_id = int(idx)
+
+    calculating_properties_items = []
+    host_batches = _build_stage3_batches(sim, len(worker_caps))
 
     _rank0_log(
-        f"calculating properties: prepared property host tasks count={len(stage3_cpu_items)} "
-        f"halos={halo_offset} galaxies={galaxy_offset}"
+        f"calculating properties: prepared property host tasks count={len(host_batches)} "
+        f"halos={len(sim.halo_list)} galaxies={len(sim.galaxy_list)}"
     )
+    prep_start = time.monotonic()
+
+    def _materialize_calculating_properties_payload(spec):
+        ibatch, batch = spec
+        payload_path = shard_root / f"calculating_properties_input_{int(ibatch):05d}.pkl"
+        _dump_pickle(payload_path, _build_stage3_property_payload(sim, batch))
+        return int(ibatch), {"payload_path": str(payload_path)}
+
+    prep_workers = max(
+        1,
+        _env_int(
+            "CAESAR_AHF_SUBHALO_STAGE3_PREP_WORKERS",
+            min(8, max(1, len(host_batches))),
+        ),
+    )
+    if len(host_batches) > 1 and prep_workers > 1:
+        prepared = {}
+        with ThreadPoolExecutor(max_workers=int(prep_workers)) as executor:
+            futures = [
+                executor.submit(_materialize_calculating_properties_payload, (ibatch, batch))
+                for ibatch, batch in enumerate(host_batches)
+            ]
+            for fut in as_completed(futures):
+                ibatch, item = fut.result()
+                prepared[int(ibatch)] = item
+        calculating_properties_items = [prepared[idx] for idx in range(len(host_batches))]
+    else:
+        for ibatch, batch in enumerate(host_batches):
+            _idx, item = _materialize_calculating_properties_payload((ibatch, batch))
+            calculating_properties_items.append(item)
+    _rank0_log(
+        f"calculating properties: payload materialization complete batches={len(calculating_properties_items)} "
+        f"elapsed={time.monotonic() - prep_start:.1f}s workers={prep_workers}"
+    )
+
+    snapshot_meta = direct_state.snapshot
+    total_halos = int(len(sim.halo_list))
+    total_galaxies = int(len(sim.galaxy_list))
+    del final_galaxies
+    del sim
+    del direct_state
+    gc.collect()
 
     stage3_results = _dispatch_stage(
         comm,
         worker_caps=worker_caps,
         regular_queue=[],
-        small_queue=stage3_cpu_items,
+        small_queue=calculating_properties_items,
         stage_name="calculating_properties",
         display_name="calculating properties",
         regular_total=0,
-        small_total=len(stage3_cpu_items),
+        small_total=len(calculating_properties_items),
         worker_threads=worker_threads,
         worker_roles={int(cap.rank): "property_worker" for cap in worker_caps},
         progress_unit="batches",
         progress_metrics=[
-            ProgressMetric("halos", "count_halos", total=int(halo_offset) if halo_offset > 0 else None),
-            ProgressMetric("galaxies", "count_galaxies", total=int(galaxy_offset) if galaxy_offset > 0 else None),
+            ProgressMetric("halos", "count_halos", total=total_halos),
+            ProgressMetric("galaxies", "count_galaxies", total=total_galaxies),
         ],
     )
     _rank0_log("writing: coordinator beginning final export")

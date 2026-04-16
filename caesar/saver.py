@@ -19,7 +19,7 @@ blacklist = [
 ######################################################################
 
 def _write_dataset(key, data, hd):
-    hd.create_dataset(key, data=data, compression=1)
+    hd.create_dataset(key, data=data)
 
 def check_and_write_dataset(obj, key, hd):
     """General function for writing an HDF5 dataset.
@@ -259,7 +259,7 @@ def _stream_group_id_dataset(
                 continue
             arr[idx] = int(getattr(group, "GroupID", -1))
         arr.flush()
-        hd.create_dataset(dataset_name, data=arr, compression=1)
+        hd.create_dataset(dataset_name, data=arr)
         del arr
     finally:
         try:

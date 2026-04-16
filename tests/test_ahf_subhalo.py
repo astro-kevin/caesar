@@ -182,6 +182,102 @@ def test_reconciled_galaxy_shard_payload_uses_table_format():
     assert np.array_equal(restored[0]["slist"], np.asarray([2, 3], dtype=np.int32))
 
 
+def test_calculating_properties_payload_preserves_global_particle_lists():
+    class DummyGroup:
+        pass
+
+    class DummyDataManager:
+        def __init__(self):
+            self.pos = np.asarray([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float32)
+            self.vel = np.zeros((2, 3), dtype=np.float32)
+            self.mass = np.asarray([3.0, 4.0], dtype=np.float32)
+            self.ptype = np.asarray([0, 4], dtype=np.int32)
+            self.pot = np.asarray([-1.0, -2.0], dtype=np.float32)
+            self.glist = np.asarray([0], dtype=np.int64)
+            self.slist = np.asarray([1], dtype=np.int64)
+            self.blackholes = False
+            self.ptypes = ["gas", "star"]
+
+    halo = DummyGroup()
+    halo.AHF_haloID = 10
+    halo.AHF_parent_haloID = 0
+    halo.AHF_top_haloID = 10
+    halo.AHF_depth = 0
+    halo.AHF_ancestor_haloIDs = np.asarray([], dtype=np.int64)
+    halo.global_indexes = np.asarray([0, 1], dtype=np.int64)
+    halo.glist = np.asarray([0], dtype=np.int64)
+    halo.slist = np.asarray([0], dtype=np.int64)
+    halo.dmlist = np.asarray([], dtype=np.int64)
+    halo.bhlist = np.asarray([], dtype=np.int64)
+    halo.dlist = np.asarray([], dtype=np.int64)
+    halo.galaxy_index_list = np.asarray([0], dtype=np.int32)
+    halo._merge_id = 0
+
+    gal = DummyGroup()
+    gal.AHF_haloID = 10
+    gal.AHF_parent_haloID = 0
+    gal.AHF_top_haloID = 10
+    gal.AHF_depth = 0
+    gal.AHF_ancestor_haloIDs = np.asarray([], dtype=np.int64)
+    gal.global_indexes = np.asarray([1], dtype=np.int64)
+    gal.glist = np.asarray([], dtype=np.int64)
+    gal.slist = np.asarray([0], dtype=np.int64)
+    gal.dmlist = np.asarray([], dtype=np.int64)
+    gal.bhlist = np.asarray([], dtype=np.int64)
+    gal.dlist = np.asarray([], dtype=np.int64)
+    gal.parent_halo_index = 0
+    gal._ahf_host_halo_index = 0
+    gal._merge_id = 0
+
+    sim = SimpleNamespace(
+        halo_list=[halo],
+        galaxy_list=[gal],
+        data_manager=DummyDataManager(),
+        units={"mass": "Msun", "length": "kpccm", "velocity": "km/s", "time": "yr", "temperature": "K"},
+        simulation=SimpleNamespace(
+            XH=0.76,
+            redshift=0.0,
+            omega_baryon=0.0,
+            omega_matter=0.3,
+            omega_lambda=0.7,
+            Om_z=0.3,
+            hubble_constant=0.7,
+            boxsize=SimpleNamespace(d=100.0),
+            critical_density=SimpleNamespace(d=1.0),
+            G=SimpleNamespace(d=1.0),
+            H_z=SimpleNamespace(d=1.0),
+            Densities=SimpleNamespace(d=np.asarray([1.0, 2.0, 3.0], dtype=np.float64)),
+            ngas=1,
+            nstar=1,
+            nbh=0,
+            ndust=0,
+            ndm=0,
+            ndm2=0,
+            ndm3=0,
+            ntot=2,
+            baryons_present=True,
+            unbind_halos=False,
+            effective_resolution=1,
+            mean_interparticle_separation=SimpleNamespace(d=1.0),
+        ),
+        _kwargs={},
+        load_pot=True,
+    )
+
+    payload = subhalo_mod._build_stage3_property_payload(sim, [halo])
+    halo_rec = payload["halos"][0]
+    gal_rec = payload["galaxies"][0]
+    assert np.array_equal(halo_rec["global_glist"], np.asarray([0], dtype=np.int64))
+    assert np.array_equal(halo_rec["global_slist"], np.asarray([0], dtype=np.int64))
+    assert np.array_equal(gal_rec["global_slist"], np.asarray([0], dtype=np.int64))
+
+
+def test_calculating_properties_list_blocks_prefer_preserved_global_lists():
+    states = [{"id": 7, "glist": np.asarray([0, 1], dtype=np.int64), "_glist": np.asarray([10, 11], dtype=np.int64)}]
+    blocks = mpi_mod._build_property_list_blocks(states, ("glist",))
+    assert np.array_equal(blocks["glist"]["data"], np.asarray([10, 11], dtype=np.int64))
+
+
 def test_rank0_log_includes_total_and_stage_elapsed(monkeypatch, capsys):
     ticks = iter([100.0, 105.0, 112.0])
     monkeypatch.setattr(mpi_mod.time, "monotonic", lambda: next(ticks))
@@ -821,13 +917,43 @@ def test_stage3_batches_group_complete_top_level_hosts():
     ]
     sim = SimpleNamespace(halo_list=halos, galaxy_list=galaxies)
 
+    batches = mpi_mod._build_stage3_batches(sim, worker_count=1)
+
+    assert len(batches) == 2
+    batch_halo_ids = [{int(getattr(halo, "AHF_haloID", -1)) for halo in batch} for batch in batches]
+    batch_top_ids = [{int(getattr(halo, "AHF_top_haloID", -1)) for halo in batch} for batch in batches]
+    assert {10, 11} in batch_halo_ids
+    assert {20} in batch_halo_ids
+    assert {10} in batch_top_ids
+    assert {20} in batch_top_ids
+
+
+def test_stage3_batches_balance_whole_hosts_by_internal_cost(monkeypatch):
+    monkeypatch.setenv("CAESAR_AHF_SUBHALO_CALCULATING_PROPERTIES_BATCH_MULTIPLIER", "1")
+    monkeypatch.setenv("CAESAR_AHF_SUBHALO_CALCULATING_PROPERTIES_HALO_OVERHEAD", "100")
+    monkeypatch.setenv("CAESAR_AHF_SUBHALO_CALCULATING_PROPERTIES_GALAXY_OVERHEAD", "50")
+
+    halos = [
+        SimpleNamespace(AHF_haloID=10, AHF_top_haloID=10, global_indexes=np.arange(20, dtype=np.int64), galaxy_index_list=np.asarray([0, 1], dtype=np.int32), AHF_depth=0),
+        SimpleNamespace(AHF_haloID=11, AHF_top_haloID=10, global_indexes=np.arange(5, dtype=np.int64), galaxy_index_list=np.asarray([], dtype=np.int32), AHF_depth=1),
+        SimpleNamespace(AHF_haloID=20, AHF_top_haloID=20, global_indexes=np.arange(9, dtype=np.int64), galaxy_index_list=np.asarray([2], dtype=np.int32), AHF_depth=0),
+        SimpleNamespace(AHF_haloID=30, AHF_top_haloID=30, global_indexes=np.arange(8, dtype=np.int64), galaxy_index_list=np.asarray([], dtype=np.int32), AHF_depth=0),
+    ]
+    galaxies = [
+        SimpleNamespace(global_indexes=np.arange(3, dtype=np.int64)),
+        SimpleNamespace(global_indexes=np.arange(4, dtype=np.int64)),
+        SimpleNamespace(global_indexes=np.arange(2, dtype=np.int64)),
+    ]
+    sim = SimpleNamespace(halo_list=halos, galaxy_list=galaxies)
+
     batches = mpi_mod._build_stage3_batches(sim, worker_count=2)
 
     assert len(batches) == 2
-    assert {int(getattr(halo, "AHF_haloID", -1)) for halo in batches[0]} == {10, 11}
-    assert {int(getattr(halo, "AHF_haloID", -1)) for halo in batches[1]} == {20}
-    assert {int(getattr(halo, "AHF_top_haloID", -1)) for halo in batches[0]} == {10}
-    assert {int(getattr(halo, "AHF_top_haloID", -1)) for halo in batches[1]} == {20}
+    batch_halo_ids = [{int(getattr(halo, "AHF_haloID", -1)) for halo in batch} for batch in batches]
+    batch_top_ids = [{int(getattr(halo, "AHF_top_haloID", -1)) for halo in batch} for batch in batches]
+    assert {10, 11} in batch_halo_ids
+    assert {10} in batch_top_ids
+    assert any(top_ids == {20, 30} for top_ids in batch_top_ids)
 
 
 def test_stage1_thread_map_preserves_gpu_support_threads():

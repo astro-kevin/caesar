@@ -838,14 +838,14 @@ def write_progens(obj, data, caesar_file, index_name, redshift):
         tree = f['tree_data']
         
     if data.dtype == np.int32:
-        progens = tree.create_dataset('%s' % (index_name), data=data, compression=1)
+        progens = tree.create_dataset('%s' % (index_name), data=data)
     else:
         try:
             progens = f.create_group('tree_data/%s' % (index_name))
         except:
             progens = f['tree_data/%s' % (index_name)]
         for index, element in enumerate(data):
-            progens.create_dataset("%d"%index, data=np.array(element, dtype=np.int32), compression=1)
+            progens.create_dataset("%d"%index, data=np.array(element, dtype=np.int32))
     tree.attrs[('z_'+index_name).encode('utf8')] = redshift
     f.close()
     return    
