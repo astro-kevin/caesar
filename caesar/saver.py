@@ -12,7 +12,8 @@ blacklist = [
     'unbound_particles', '_units',
     'unit_registry_json',
     'unbound_indexes',
-    'lists','dicts'
+    'lists','dicts',
+    '_ahf_subhalo_streaming_save',
 ]
 
 ######################################################################

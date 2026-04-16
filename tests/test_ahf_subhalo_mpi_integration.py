@@ -224,6 +224,12 @@ def test_run_mpi_pipeline_end_to_end(tmp_path):
     with h5py.File(output, "r") as handle:
         assert int(handle.attrs["nhalos"]) == 2
         assert int(handle.attrs["ngalaxies"]) == 2
+        sim_attrs = handle["simulation_attributes"].attrs
+        assert float(sim_attrs["hubble_constant"]) == 0.5
+        assert int(sim_attrs["effective_resolution"]) > 0
+        assert bool(sim_attrs["baryons_present"])
+        assert not bool(sim_attrs["unbind_halos"])
+        assert "mean_interparticle_separation" in sim_attrs
         assert "halo_data/AHF_haloID" in handle
         assert "galaxy_data/AHF_haloID" in handle
         assert "galaxy_data/caesar_parent_halo_index" in handle

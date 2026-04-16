@@ -12,7 +12,11 @@ from typing import Dict, Iterable, Mapping, Optional, Sequence
 import h5py
 import numpy as np
 
-from caesar.AHF_subhalo import _ShardYTUnitHelper
+from caesar.AHF_subhalo import (
+    _ShardYTUnitHelper,
+    _effective_resolution_from_ndm,
+    _mean_interparticle_separation_from_boxsize,
+)
 from caesar.saver import serialize_global_attribs
 from caesar.simulation_attributes import SimulationAttributes
 
@@ -315,8 +319,9 @@ def _build_save_stub(snapshot_meta, *, nhalos: int, ngalaxies: int):
     obj._ahf_matched = True
     obj._include_dm_in_galaxies = True
     obj.load_pot = True
+    obj.load_haloid = False
+    obj.skip_hash_check = True
     obj.nproc = 1
-    obj._ahf_subhalo_streaming_save = False
 
     sim = SimulationAttributes()
     z = float(snapshot_meta.redshift)
@@ -367,6 +372,14 @@ def _build_save_stub(snapshot_meta, *, nhalos: int, ngalaxies: int):
     sim.ndm2 = int(snapshot_meta.particle_counts.get("dm2", 0))
     sim.ndm3 = int(snapshot_meta.particle_counts.get("dm3", 0))
     sim.ntot = int(sum(int(v) for v in snapshot_meta.particle_counts.values()))
+    sim.hubble_constant = float(snapshot_meta.hubble_constant)
+    sim.baryons_present = bool(sim.ngas > 0 or sim.nstar > 0)
+    sim.unbind_halos = False
+    sim.effective_resolution = int(_effective_resolution_from_ndm(sim.ndm))
+    sim.mean_interparticle_separation = helper.quan(
+        _mean_interparticle_separation_from_boxsize(float(snapshot_meta.boxsize), sim.ndm),
+        snapshot_meta.units["length"],
+    )
     obj.simulation = sim
     return obj
 

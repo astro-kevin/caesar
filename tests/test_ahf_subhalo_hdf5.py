@@ -354,6 +354,15 @@ def test_direct_stage3_runtime_can_compute_and_save(monkeypatch, tmp_path):
     with h5py.File(outfile, "r") as handle:
         assert int(handle.attrs["nhalos"]) == 1
         assert int(handle.attrs["ngalaxies"]) == 1
+        assert bool(handle.attrs["skip_hash_check"])
+        assert not bool(handle.attrs["load_haloid"])
+        assert "_ahf_subhalo_streaming_save" not in handle.attrs
+        sim_attrs = handle["simulation_attributes"].attrs
+        assert float(sim_attrs["hubble_constant"]) == 0.5
+        assert int(sim_attrs["effective_resolution"]) == 1
+        assert bool(sim_attrs["baryons_present"])
+        assert not bool(sim_attrs["unbind_halos"])
+        assert "mean_interparticle_separation" in sim_attrs
         assert np.array_equal(handle["halo_data/AHF_haloID"][:], np.asarray([10], dtype=np.int64))
         assert np.array_equal(handle["galaxy_data/AHF_haloID"][:], np.asarray([10], dtype=np.int64))
         assert np.array_equal(handle["halo_data/caesar_parent_halo_index"][:], np.asarray([-1], dtype=np.int64))

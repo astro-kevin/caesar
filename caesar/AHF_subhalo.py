@@ -138,6 +138,20 @@ def _build_node_dm_counts(membership_arrays: Dict[int, np.ndarray]) -> Dict[int,
     return node_ndm
 
 
+def _effective_resolution_from_ndm(ndm: int) -> int:
+    ndm = int(ndm)
+    if ndm <= 0:
+        return 0
+    return max(1, int(round(float(ndm) ** (1.0 / 3.0))))
+
+
+def _mean_interparticle_separation_from_boxsize(boxsize: float, ndm: int) -> float:
+    effective_resolution = int(_effective_resolution_from_ndm(ndm))
+    if effective_resolution <= 0:
+        return 0.0
+    return float(boxsize) / float(effective_resolution)
+
+
 def _build_tiny_batches(
     tasks: Sequence[AHFSubhaloTask],
     *,
@@ -730,6 +744,7 @@ def _build_stage3_property_payload(sim, halos: Sequence) -> Dict[str, object]:
         galaxy_payloads.append(rec)
 
     boxsize_val = getattr(getattr(sim.simulation, "boxsize", None), "d", getattr(sim.simulation, "boxsize", 0.0))
+    ndm_val = int(getattr(sim.simulation, "ndm", 0))
     simulation_payload = {
         "XH": float(getattr(sim.simulation, "XH", 0.76)),
         "redshift": float(getattr(sim.simulation, "redshift", 0.0)),
@@ -737,6 +752,7 @@ def _build_stage3_property_payload(sim, halos: Sequence) -> Dict[str, object]:
         "omega_matter": float(getattr(sim.simulation, "omega_matter", 0.0)),
         "omega_lambda": float(getattr(sim.simulation, "omega_lambda", 0.0)),
         "Om_z": float(getattr(sim.simulation, "Om_z", getattr(sim.simulation, "omega_matter", 0.0))),
+        "hubble_constant": float(getattr(sim.simulation, "hubble_constant", 0.0)),
         "boxsize": float(boxsize_val),
         "critical_density": _scalar(getattr(sim.simulation, "critical_density", 0.0)),
         "G": _scalar(getattr(sim.simulation, "G", 4.51691362044e-39)),
@@ -749,7 +765,22 @@ def _build_stage3_property_payload(sim, halos: Sequence) -> Dict[str, object]:
         "nstar": int(star_ids.size),
         "nbh": int(bh_ids.size),
         "ndust": int(dust_ids.size),
+        "ndm": ndm_val,
+        "ndm2": int(getattr(sim.simulation, "ndm2", 0)),
+        "ndm3": int(getattr(sim.simulation, "ndm3", 0)),
         "ntot": int(global_ids.size),
+        "baryons_present": bool(getattr(sim.simulation, "baryons_present", gas_ids.size > 0 or star_ids.size > 0)),
+        "unbind_halos": bool(getattr(sim.simulation, "unbind_halos", False)),
+        "effective_resolution": int(
+            getattr(sim.simulation, "effective_resolution", _effective_resolution_from_ndm(ndm_val))
+        ),
+        "mean_interparticle_separation": _scalar(
+            getattr(
+                sim.simulation,
+                "mean_interparticle_separation",
+                _mean_interparticle_separation_from_boxsize(float(boxsize_val), ndm_val),
+            )
+        ),
     }
 
     return {
@@ -773,6 +804,8 @@ def _build_stage3_property_runtime(payload: Dict[str, object], *, nproc: int):
     sim._kwargs = dict(payload.get("kwargs", {}))
     sim.units = dict(payload.get("units", sim.units))
     sim.load_pot = bool(payload.get("load_pot", True))
+    sim.load_haloid = False
+    sim.skip_hash_check = True
     sim.nproc = int(max(1, nproc))
 
     sim_payload = dict(payload.get("simulation", {}))
@@ -783,6 +816,7 @@ def _build_stage3_property_runtime(payload: Dict[str, object], *, nproc: int):
     sim.simulation.omega_matter = float(sim_payload.get("omega_matter", 0.0))
     sim.simulation.omega_lambda = float(sim_payload.get("omega_lambda", 0.0))
     sim.simulation.Om_z = float(sim_payload.get("Om_z", sim.simulation.omega_matter))
+    sim.simulation.hubble_constant = float(sim_payload.get("hubble_constant", 0.0))
     sim.simulation.boxsize = sim.yt_dataset.quan(float(sim_payload.get("boxsize", 0.0)), sim.units["length"])
     sim.simulation.critical_density = sim.yt_dataset.quan(
         float(sim_payload.get("critical_density", 0.0)),
@@ -801,7 +835,29 @@ def _build_stage3_property_runtime(payload: Dict[str, object], *, nproc: int):
     sim.simulation.nstar = int(sim_payload.get("nstar", 0))
     sim.simulation.nbh = int(sim_payload.get("nbh", 0))
     sim.simulation.ndust = int(sim_payload.get("ndust", 0))
+    sim.simulation.ndm = int(sim_payload.get("ndm", 0))
+    sim.simulation.ndm2 = int(sim_payload.get("ndm2", 0))
+    sim.simulation.ndm3 = int(sim_payload.get("ndm3", 0))
     sim.simulation.ntot = int(sim_payload.get("ntot", 0))
+    sim.simulation.baryons_present = bool(
+        sim_payload.get("baryons_present", sim.simulation.ngas > 0 or sim.simulation.nstar > 0)
+    )
+    sim.simulation.unbind_halos = bool(sim_payload.get("unbind_halos", False))
+    sim.simulation.effective_resolution = int(
+        sim_payload.get("effective_resolution", _effective_resolution_from_ndm(sim.simulation.ndm))
+    )
+    sim.simulation.mean_interparticle_separation = sim.yt_dataset.quan(
+        float(
+            sim_payload.get(
+                "mean_interparticle_separation",
+                _mean_interparticle_separation_from_boxsize(
+                    float(getattr(sim.simulation.boxsize, "d", sim.simulation.boxsize)),
+                    sim.simulation.ndm,
+                ),
+            )
+        ),
+        sim.units["length"],
+    )
 
     dm_payload = dict(payload.get("data_manager", {}))
     dm = SimpleNamespace()
@@ -2609,6 +2665,8 @@ def _build_direct_stage3_runtime(
     sim._kwargs = dict(kwargs or {})
     sim.units = dict(state.snapshot.units)
     sim.load_pot = True
+    sim.load_haloid = False
+    sim.skip_hash_check = True
     sim.nproc = int(max(1, nproc))
     sim._ds = _ShardYTUnitHelper(redshift=float(state.snapshot.redshift))
 
@@ -2629,6 +2687,7 @@ def _build_direct_stage3_runtime(
     sim.simulation.omega_matter = om0
     sim.simulation.omega_lambda = ol0
     sim.simulation.omega_baryon = 0.0
+    sim.simulation.hubble_constant = float(state.snapshot.hubble_constant)
     sim.simulation.Om_z = omz
     sim.simulation.E_z = ez
     sim.simulation.fullpath = os.path.dirname(str(state.snapshot.snapshot_file))
@@ -2664,6 +2723,13 @@ def _build_direct_stage3_runtime(
     sim.simulation.ndm2 = int(state.snapshot.particle_counts.get("dm2", 0))
     sim.simulation.ndm3 = int(state.snapshot.particle_counts.get("dm3", 0))
     sim.simulation.ntot = int(sum(int(v) for v in state.snapshot.particle_counts.values()))
+    sim.simulation.baryons_present = bool(sim.simulation.ngas > 0 or sim.simulation.nstar > 0)
+    sim.simulation.unbind_halos = False
+    sim.simulation.effective_resolution = int(_effective_resolution_from_ndm(sim.simulation.ndm))
+    sim.simulation.mean_interparticle_separation = sim.yt_dataset.quan(
+        _mean_interparticle_separation_from_boxsize(float(state.snapshot.boxsize), sim.simulation.ndm),
+        sim.units["length"],
+    )
 
     ordered_ptypes = [
         ptype for ptype in ("gas", "dm", "dm2", "dm3", "star", "bh", "dust")
