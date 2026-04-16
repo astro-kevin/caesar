@@ -129,12 +129,85 @@ def _assert_hdf5_equal(path_a: Path, path_b: Path) -> None:
         _cmp(fa, fb, "")
 
 
-def _stage3_result_with_summary(shard_path: Path, halo_states, galaxy_states):
+def _property_shard_payload_from_states(halo_states, galaxy_states):
+    halo_columns = export_mod.build_group_column_payload(
+        halo_states,
+        list_attrs=("dmlist", "glist", "slist", "bhlist", "dlist"),
+        skip_attrs={
+            "id",
+            "_merge_id",
+            "obj",
+            "halo",
+            "galaxies",
+            "satellite_galaxies",
+            "clouds",
+            "galaxy",
+            "central_galaxy",
+            "galaxy_index_list",
+            "global_indexes",
+            "AHF_ancestor_haloIDs",
+            "glist",
+            "slist",
+            "dmlist",
+            "bhlist",
+            "dlist",
+            "_glist",
+            "_slist",
+            "_dmlist",
+            "_bhlist",
+            "_dlist",
+        },
+    )
+    galaxy_columns = export_mod.build_group_column_payload(
+        galaxy_states,
+        list_attrs=("glist", "slist", "bhlist", "dlist", "cloud_index_list", "AHF_ancestor_haloIDs"),
+        skip_attrs={
+            "id",
+            "_merge_id",
+            "obj",
+            "halo",
+            "galaxies",
+            "satellite_galaxies",
+            "clouds",
+            "galaxy",
+            "central_galaxy",
+            "parent_halo_index",
+            "_ahf_host_halo_index",
+            "glist",
+            "slist",
+            "dmlist",
+            "bhlist",
+            "dlist",
+            "cloud_index_list",
+            "AHF_ancestor_haloIDs",
+            "_glist",
+            "_slist",
+            "_dmlist",
+            "_bhlist",
+            "_dlist",
+        },
+    )
+    return {
+        "halo_columns": halo_columns,
+        "galaxy_columns": galaxy_columns,
+        "halo_lists": mpi_mod._build_property_list_blocks(halo_states, ("dmlist", "glist", "slist", "bhlist", "dlist")),
+        "galaxy_lists": mpi_mod._build_property_list_blocks(
+            galaxy_states,
+            ("glist", "slist", "bhlist", "dlist", "cloud_index_list", "AHF_ancestor_haloIDs"),
+        ),
+    }
+
+
+def _calculating_properties_result_with_summary(shard_path: Path, halo_states, galaxy_states):
+    payload = _property_shard_payload_from_states(halo_states, galaxy_states)
     return {
         "shard_path": str(shard_path),
         "count_halos": int(len(halo_states)),
         "count_galaxies": int(len(galaxy_states)),
-        "summary": mpi_mod._build_property_shard_summary(halo_states, galaxy_states),
+        "summary": mpi_mod._build_property_shard_summary(
+            payload["halo_columns"],
+            payload["galaxy_columns"],
+        ),
     }
 
 
@@ -298,7 +371,7 @@ def test_build_task_payload_uses_direct_particle_tables(monkeypatch, tmp_path):
     assert payload["eligible_vel"].shape == (3, 3)
 
 
-def test_direct_stage3_runtime_can_compute_and_save(monkeypatch, tmp_path):
+def test_direct_calculating_properties_runtime_can_compute_and_save(monkeypatch, tmp_path):
     snapshot = tmp_path / "snap.hdf5"
     _write_test_snapshot(snapshot)
 
@@ -338,7 +411,7 @@ def test_direct_stage3_runtime_can_compute_and_save(monkeypatch, tmp_path):
         }
     ]
 
-    sim = subhalo_mod._build_direct_stage3_runtime(
+    sim = subhalo_mod._build_direct_calculating_properties_runtime(
         state,
         galaxy_payloads=galaxy_payloads,
         nproc=1,
@@ -429,7 +502,7 @@ def test_streaming_export_matches_original_caesar_format(monkeypatch, tmp_path):
         }
     ]
 
-    sim_ref = subhalo_mod._build_direct_stage3_runtime(
+    sim_ref = subhalo_mod._build_direct_calculating_properties_runtime(
         state,
         galaxy_payloads=galaxy_payloads,
         nproc=1,
@@ -443,18 +516,11 @@ def test_streaming_export_matches_original_caesar_format(monkeypatch, tmp_path):
     halo_states = [subhalo_mod._serialize_group_state(group, id_key="_merge_id") for group in sim_ref.halo_list]
     galaxy_states = [subhalo_mod._serialize_group_state(group, id_key="_merge_id") for group in sim_ref.galaxy_list]
 
-    shard_path = tmp_path / "stage3_rank00000.pkl"
+    shard_path = tmp_path / "calculating_properties_rank00000.pkl"
     with shard_path.open("wb") as fh:
-        pickle.dump(
-            {
-                "halos": halo_states,
-                "galaxies": galaxy_states,
-            },
-            fh,
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
+        pickle.dump(_property_shard_payload_from_states(halo_states, galaxy_states), fh, protocol=pickle.HIGHEST_PROTOCOL)
 
-    sim_old = subhalo_mod._build_direct_stage3_runtime(
+    sim_old = subhalo_mod._build_direct_calculating_properties_runtime(
         state,
         galaxy_payloads=galaxy_payloads,
         nproc=1,
@@ -471,7 +537,7 @@ def test_streaming_export_matches_original_caesar_format(monkeypatch, tmp_path):
     stream_out = tmp_path / "stream_caesar.hdf5"
     export_mod.write_catalogue_from_property_shards(
         snapshot_meta=state.snapshot,
-        property_results=[_stage3_result_with_summary(shard_path, halo_states, galaxy_states)],
+        property_results=[_calculating_properties_result_with_summary(shard_path, halo_states, galaxy_states)],
         output_file=str(stream_out),
     )
 
@@ -531,7 +597,7 @@ def test_streaming_export_handles_sorted_multi_halo_lists(monkeypatch, tmp_path)
         },
     ]
 
-    sim_ref = subhalo_mod._build_direct_stage3_runtime(
+    sim_ref = subhalo_mod._build_direct_calculating_properties_runtime(
         state,
         galaxy_payloads=galaxy_payloads,
         nproc=1,
@@ -545,18 +611,11 @@ def test_streaming_export_handles_sorted_multi_halo_lists(monkeypatch, tmp_path)
     halo_states = [subhalo_mod._serialize_group_state(group, id_key="_merge_id") for group in sim_ref.halo_list]
     galaxy_states = [subhalo_mod._serialize_group_state(group, id_key="_merge_id") for group in sim_ref.galaxy_list]
 
-    shard_path = tmp_path / "stage3_rank00000.pkl"
+    shard_path = tmp_path / "calculating_properties_rank00000.pkl"
     with shard_path.open("wb") as fh:
-        pickle.dump(
-            {
-                "halos": halo_states,
-                "galaxies": galaxy_states,
-            },
-            fh,
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
+        pickle.dump(_property_shard_payload_from_states(halo_states, galaxy_states), fh, protocol=pickle.HIGHEST_PROTOCOL)
 
-    sim_old = subhalo_mod._build_direct_stage3_runtime(
+    sim_old = subhalo_mod._build_direct_calculating_properties_runtime(
         state,
         galaxy_payloads=galaxy_payloads,
         nproc=1,
@@ -573,7 +632,126 @@ def test_streaming_export_handles_sorted_multi_halo_lists(monkeypatch, tmp_path)
     stream_out = tmp_path / "stream_caesar_multi.hdf5"
     export_mod.write_catalogue_from_property_shards(
         snapshot_meta=state.snapshot,
-        property_results=[_stage3_result_with_summary(shard_path, halo_states, galaxy_states)],
+        property_results=[_calculating_properties_result_with_summary(shard_path, halo_states, galaxy_states)],
+        output_file=str(stream_out),
+    )
+
+    _assert_hdf5_equal(ref_out, stream_out)
+
+
+def test_streaming_export_handles_scrambled_ragged_block_owner_order(monkeypatch, tmp_path):
+    snapshot = tmp_path / "snap.hdf5"
+    _write_test_snapshot(snapshot)
+
+    hierarchy = SimpleNamespace(
+        parent_of={10: 0, 11: 0},
+        children_of={10: [], 11: []},
+    )
+    halos_df = pd.DataFrame(
+        {
+            "hid": np.asarray([10, 11], dtype=np.int64),
+            "host_hid": np.asarray([0, 0], dtype=np.int64),
+            "npart": np.asarray([2, 4], dtype=np.int64),
+            "n_star": np.asarray([1, 1], dtype=np.int64),
+        }
+    )
+    memberships = {
+        10: np.asarray([[1001, 0], [3001, 4]], dtype=np.int64),
+        11: np.asarray([[1002, 0], [2001, 1], [2002, 1], [3002, 4]], dtype=np.int64),
+    }
+
+    monkeypatch.setattr(hdf5_mod, "load_ahf_hierarchy", lambda _: hierarchy)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_halos_dataframe", lambda _: halos_df)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_particle_blocks", lambda *args, **kwargs: memberships)
+
+    state = hdf5_mod.build_direct_state(str(snapshot), "dummy.AHF_particles")
+    galaxy_payloads = [
+        {
+            "AHF_haloID": 10,
+            "AHF_parent_haloID": 0,
+            "AHF_top_haloID": 10,
+            "AHF_depth": 0,
+            "AHF_ancestor_haloIDs": np.asarray([], dtype=np.int64),
+            "glist": np.asarray([0], dtype=np.int32),
+            "slist": np.asarray([0], dtype=np.int32),
+            "dmlist": np.asarray([], dtype=np.int32),
+            "bhlist": np.asarray([], dtype=np.int32),
+            "dlist": np.asarray([], dtype=np.int32),
+        },
+        {
+            "AHF_haloID": 11,
+            "AHF_parent_haloID": 0,
+            "AHF_top_haloID": 11,
+            "AHF_depth": 0,
+            "AHF_ancestor_haloIDs": np.asarray([], dtype=np.int64),
+            "glist": np.asarray([1], dtype=np.int32),
+            "slist": np.asarray([1], dtype=np.int32),
+            "dmlist": np.asarray([], dtype=np.int32),
+            "bhlist": np.asarray([], dtype=np.int32),
+            "dlist": np.asarray([], dtype=np.int32),
+        },
+    ]
+
+    sim_ref = subhalo_mod._build_direct_calculating_properties_runtime(
+        state,
+        galaxy_payloads=galaxy_payloads,
+        nproc=1,
+    )
+    for idx, halo in enumerate(sim_ref.halo_list):
+        halo._merge_id = idx
+    for idx, gal in enumerate(sim_ref.galaxy_list):
+        gal._merge_id = idx
+    subhalo_mod._compute_group_properties_subset(sim_ref, group_type="halo", groups=list(sim_ref.halo_list))
+    subhalo_mod._compute_group_properties_subset(sim_ref, group_type="galaxy", groups=list(sim_ref.galaxy_list))
+    halo_states = [subhalo_mod._serialize_group_state(group, id_key="_merge_id") for group in sim_ref.halo_list]
+    galaxy_states = [subhalo_mod._serialize_group_state(group, id_key="_merge_id") for group in sim_ref.galaxy_list]
+
+    payload = _property_shard_payload_from_states(halo_states, galaxy_states)
+
+    def _scramble_block(block):
+        owner_ids = np.asarray(block["owner_id"], dtype=np.int64)
+        lengths = np.asarray(block["lengths"], dtype=np.int64)
+        data = np.asarray(block["data"])
+        if owner_ids.size <= 1:
+            return dict(block)
+        order = np.arange(owner_ids.size - 1, -1, -1, dtype=np.int64)
+        starts = np.zeros(owner_ids.size, dtype=np.int64)
+        if owner_ids.size > 1:
+            starts[1:] = np.cumsum(lengths[:-1], dtype=np.int64)
+        ends = starts + lengths
+        parts = [np.asarray(data[int(starts[idx]):int(ends[idx])]) for idx in order.tolist()]
+        return {
+            "owner_id": owner_ids[order],
+            "lengths": lengths[order],
+            "data": np.concatenate(parts) if parts else np.empty(0, dtype=data.dtype),
+            "dtype": block.get("dtype"),
+        }
+
+    payload["halo_lists"] = {name: _scramble_block(block) for name, block in payload["halo_lists"].items()}
+    payload["galaxy_lists"] = {name: _scramble_block(block) for name, block in payload["galaxy_lists"].items()}
+
+    shard_path = tmp_path / "calculating_properties_rank00000.pkl"
+    with shard_path.open("wb") as fh:
+        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+
+    sim_old = subhalo_mod._build_direct_calculating_properties_runtime(
+        state,
+        galaxy_payloads=galaxy_payloads,
+        nproc=1,
+    )
+    subhalo_mod._compute_group_properties_subset(sim_old, group_type="halo", groups=list(sim_old.halo_list))
+    subhalo_mod._compute_group_properties_subset(sim_old, group_type="galaxy", groups=list(sim_old.galaxy_list))
+    subhalo_mod._complete_finalization_after_properties_direct(sim_old)
+    pipeline_utils_mod.load_global_lists(sim_old)
+    setattr(sim_old, "_ahf_subhalo_streaming_save", False)
+
+    ref_out = tmp_path / "ref_caesar_scrambled.hdf5"
+    sim_old.save(str(ref_out))
+
+    stream_out = tmp_path / "stream_caesar_scrambled.hdf5"
+    export_mod.write_catalogue_from_property_shards(
+        snapshot_meta=state.snapshot,
+        property_results=[_calculating_properties_result_with_summary(shard_path, halo_states, galaxy_states)],
         output_file=str(stream_out),
     )
 

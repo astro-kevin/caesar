@@ -155,6 +155,110 @@ def _convert_for_spec(value, spec: _ValueSpec):
     return raw
 
 
+def _value_spec_to_payload(spec: _ValueSpec) -> Dict[str, object]:
+    return {
+        "shape": tuple(int(v) for v in spec.shape),
+        "dtype": np.dtype(spec.dtype).str,
+        "unit": None if spec.unit is None else str(spec.unit),
+    }
+
+
+def _value_spec_from_payload(payload: Mapping[str, object]) -> _ValueSpec:
+    return _ValueSpec(
+        shape=tuple(int(v) for v in payload.get("shape", ())),
+        dtype=np.dtype(str(payload.get("dtype", np.dtype(np.float64).str))),
+        unit=None if payload.get("unit", None) in (None, "") else str(payload.get("unit")),
+    )
+
+
+def _merge_value_spec(existing: Optional[_ValueSpec], incoming: _ValueSpec, *, label: str) -> _ValueSpec:
+    if existing is None:
+        return incoming
+    if (
+        tuple(int(v) for v in existing.shape) != tuple(int(v) for v in incoming.shape)
+        or np.dtype(existing.dtype) != np.dtype(incoming.dtype)
+        or (None if existing.unit in (None, "") else str(existing.unit))
+        != (None if incoming.unit in (None, "") else str(incoming.unit))
+    ):
+        raise RuntimeError(
+            f"Incompatible shard schema for {label}: "
+            f"existing(shape={existing.shape}, dtype={np.dtype(existing.dtype).str}, unit={existing.unit}) "
+            f"!= incoming(shape={incoming.shape}, dtype={np.dtype(incoming.dtype).str}, unit={incoming.unit})"
+        )
+    return existing
+
+
+def _build_column_array(states: Sequence[Mapping[str, object]], *, getter, spec: _ValueSpec) -> np.ndarray:
+    out = np.empty((len(states),) + tuple(int(v) for v in spec.shape), dtype=spec.dtype)
+    for idx, state in enumerate(states):
+        out[idx] = _convert_for_spec(getter(state), spec)
+    return out
+
+
+def build_group_column_payload(
+    states: Sequence[Mapping[str, object]],
+    *,
+    list_attrs: Sequence[str],
+    skip_attrs: set[str],
+) -> Dict[str, object]:
+    schema = _GroupSchema(
+        size=len(states),
+        list_attrs=tuple(str(v) for v in list_attrs),
+        list_lengths={str(name): np.zeros(len(states), dtype=np.int64) for name in list_attrs},
+    )
+    for idx, state in enumerate(states):
+        _scan_state_schema(state, schema=schema, skip_attrs=skip_attrs, list_lengths_index=int(idx))
+
+    ids = np.asarray([int(state["id"]) for state in states], dtype=np.int64)
+    attrs = {
+        str(name): _build_column_array(states, getter=lambda state, key=name: state.get(str(key)), spec=spec)
+        for name, spec in schema.attr_specs.items()
+    }
+    dicts = {
+        str(dict_name): {
+            str(subkey): _build_column_array(
+                states,
+                getter=lambda state, dn=dict_name, sk=subkey: state.get(str(dn), {}).get(str(sk)),
+                spec=spec,
+            )
+            for subkey, spec in submap.items()
+        }
+        for dict_name, submap in schema.dict_specs.items()
+    }
+    return {
+        "id": ids,
+        "attr_specs": {str(name): _value_spec_to_payload(spec) for name, spec in schema.attr_specs.items()},
+        "dict_specs": {
+            str(dict_name): {str(subkey): _value_spec_to_payload(spec) for subkey, spec in submap.items()}
+            for dict_name, submap in schema.dict_specs.items()
+        },
+        "list_lengths": {str(name): np.asarray(lengths, dtype=np.int64) for name, lengths in schema.list_lengths.items()},
+        "list_dtypes": {str(name): np.dtype(dtype).str for name, dtype in schema.list_dtypes.items()},
+        "attrs": attrs,
+        "dicts": dicts,
+    }
+
+
+def _merge_group_schema_from_summary(
+    schema: _GroupSchema,
+    summary_entry: Mapping[str, object],
+    *,
+    label: str,
+) -> None:
+    for name, payload in dict(summary_entry.get("attr_specs", {})).items():
+        incoming = _value_spec_from_payload(payload)
+        schema.attr_specs[str(name)] = _merge_value_spec(schema.attr_specs.get(str(name)), incoming, label=f"{label}.{name}")
+    for dict_name, submap in dict(summary_entry.get("dict_specs", {})).items():
+        bucket = schema.dict_specs.setdefault(str(dict_name), {})
+        for subkey, payload in dict(submap).items():
+            incoming = _value_spec_from_payload(payload)
+            bucket[str(subkey)] = _merge_value_spec(
+                bucket.get(str(subkey)),
+                incoming,
+                label=f"{label}.{dict_name}.{subkey}",
+            )
+
+
 def _scan_state_schema(
     state: Mapping[str, object],
     *,
@@ -182,7 +286,7 @@ def _scan_state_schema(
         else:
             if str(key) in schema.attr_specs:
                 continue
-            spec = _infer_value_spec(value)
+            spec = _infer_legacy_attr_spec(str(key), value)
             if spec is not None:
                 schema.attr_specs[str(key)] = spec
 
@@ -222,6 +326,16 @@ def _progress_bar(completed: int, total: int) -> str:
         filled = int(round(min(1.0, max(0.0, float(done_int) / float(total_int))) * float(width)))
     filled = max(0, min(int(width), int(filled)))
     return "[" + "#" * filled + "-" * (int(width) - filled) + "]"
+
+
+def _global_property_workers() -> int:
+    try:
+        workers = int(os.environ.get("CAESAR_AHF_SUBHALO_GLOBAL_PROPERTY_WORKERS", "-1"))
+    except Exception:
+        workers = -1
+    if workers == 0:
+        return 1
+    return workers
 
 
 def _find_state_by_id(
@@ -278,16 +392,18 @@ def _compute_local_density_dicts(
     mass: np.ndarray,
     boxsize: float,
     search_radii: Sequence[float],
+    workers: Optional[int] = None,
 ) -> tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
     if pos.shape[0] == 0:
         return {}, {}
 
     try:
-        from scipy.spatial import KDTree
+        from scipy.spatial import cKDTree
     except Exception:
         return {}, {}
 
-    tree = KDTree(np.mod(pos, boxsize), boxsize=boxsize if boxsize > 0 else None)
+    query_workers = _global_property_workers() if workers is None else int(workers)
+    tree = cKDTree(np.mod(pos, boxsize), boxsize=boxsize if boxsize > 0 else None)
     mass_out: Dict[str, np.ndarray] = {}
     number_out: Dict[str, np.ndarray] = {}
     for radius in search_radii:
@@ -295,7 +411,7 @@ def _compute_local_density_dicts(
         if r <= 0.0:
             continue
         volume = (4.0 / 3.0) * np.pi * r**3
-        neighbours = tree.query_ball_point(pos, r, workers=1)
+        neighbours = tree.query_ball_point(pos, r, workers=query_workers)
         key = str(int(r))
         local_mass = np.empty(pos.shape[0], dtype=np.float64)
         local_num = np.empty(pos.shape[0], dtype=np.float64)
@@ -306,6 +422,87 @@ def _compute_local_density_dicts(
         mass_out[key] = local_mass
         number_out[key] = local_num
     return mass_out, number_out
+
+
+def compute_global_properties_from_property_shards(
+    *,
+    snapshot_meta,
+    property_results: Sequence[Mapping[str, object]],
+    log_fn=None,
+    stage_label: str = "global properties",
+) -> Dict[str, object]:
+    shard_paths = [Path(str(result["shard_path"])) for result in property_results]
+    nhalos = int(sum(int(result.get("count_halos", 0)) for result in property_results))
+    ngalaxies = int(sum(int(result.get("count_galaxies", 0)) for result in property_results))
+
+    halo_total_mass = np.zeros(nhalos, dtype=np.float64)
+    halo_pos = np.zeros((nhalos, 3), dtype=np.float64)
+    galaxy_stellar_mass = np.zeros(ngalaxies, dtype=np.float64)
+    galaxy_total_mass = np.zeros(ngalaxies, dtype=np.float64)
+    galaxy_pos = np.zeros((ngalaxies, 3), dtype=np.float64)
+
+    summary_ready = all(
+        isinstance(result.get("summary"), Mapping)
+        and isinstance(dict(result.get("summary", {})).get("halos", {}), Mapping)
+        and isinstance(dict(result.get("summary", {})).get("galaxies", {}), Mapping)
+        for result in property_results
+    )
+    if log_fn is not None:
+        log_fn(f"{stage_label}: gathering neighbour-search inputs halos={nhalos} galaxies={ngalaxies}")
+
+    if not summary_ready:
+        raise RuntimeError("Property shard summaries are required for global property calculation")
+
+    for result in property_results:
+        summary = result.get("summary", {})
+        halo_summary = summary.get("halos", {})
+        halo_ids = np.asarray(halo_summary.get("id", []), dtype=np.int64)
+        if halo_ids.size > 0:
+            halo_total_mass[halo_ids] = np.asarray(halo_summary.get("total_mass", []), dtype=np.float64)
+            halo_pos[halo_ids] = np.asarray(halo_summary.get("pos", []), dtype=np.float64)
+
+        galaxy_summary = summary.get("galaxies", {})
+        galaxy_ids = np.asarray(galaxy_summary.get("id", []), dtype=np.int64)
+        if galaxy_ids.size > 0:
+            galaxy_stellar_mass[galaxy_ids] = np.asarray(galaxy_summary.get("stellar_mass", []), dtype=np.float64)
+            galaxy_total_mass[galaxy_ids] = np.asarray(galaxy_summary.get("total_mass", []), dtype=np.float64)
+            galaxy_pos[galaxy_ids] = np.asarray(galaxy_summary.get("pos", []), dtype=np.float64)
+
+    halo_order = np.argsort(-halo_total_mass, kind="stable")
+    galaxy_order = np.argsort(-galaxy_stellar_mass, kind="stable")
+    halo_pos_sorted = halo_pos[halo_order]
+    halo_mass_sorted = halo_total_mass[halo_order]
+    galaxy_pos_sorted = galaxy_pos[galaxy_order]
+    galaxy_mass_sorted = galaxy_total_mass[galaxy_order]
+    search_radii = np.asarray([300.0, 1000.0, 3000.0], dtype=np.float64)
+    workers = _global_property_workers()
+    if log_fn is not None:
+        worker_label = "all available cores" if int(workers) < 0 else str(int(workers))
+        log_fn(f"{stage_label}: computing neighbour-based densities with workers={worker_label}")
+    halo_local_mass, halo_local_num = _compute_local_density_dicts(
+        pos=halo_pos_sorted,
+        mass=halo_mass_sorted,
+        boxsize=float(snapshot_meta.boxsize),
+        search_radii=search_radii,
+        workers=workers,
+    )
+    galaxy_local_mass, galaxy_local_num = _compute_local_density_dicts(
+        pos=galaxy_pos_sorted,
+        mass=galaxy_mass_sorted,
+        boxsize=float(snapshot_meta.boxsize),
+        search_radii=search_radii,
+        workers=workers,
+    )
+    if log_fn is not None:
+        log_fn(f"{stage_label}: neighbour-based densities complete")
+    return {
+        "halo_order": np.asarray(halo_order, dtype=np.int64),
+        "galaxy_order": np.asarray(galaxy_order, dtype=np.int64),
+        "halo_local_mass": halo_local_mass,
+        "halo_local_num": halo_local_num,
+        "galaxy_local_mass": galaxy_local_mass,
+        "galaxy_local_num": galaxy_local_num,
+    }
 
 
 def _build_save_stub(snapshot_meta, *, nhalos: int, ngalaxies: int):
@@ -391,6 +588,7 @@ def write_catalogue_from_property_shards(
     output_file: str,
     log_fn=None,
     stage_label: str = "writing",
+    global_properties: Optional[Mapping[str, object]] = None,
 ) -> None:
     shard_paths = [Path(str(result["shard_path"])) for result in property_results]
     nhalos = int(sum(int(result.get("count_halos", 0)) for result in property_results))
@@ -487,68 +685,45 @@ def write_catalogue_from_property_shards(
     galaxy_total_mass = np.zeros(ngalaxies, dtype=np.float64)
     galaxy_pos = np.zeros((ngalaxies, 3), dtype=np.float64)
     galaxy_top_halo_id = np.full(ngalaxies, -1, dtype=np.int64)
-    summary_ready = all(isinstance(result.get("summary"), Mapping) for result in property_results)
-    top_halo_state = None
-    top_halo_mass = None
-    top_galaxy_state = None
-    top_galaxy_stellar_mass = None
-    if summary_ready:
-        for result in property_results:
-            summary = result.get("summary", {})
-            halo_summary = summary.get("halos", {})
-            halo_ids = np.asarray(halo_summary.get("id", []), dtype=np.int64)
-            if halo_ids.size > 0:
-                halo_total_mass[halo_ids] = np.asarray(halo_summary.get("total_mass", []), dtype=np.float64)
-                halo_pos[halo_ids] = np.asarray(halo_summary.get("pos", []), dtype=np.float64)
-                halo_ahf_id[halo_ids] = np.asarray(halo_summary.get("ahf_halo_id", []), dtype=np.int64)
-                for name, lengths in dict(halo_summary.get("list_lengths", {})).items():
-                    if name in halo_schema.list_lengths:
-                        halo_schema.list_lengths[name][halo_ids] = np.asarray(lengths, dtype=np.int64)
-                for name, dtype_str in dict(halo_summary.get("list_dtypes", {})).items():
-                    if name in halo_schema.list_lengths and name not in halo_schema.list_dtypes:
-                        halo_schema.list_dtypes[name] = np.dtype(dtype_str)
+    summary_ready = all(
+        isinstance(result.get("summary"), Mapping)
+        and isinstance(dict(result.get("summary", {})).get("halos", {}), Mapping)
+        and isinstance(dict(result.get("summary", {})).get("galaxies", {}), Mapping)
+        for result in property_results
+    )
+    if not summary_ready:
+        raise RuntimeError("Property shard summaries are required for AHF-subhalo export")
 
-            galaxy_summary = summary.get("galaxies", {})
-            galaxy_ids = np.asarray(galaxy_summary.get("id", []), dtype=np.int64)
-            if galaxy_ids.size > 0:
-                galaxy_stellar_mass[galaxy_ids] = np.asarray(galaxy_summary.get("stellar_mass", []), dtype=np.float64)
-                galaxy_total_mass[galaxy_ids] = np.asarray(galaxy_summary.get("total_mass", []), dtype=np.float64)
-                galaxy_pos[galaxy_ids] = np.asarray(galaxy_summary.get("pos", []), dtype=np.float64)
-                galaxy_top_halo_id[galaxy_ids] = np.asarray(galaxy_summary.get("top_halo_id", []), dtype=np.int64)
-                for name, lengths in dict(galaxy_summary.get("list_lengths", {})).items():
-                    if name in galaxy_schema.list_lengths:
-                        galaxy_schema.list_lengths[name][galaxy_ids] = np.asarray(lengths, dtype=np.int64)
-                for name, dtype_str in dict(galaxy_summary.get("list_dtypes", {})).items():
-                    if name in galaxy_schema.list_lengths and name not in galaxy_schema.list_dtypes:
-                        galaxy_schema.list_dtypes[name] = np.dtype(dtype_str)
+    for result in property_results:
+        summary = dict(result.get("summary", {}))
+        halo_summary = dict(summary.get("halos", {}))
+        halo_ids = np.asarray(halo_summary.get("id", []), dtype=np.int64)
+        if halo_ids.size > 0:
+            halo_total_mass[halo_ids] = np.asarray(halo_summary.get("total_mass", []), dtype=np.float64)
+            halo_pos[halo_ids] = np.asarray(halo_summary.get("pos", []), dtype=np.float64)
+            halo_ahf_id[halo_ids] = np.asarray(halo_summary.get("ahf_halo_id", []), dtype=np.int64)
+            for name, lengths in dict(halo_summary.get("list_lengths", {})).items():
+                if name in halo_schema.list_lengths:
+                    halo_schema.list_lengths[name][halo_ids] = np.asarray(lengths, dtype=np.int64)
+            for name, dtype_str in dict(halo_summary.get("list_dtypes", {})).items():
+                if name in halo_schema.list_lengths and name not in halo_schema.list_dtypes:
+                    halo_schema.list_dtypes[name] = np.dtype(dtype_str)
+        _merge_group_schema_from_summary(halo_schema, halo_summary, label="halo")
 
-            candidate_halo_mass = summary.get("top_halo_mass")
-            if candidate_halo_mass is not None and (top_halo_mass is None or float(candidate_halo_mass) > float(top_halo_mass)):
-                top_halo_mass = float(candidate_halo_mass)
-                top_halo_state = summary.get("top_halo_state")
-
-            candidate_gal_mass = summary.get("top_galaxy_stellar_mass")
-            if candidate_gal_mass is not None and (
-                top_galaxy_stellar_mass is None or float(candidate_gal_mass) > float(top_galaxy_stellar_mass)
-            ):
-                top_galaxy_stellar_mass = float(candidate_gal_mass)
-                top_galaxy_state = summary.get("top_galaxy_state")
-    else:
-        for shard_path in shard_paths:
-            shard = _load_pickle(shard_path)
-            for state in shard.get("halos", []):
-                hid = int(state["id"])
-                halo_total_mass[hid] = float(_raw_value(state["masses"]["total"]))
-                halo_pos[hid] = np.asarray(_raw_value(state["pos"]), dtype=np.float64)
-                halo_ahf_id[hid] = int(state.get("AHF_haloID", -1))
-                _scan_state_schema(state, schema=halo_schema, skip_attrs=halo_skip, list_lengths_index=hid)
-            for state in shard.get("galaxies", []):
-                gid = int(state["id"])
-                galaxy_stellar_mass[gid] = float(_raw_value(state["masses"]["stellar"]))
-                galaxy_total_mass[gid] = float(_raw_value(state["masses"]["total"]))
-                galaxy_pos[gid] = np.asarray(_raw_value(state["pos"]), dtype=np.float64)
-                galaxy_top_halo_id[gid] = int(state.get("AHF_top_haloID", -1))
-                _scan_state_schema(state, schema=galaxy_schema, skip_attrs=galaxy_skip, list_lengths_index=gid)
+        galaxy_summary = dict(summary.get("galaxies", {}))
+        galaxy_ids = np.asarray(galaxy_summary.get("id", []), dtype=np.int64)
+        if galaxy_ids.size > 0:
+            galaxy_stellar_mass[galaxy_ids] = np.asarray(galaxy_summary.get("stellar_mass", []), dtype=np.float64)
+            galaxy_total_mass[galaxy_ids] = np.asarray(galaxy_summary.get("total_mass", []), dtype=np.float64)
+            galaxy_pos[galaxy_ids] = np.asarray(galaxy_summary.get("pos", []), dtype=np.float64)
+            galaxy_top_halo_id[galaxy_ids] = np.asarray(galaxy_summary.get("top_halo_id", []), dtype=np.int64)
+            for name, lengths in dict(galaxy_summary.get("list_lengths", {})).items():
+                if name in galaxy_schema.list_lengths:
+                    galaxy_schema.list_lengths[name][galaxy_ids] = np.asarray(lengths, dtype=np.int64)
+            for name, dtype_str in dict(galaxy_summary.get("list_dtypes", {})).items():
+                if name in galaxy_schema.list_lengths and name not in galaxy_schema.list_dtypes:
+                    galaxy_schema.list_dtypes[name] = np.dtype(dtype_str)
+        _merge_group_schema_from_summary(galaxy_schema, galaxy_summary, label="galaxy")
 
     halo_order = np.argsort(-halo_total_mass, kind="stable")
     halo_new_index = np.empty(nhalos, dtype=np.int64)
@@ -559,30 +734,6 @@ def write_catalogue_from_property_shards(
     galaxy_new_index = np.empty(ngalaxies, dtype=np.int64)
     galaxy_new_index[galaxy_order] = np.arange(ngalaxies, dtype=np.int64)
     galaxy_parent_halo_new = np.asarray([int(halo_ahf_to_new.get(int(hid), -1)) for hid in galaxy_top_halo_id], dtype=np.int64)
-
-    if top_halo_state is None:
-        top_halo_state = _find_state_by_id(
-            shard_paths,
-            group_key="halos",
-            target_id=int(halo_order[0]) if nhalos > 0 else None,
-        )
-    if top_galaxy_state is None:
-        top_galaxy_state = _find_state_by_id(
-            shard_paths,
-            group_key="galaxies",
-            target_id=int(galaxy_order[0]) if ngalaxies > 0 else None,
-        )
-
-    halo_schema.attr_specs, halo_schema.dict_specs = _legacy_schema_from_state(
-        top_halo_state,
-        list_attrs=halo_schema.list_attrs,
-        skip_attrs=halo_skip,
-    )
-    galaxy_schema.attr_specs, galaxy_schema.dict_specs = _legacy_schema_from_state(
-        top_galaxy_state,
-        list_attrs=galaxy_schema.list_attrs,
-        skip_attrs=galaxy_skip,
-    )
 
     halo_galaxy_lengths = np.zeros(nhalos, dtype=np.int64)
     for merge_id in galaxy_order.tolist():
@@ -604,23 +755,47 @@ def write_catalogue_from_property_shards(
             galaxy_central[new_gid] = True
         cursor[host] += 1
 
-    halo_pos_sorted = halo_pos[halo_order]
-    halo_mass_sorted = halo_total_mass[halo_order]
-    galaxy_pos_sorted = galaxy_pos[galaxy_order]
-    galaxy_mass_sorted = galaxy_total_mass[galaxy_order]
-    search_radii = np.asarray([300.0, 1000.0, 3000.0], dtype=np.float64)
-    halo_local_mass, halo_local_num = _compute_local_density_dicts(
-        pos=halo_pos_sorted,
-        mass=halo_mass_sorted,
-        boxsize=float(snapshot_meta.boxsize),
-        search_radii=search_radii,
-    )
-    galaxy_local_mass, galaxy_local_num = _compute_local_density_dicts(
-        pos=galaxy_pos_sorted,
-        mass=galaxy_mass_sorted,
-        boxsize=float(snapshot_meta.boxsize),
-        search_radii=search_radii,
-    )
+    if global_properties is not None:
+        expected_halo_order = np.asarray(global_properties.get("halo_order", []), dtype=np.int64)
+        expected_galaxy_order = np.asarray(global_properties.get("galaxy_order", []), dtype=np.int64)
+        if expected_halo_order.size > 0 and not np.array_equal(expected_halo_order, halo_order):
+            raise RuntimeError("Precomputed halo global properties do not match writer halo ordering")
+        if expected_galaxy_order.size > 0 and not np.array_equal(expected_galaxy_order, galaxy_order):
+            raise RuntimeError("Precomputed galaxy global properties do not match writer galaxy ordering")
+        halo_local_mass = {
+            str(key): np.asarray(val, dtype=np.float64)
+            for key, val in dict(global_properties.get("halo_local_mass", {})).items()
+        }
+        halo_local_num = {
+            str(key): np.asarray(val, dtype=np.float64)
+            for key, val in dict(global_properties.get("halo_local_num", {})).items()
+        }
+        galaxy_local_mass = {
+            str(key): np.asarray(val, dtype=np.float64)
+            for key, val in dict(global_properties.get("galaxy_local_mass", {})).items()
+        }
+        galaxy_local_num = {
+            str(key): np.asarray(val, dtype=np.float64)
+            for key, val in dict(global_properties.get("galaxy_local_num", {})).items()
+        }
+    else:
+        halo_pos_sorted = halo_pos[halo_order]
+        halo_mass_sorted = halo_total_mass[halo_order]
+        galaxy_pos_sorted = galaxy_pos[galaxy_order]
+        galaxy_mass_sorted = galaxy_total_mass[galaxy_order]
+        search_radii = np.asarray([300.0, 1000.0, 3000.0], dtype=np.float64)
+        halo_local_mass, halo_local_num = _compute_local_density_dicts(
+            pos=halo_pos_sorted,
+            mass=halo_mass_sorted,
+            boxsize=float(snapshot_meta.boxsize),
+            search_radii=search_radii,
+        )
+        galaxy_local_mass, galaxy_local_num = _compute_local_density_dicts(
+            pos=galaxy_pos_sorted,
+            mass=galaxy_mass_sorted,
+            boxsize=float(snapshot_meta.boxsize),
+            search_radii=search_radii,
+        )
 
     halo_schema.attr_specs.setdefault("GroupID", _ValueSpec(shape=(), dtype=np.int64))
     halo_schema.attr_specs.setdefault("central_galaxy", _ValueSpec(shape=(), dtype=np.int64))
@@ -658,8 +833,8 @@ def write_catalogue_from_property_shards(
         galaxy_schema.dict_specs["local_mass_density"][key] = _ValueSpec(shape=(), dtype=np.float64, unit=density_unit)
         galaxy_schema.dict_specs["local_number_density"][key] = _ValueSpec(shape=(), dtype=np.float64, unit=number_density_unit)
 
-    halo_list_names = tuple(name for name in ("dmlist", "glist", "slist", "bhlist", "dlist", "galaxy_index_list") if name in halo_schema.list_lengths)
-    galaxy_list_names = tuple(name for name in ("glist", "slist", "bhlist", "dlist", "cloud_index_list", "AHF_ancestor_haloIDs") if name in galaxy_schema.list_lengths)
+        halo_list_names = tuple(name for name in ("dmlist", "glist", "slist", "bhlist", "dlist", "galaxy_index_list") if name in halo_schema.list_lengths)
+        galaxy_list_names = tuple(name for name in ("glist", "slist", "bhlist", "dlist", "cloud_index_list", "AHF_ancestor_haloIDs") if name in galaxy_schema.list_lengths)
 
     halo_ordered_lengths = {}
     for name in halo_list_names:
@@ -710,7 +885,7 @@ def write_catalogue_from_property_shards(
     if log_fn is not None:
         log_fn(
             f"{stage_label}: starting final export halos={nhalos} galaxies={ngalaxies} "
-            f"stage3_shards={len(shard_paths)}"
+            f"property_shards={len(shard_paths)}"
         )
 
     if os.path.isfile(output_file):
@@ -822,92 +997,53 @@ def write_catalogue_from_property_shards(
             if int(size) > 0
         }
 
-        def _halo_attr_value(name: str, state: Mapping[str, object], new_idx: int):
-            if name == "GroupID":
-                return new_idx
-            if name == "central_galaxy":
-                start = int(halo_galaxy_starts[new_idx])
-                end = int(halo_galaxy_ends[new_idx])
-                return int(halo_galaxy_data[start]) if end > start else -1
-            if name == "caesar_parent_halo_index":
-                return int(halo_ahf_to_new.get(int(state.get("AHF_parent_haloID", -1)), -1))
-            if name == "caesar_top_halo_index":
-                return int(halo_ahf_to_new.get(int(state.get("AHF_top_haloID", -1)), -1))
-            return state.get(name)
-
-        def _galaxy_attr_value(name: str, state: Mapping[str, object], merge_id: int, new_idx: int):
-            if name == "GroupID":
-                return new_idx
-            if name in {"parent_halo_index", "_ahf_host_halo_index"}:
-                return int(galaxy_parent_halo_new[merge_id])
-            if name == "caesar_parent_halo_index":
-                return int(halo_ahf_to_new.get(int(state.get("AHF_parent_haloID", -1)), -1))
-            if name == "caesar_top_halo_index":
-                return int(halo_ahf_to_new.get(int(state.get("AHF_top_haloID", -1)), -1))
-            if name == "central":
-                return bool(galaxy_central[new_idx])
-            return state.get(name)
-
-        def _halo_dict_value(dict_name: str, subkey: str, state: Mapping[str, object], new_idx: int):
-            if dict_name == "local_mass_density":
-                return halo_local_mass[subkey][new_idx]
-            if dict_name == "local_number_density":
-                return halo_local_num[subkey][new_idx]
-            return state.get(dict_name, {}).get(subkey)
-
-        def _galaxy_dict_value(dict_name: str, subkey: str, state: Mapping[str, object], new_idx: int):
-            if dict_name == "local_mass_density":
-                return galaxy_local_mass[subkey][new_idx]
-            if dict_name == "local_number_density":
-                return galaxy_local_num[subkey][new_idx]
-            return state.get(dict_name, {}).get(subkey)
-
         def _apply_list_block(
             *,
-            block: Optional[Mapping[str, object]],
+            block: Mapping[str, object],
             name: str,
-            states: Sequence[Mapping[str, object]],
-            new_idxs: np.ndarray,
+            owner_new_index: np.ndarray,
             starts: Mapping[str, np.ndarray],
             ends: Mapping[str, np.ndarray],
             final_arrays: Mapping[str, np.ndarray],
             reverse_name_prefix: str,
         ) -> None:
+            if not isinstance(block, Mapping):
+                raise RuntimeError(f"Missing required ragged block for {reverse_name_prefix}_{name}")
             arr = final_arrays[name]
             reverse_name = f"{reverse_name_prefix}_{name}"
             reverse_arr = reverse_arrays.get(reverse_name)
-            owner_to_new = {int(state["id"]): int(new_idx) for state, new_idx in zip(states, new_idxs)}
-            if isinstance(block, Mapping):
-                owner_ids = np.asarray(block.get("owner_id", []), dtype=np.int64)
-                lengths = np.asarray(block.get("lengths", []), dtype=np.int64)
-                data = np.asarray(block.get("data", []), dtype=arr.dtype)
-                if owner_ids.size == lengths.size and owner_ids.size > 0:
-                    block_new_idxs = np.asarray([int(owner_to_new.get(int(owner_id), -1)) for owner_id in owner_ids.tolist()], dtype=np.int64)
-                    src_starts, src_ends = _compute_starts_ends(lengths)
-                    for idx in range(owner_ids.size):
-                        new_idx = int(block_new_idxs[idx])
-                        if new_idx < 0:
-                            continue
-                        dst_start = int(starts[name][new_idx])
-                        dst_end = int(ends[name][new_idx])
-                        if dst_end <= dst_start:
-                            continue
-                        src_start = int(src_starts[idx])
-                        src_end = int(src_ends[idx])
-                        segment = data[src_start:src_end]
-                        arr[dst_start:dst_end] = segment
-                        if reverse_arr is not None and segment.size > 0:
-                            reverse_arr[np.asarray(segment, dtype=np.int64)] = int(new_idx)
-                    return
+            owner_ids = np.asarray(block.get("owner_id", []), dtype=np.int64)
+            lengths = np.asarray(block.get("lengths", []), dtype=np.int64)
+            data = np.asarray(block.get("data", []), dtype=arr.dtype)
+            if owner_ids.size != lengths.size:
+                raise RuntimeError(f"Invalid ragged block for {reverse_name}: owner_ids and lengths size mismatch")
+            if owner_ids.size == 0:
+                return
+            if np.any(owner_ids < 0) or np.any(owner_ids >= owner_new_index.size):
+                raise RuntimeError(f"Invalid ragged block for {reverse_name}: owner_id out of bounds")
+            if np.unique(owner_ids).size != owner_ids.size:
+                raise RuntimeError(f"Invalid ragged block for {reverse_name}: duplicate owner_id entries")
 
-            for state, new_idx in zip(states, new_idxs):
-                data = np.asarray(_state_list_data(state, name), dtype=arr.dtype)
-                start = int(starts[name][new_idx])
-                end = int(ends[name][new_idx])
-                if end > start:
-                    arr[start:end] = data
-                    if reverse_arr is not None and data.size > 0:
-                        reverse_arr[np.asarray(data, dtype=np.int64)] = int(new_idx)
+            src_starts, src_ends = _compute_starts_ends(lengths)
+            owner_new_idxs = np.asarray(owner_new_index[owner_ids], dtype=np.int64)
+            for idx in np.argsort(owner_new_idxs, kind="stable").tolist():
+                new_idx = int(owner_new_idxs[idx])
+                dst_start = int(starts[name][new_idx])
+                dst_end = int(ends[name][new_idx])
+                if dst_end <= dst_start:
+                    continue
+                src_start = int(src_starts[idx])
+                src_end = int(src_ends[idx])
+                segment = data[src_start:src_end]
+                expected_len = int(dst_end - dst_start)
+                if int(segment.size) != expected_len:
+                    raise RuntimeError(
+                        f"Invalid ragged block for {reverse_name}: owner_id={int(owner_ids[idx])} "
+                        f"segment length {int(segment.size)} != expected {expected_len}"
+                    )
+                arr[dst_start:dst_end] = segment
+                if reverse_arr is not None and segment.size > 0:
+                    reverse_arr[np.asarray(segment, dtype=np.int64)] = int(new_idx)
 
         write_progress_every = max(1, int(os.environ.get("CAESAR_AHF_SUBHALO_EXPORT_PROGRESS_EVERY", "4")))
         write_progress_seconds = max(5.0, float(os.environ.get("CAESAR_AHF_SUBHALO_EXPORT_PROGRESS_SECONDS", "60.0")))
@@ -917,28 +1053,56 @@ def write_catalogue_from_property_shards(
 
         for shard_idx, shard_path in enumerate(shard_paths, start=1):
             shard = _load_pickle(shard_path)
-            halo_states = list(shard.get("halos", []))
-            galaxy_states = list(shard.get("galaxies", []))
+            halo_columns = dict(shard.get("halo_columns", {}))
+            galaxy_columns = dict(shard.get("galaxy_columns", {}))
             halo_list_blocks = dict(shard.get("halo_lists", {})) if isinstance(shard.get("halo_lists", {}), Mapping) else {}
             galaxy_list_blocks = dict(shard.get("galaxy_lists", {})) if isinstance(shard.get("galaxy_lists", {}), Mapping) else {}
-            if halo_states:
-                halo_merge_ids = np.asarray([int(state["id"]) for state in halo_states], dtype=np.int64)
+            halo_attrs = dict(halo_columns.get("attrs", {}))
+            halo_dicts = {str(name): dict(submap) for name, submap in dict(halo_columns.get("dicts", {})).items()}
+            galaxy_attrs = dict(galaxy_columns.get("attrs", {}))
+            galaxy_dicts = {str(name): dict(submap) for name, submap in dict(galaxy_columns.get("dicts", {})).items()}
+
+            halo_merge_ids = np.asarray(halo_columns.get("id", []), dtype=np.int64)
+            if halo_merge_ids.size > 0:
                 halo_new_idxs = np.asarray(halo_new_index[halo_merge_ids], dtype=np.int64)
                 halo_order_local = np.argsort(halo_new_idxs)
-                halo_states = [halo_states[idx] for idx in halo_order_local.tolist()]
                 halo_merge_ids = halo_merge_ids[halo_order_local]
                 halo_new_idxs = halo_new_idxs[halo_order_local]
+                halo_parent_ids = np.asarray(
+                    halo_attrs.get("AHF_parent_haloID", np.full(halo_merge_ids.size, -1, dtype=np.int64)),
+                    dtype=np.int64,
+                )[halo_order_local]
+                halo_top_ids = np.asarray(
+                    halo_attrs.get("AHF_top_haloID", np.full(halo_merge_ids.size, -1, dtype=np.int64)),
+                    dtype=np.int64,
+                )[halo_order_local]
 
                 for name, ds in halo_attr_dsets.items():
-                    spec = halo_schema.attr_specs[name]
-                    values = np.asarray(
-                        [
-                            _convert_for_spec(_halo_attr_value(name, state, int(new_idx)), spec)
-                            for state, new_idx in zip(halo_states, halo_new_idxs)
-                        ],
-                        dtype=spec.dtype,
-                    )
-                    ds[halo_new_idxs] = values
+                    if name == "GroupID":
+                        ds[halo_new_idxs] = np.asarray(halo_new_idxs, dtype=ds.dtype)
+                    elif name == "central_galaxy":
+                        values = np.asarray(
+                            [
+                                int(halo_galaxy_data[int(halo_galaxy_starts[int(new_idx)])])
+                                if int(halo_galaxy_ends[int(new_idx)]) > int(halo_galaxy_starts[int(new_idx)])
+                                else -1
+                                for new_idx in halo_new_idxs.tolist()
+                            ],
+                            dtype=ds.dtype,
+                        )
+                        ds[halo_new_idxs] = values
+                    elif name == "caesar_parent_halo_index":
+                        ds[halo_new_idxs] = np.asarray(
+                            [int(halo_ahf_to_new.get(int(v), -1)) for v in halo_parent_ids.tolist()],
+                            dtype=ds.dtype,
+                        )
+                    elif name == "caesar_top_halo_index":
+                        ds[halo_new_idxs] = np.asarray(
+                            [int(halo_ahf_to_new.get(int(v), -1)) for v in halo_top_ids.tolist()],
+                            dtype=ds.dtype,
+                        )
+                    elif name in halo_attrs:
+                        ds[halo_new_idxs] = np.asarray(halo_attrs[name], dtype=ds.dtype)[halo_order_local]
 
                 for name in ("dmlist", "glist", "slist", "bhlist", "dlist"):
                     if name not in halo_list_dsets:
@@ -946,8 +1110,7 @@ def write_catalogue_from_property_shards(
                     _apply_list_block(
                         block=halo_list_blocks.get(name),
                         name=name,
-                        states=halo_states,
-                        new_idxs=halo_new_idxs,
+                        owner_new_index=halo_new_index,
                         starts=halo_starts,
                         ends=halo_ends,
                         final_arrays=halo_final_lists,
@@ -956,34 +1119,47 @@ def write_catalogue_from_property_shards(
 
                 for dict_name, submap in halo_dict_dsets.items():
                     for subkey, ds in submap.items():
-                        spec = halo_schema.dict_specs[dict_name][subkey]
-                        values = np.asarray(
-                            [
-                                _convert_for_spec(_halo_dict_value(dict_name, subkey, state, int(new_idx)), spec)
-                                for state, new_idx in zip(halo_states, halo_new_idxs)
-                            ],
-                            dtype=spec.dtype,
-                        )
-                        ds[halo_new_idxs] = values
+                        if dict_name == "local_mass_density":
+                            ds[halo_new_idxs] = np.asarray(halo_local_mass[subkey], dtype=ds.dtype)[halo_new_idxs]
+                        elif dict_name == "local_number_density":
+                            ds[halo_new_idxs] = np.asarray(halo_local_num[subkey], dtype=ds.dtype)[halo_new_idxs]
+                        elif subkey in halo_dicts.get(dict_name, {}):
+                            ds[halo_new_idxs] = np.asarray(halo_dicts[dict_name][subkey], dtype=ds.dtype)[halo_order_local]
 
-            if galaxy_states:
-                galaxy_merge_ids = np.asarray([int(state["id"]) for state in galaxy_states], dtype=np.int64)
+            galaxy_merge_ids = np.asarray(galaxy_columns.get("id", []), dtype=np.int64)
+            if galaxy_merge_ids.size > 0:
                 galaxy_new_idxs = np.asarray(galaxy_new_index[galaxy_merge_ids], dtype=np.int64)
                 galaxy_order_local = np.argsort(galaxy_new_idxs)
-                galaxy_states = [galaxy_states[idx] for idx in galaxy_order_local.tolist()]
                 galaxy_merge_ids = galaxy_merge_ids[galaxy_order_local]
                 galaxy_new_idxs = galaxy_new_idxs[galaxy_order_local]
+                galaxy_parent_ids = np.asarray(
+                    galaxy_attrs.get("AHF_parent_haloID", np.full(galaxy_merge_ids.size, -1, dtype=np.int64)),
+                    dtype=np.int64,
+                )[galaxy_order_local]
+                galaxy_top_ids = np.asarray(
+                    galaxy_attrs.get("AHF_top_haloID", np.full(galaxy_merge_ids.size, -1, dtype=np.int64)),
+                    dtype=np.int64,
+                )[galaxy_order_local]
 
                 for name, ds in galaxy_attr_dsets.items():
-                    spec = galaxy_schema.attr_specs[name]
-                    values = np.asarray(
-                        [
-                            _convert_for_spec(_galaxy_attr_value(name, state, int(merge_id), int(new_idx)), spec)
-                            for state, merge_id, new_idx in zip(galaxy_states, galaxy_merge_ids, galaxy_new_idxs)
-                        ],
-                        dtype=spec.dtype,
-                    )
-                    ds[galaxy_new_idxs] = values
+                    if name == "GroupID":
+                        ds[galaxy_new_idxs] = np.asarray(galaxy_new_idxs, dtype=ds.dtype)
+                    elif name in {"parent_halo_index", "_ahf_host_halo_index"}:
+                        ds[galaxy_new_idxs] = np.asarray(galaxy_parent_halo_new[galaxy_merge_ids], dtype=ds.dtype)
+                    elif name == "caesar_parent_halo_index":
+                        ds[galaxy_new_idxs] = np.asarray(
+                            [int(halo_ahf_to_new.get(int(v), -1)) for v in galaxy_parent_ids.tolist()],
+                            dtype=ds.dtype,
+                        )
+                    elif name == "caesar_top_halo_index":
+                        ds[galaxy_new_idxs] = np.asarray(
+                            [int(halo_ahf_to_new.get(int(v), -1)) for v in galaxy_top_ids.tolist()],
+                            dtype=ds.dtype,
+                        )
+                    elif name == "central":
+                        ds[galaxy_new_idxs] = np.asarray(galaxy_central[galaxy_new_idxs], dtype=ds.dtype)
+                    elif name in galaxy_attrs:
+                        ds[galaxy_new_idxs] = np.asarray(galaxy_attrs[name], dtype=ds.dtype)[galaxy_order_local]
 
                 for name in ("glist", "slist", "bhlist", "dlist", "AHF_ancestor_haloIDs", "cloud_index_list"):
                     if name not in galaxy_list_dsets:
@@ -991,8 +1167,7 @@ def write_catalogue_from_property_shards(
                     _apply_list_block(
                         block=galaxy_list_blocks.get(name),
                         name=name,
-                        states=galaxy_states,
-                        new_idxs=galaxy_new_idxs,
+                        owner_new_index=galaxy_new_index,
                         starts=galaxy_starts,
                         ends=galaxy_ends,
                         final_arrays=galaxy_final_lists,
@@ -1001,18 +1176,15 @@ def write_catalogue_from_property_shards(
 
                 for dict_name, submap in galaxy_dict_dsets.items():
                     for subkey, ds in submap.items():
-                        spec = galaxy_schema.dict_specs[dict_name][subkey]
-                        values = np.asarray(
-                            [
-                                _convert_for_spec(_galaxy_dict_value(dict_name, subkey, state, int(new_idx)), spec)
-                                for state, new_idx in zip(galaxy_states, galaxy_new_idxs)
-                            ],
-                            dtype=spec.dtype,
-                        )
-                        ds[galaxy_new_idxs] = values
+                        if dict_name == "local_mass_density":
+                            ds[galaxy_new_idxs] = np.asarray(galaxy_local_mass[subkey], dtype=ds.dtype)[galaxy_new_idxs]
+                        elif dict_name == "local_number_density":
+                            ds[galaxy_new_idxs] = np.asarray(galaxy_local_num[subkey], dtype=ds.dtype)[galaxy_new_idxs]
+                        elif subkey in galaxy_dicts.get(dict_name, {}):
+                            ds[galaxy_new_idxs] = np.asarray(galaxy_dicts[dict_name][subkey], dtype=ds.dtype)[galaxy_order_local]
 
-            written_halos += len(halo_states)
-            written_galaxies += len(galaxy_states)
+            written_halos += int(halo_merge_ids.size)
+            written_galaxies += int(galaxy_merge_ids.size)
             now = time.monotonic()
             if log_fn is not None and (
                 shard_idx == len(shard_paths)

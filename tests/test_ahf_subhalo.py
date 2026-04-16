@@ -264,7 +264,7 @@ def test_calculating_properties_payload_preserves_global_particle_lists():
         load_pot=True,
     )
 
-    payload = subhalo_mod._build_stage3_property_payload(sim, [halo])
+    payload = subhalo_mod._build_calculating_properties_payload(sim, [halo])
     halo_rec = payload["halos"][0]
     gal_rec = payload["galaxies"][0]
     assert np.array_equal(halo_rec["global_glist"], np.asarray([0], dtype=np.int64))
@@ -682,7 +682,7 @@ def test_galaxy_finding_shard_payload_serializes_node_candidates():
 def test_materialize_galaxy_finding_batch_item_writes_payload_on_assignment(tmp_path):
     task = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 4, 10)
     batch = subhalo_mod.AHFSubhaloBatch(tasks=(task,), is_tiny_batch=False, target_backend="cpu", estimated_cost=10)
-    payload_path = tmp_path / "stage1_input_regular_000000.pkl"
+    payload_path = tmp_path / "finding_galaxies_input_regular_000000.pkl"
     assert not payload_path.exists()
 
     item = mpi_mod._materialize_galaxy_finding_batch_item(
@@ -904,59 +904,38 @@ def test_uniform_stage_thread_map_uses_all_worker_cores():
     assert max(vals) == 4
 
 
-def test_stage3_batches_group_complete_top_level_hosts():
-    halos = [
-        SimpleNamespace(AHF_haloID=11, AHF_top_haloID=10, global_indexes=np.arange(5, dtype=np.int64)),
-        SimpleNamespace(AHF_haloID=10, AHF_top_haloID=10, global_indexes=np.arange(20, dtype=np.int64), galaxy_index_list=np.asarray([0, 1], dtype=np.int32)),
-        SimpleNamespace(AHF_haloID=20, AHF_top_haloID=20, global_indexes=np.arange(7, dtype=np.int64), galaxy_index_list=np.asarray([2], dtype=np.int32)),
+def test_calculating_properties_batches_keep_top_level_hosts_atomic():
+    root_results = [
+        {"root_id": 10, "shard_path": "root10.pkl", "root_payload_path": "root10_payload.pkl", "count": 2, "halo_count": 2, "property_cost": 132},
+        {"root_id": 20, "shard_path": "root20.pkl", "root_payload_path": "root20_payload.pkl", "count": 1, "halo_count": 1, "property_cost": 19},
     ]
-    galaxies = [
-        SimpleNamespace(global_indexes=np.arange(3, dtype=np.int64)),
-        SimpleNamespace(global_indexes=np.arange(4, dtype=np.int64)),
-        SimpleNamespace(global_indexes=np.arange(2, dtype=np.int64)),
-    ]
-    sim = SimpleNamespace(halo_list=halos, galaxy_list=galaxies)
 
-    batches = mpi_mod._build_stage3_batches(sim, worker_count=1)
+    batches = mpi_mod._build_calculating_properties_batches(root_results, worker_count=1)
 
     assert len(batches) == 2
-    batch_halo_ids = [{int(getattr(halo, "AHF_haloID", -1)) for halo in batch} for batch in batches]
-    batch_top_ids = [{int(getattr(halo, "AHF_top_haloID", -1)) for halo in batch} for batch in batches]
-    assert {10, 11} in batch_halo_ids
-    assert {20} in batch_halo_ids
-    assert {10} in batch_top_ids
-    assert {20} in batch_top_ids
+    batch_root_ids = [{int(rec["root_id"]) for rec in batch} for batch in batches]
+    assert {10} in batch_root_ids
+    assert {20} in batch_root_ids
 
 
-def test_stage3_batches_balance_whole_hosts_by_internal_cost(monkeypatch):
+def test_calculating_properties_batches_balance_whole_hosts_by_internal_cost(monkeypatch):
     monkeypatch.setenv("CAESAR_AHF_SUBHALO_CALCULATING_PROPERTIES_BATCH_MULTIPLIER", "1")
-    monkeypatch.setenv("CAESAR_AHF_SUBHALO_CALCULATING_PROPERTIES_HALO_OVERHEAD", "100")
-    monkeypatch.setenv("CAESAR_AHF_SUBHALO_CALCULATING_PROPERTIES_GALAXY_OVERHEAD", "50")
-
-    halos = [
-        SimpleNamespace(AHF_haloID=10, AHF_top_haloID=10, global_indexes=np.arange(20, dtype=np.int64), galaxy_index_list=np.asarray([0, 1], dtype=np.int32), AHF_depth=0),
-        SimpleNamespace(AHF_haloID=11, AHF_top_haloID=10, global_indexes=np.arange(5, dtype=np.int64), galaxy_index_list=np.asarray([], dtype=np.int32), AHF_depth=1),
-        SimpleNamespace(AHF_haloID=20, AHF_top_haloID=20, global_indexes=np.arange(9, dtype=np.int64), galaxy_index_list=np.asarray([2], dtype=np.int32), AHF_depth=0),
-        SimpleNamespace(AHF_haloID=30, AHF_top_haloID=30, global_indexes=np.arange(8, dtype=np.int64), galaxy_index_list=np.asarray([], dtype=np.int32), AHF_depth=0),
+    root_results = [
+        {"root_id": 10, "shard_path": "root10.pkl", "root_payload_path": "root10_payload.pkl", "count": 2, "halo_count": 2, "property_cost": 229},
+        {"root_id": 20, "shard_path": "root20.pkl", "root_payload_path": "root20_payload.pkl", "count": 1, "halo_count": 1, "property_cost": 61},
+        {"root_id": 30, "shard_path": "root30.pkl", "root_payload_path": "root30_payload.pkl", "count": 0, "halo_count": 1, "property_cost": 58},
+        {"root_id": 40, "shard_path": "root40.pkl", "root_payload_path": "root40_payload.pkl", "count": 1, "halo_count": 1, "property_cost": 58},
     ]
-    galaxies = [
-        SimpleNamespace(global_indexes=np.arange(3, dtype=np.int64)),
-        SimpleNamespace(global_indexes=np.arange(4, dtype=np.int64)),
-        SimpleNamespace(global_indexes=np.arange(2, dtype=np.int64)),
-    ]
-    sim = SimpleNamespace(halo_list=halos, galaxy_list=galaxies)
 
-    batches = mpi_mod._build_stage3_batches(sim, worker_count=2)
+    batches = mpi_mod._build_calculating_properties_batches(root_results, worker_count=2)
 
     assert len(batches) == 2
-    batch_halo_ids = [{int(getattr(halo, "AHF_haloID", -1)) for halo in batch} for batch in batches]
-    batch_top_ids = [{int(getattr(halo, "AHF_top_haloID", -1)) for halo in batch} for batch in batches]
-    assert {10, 11} in batch_halo_ids
-    assert {10} in batch_top_ids
-    assert any(top_ids == {20, 30} for top_ids in batch_top_ids)
+    batch_root_ids = [{int(rec["root_id"]) for rec in batch} for batch in batches]
+    assert {10} in batch_root_ids
+    assert any(root_ids == {20, 40} for root_ids in batch_root_ids)
 
 
-def test_stage1_thread_map_preserves_gpu_support_threads():
+def test_finding_galaxies_thread_map_preserves_gpu_support_threads():
     worker_caps = [
         mpi_mod.WorkerCapability(rank=1, role="gpu_worker", hostname="nodeA", local_rank=1, gpu_device=0, threads=2),
         mpi_mod.WorkerCapability(rank=2, role="gpu_worker", hostname="nodeA", local_rank=2, gpu_device=1, threads=2),
@@ -973,7 +952,7 @@ def test_stage1_thread_map_preserves_gpu_support_threads():
         {"rank": int(cap.rank), "hostname": "nodeA", "visible_cores": 32} for cap in worker_caps
     )
 
-    thread_map = mpi_mod._build_stage1_thread_map(
+    thread_map = mpi_mod._build_finding_galaxies_thread_map(
         worker_caps=worker_caps,
         world_layout=world_layout,
         coordinator_rank=0,
@@ -1027,8 +1006,8 @@ def test_worker_run_finding_galaxies_bundles_multiple_items(tmp_path):
         ],
     }
 
-    path_a = tmp_path / "stage1_input_cpu_000000.pkl"
-    path_b = tmp_path / "stage1_input_cpu_000001.pkl"
+    path_a = tmp_path / "finding_galaxies_input_cpu_000000.pkl"
+    path_b = tmp_path / "finding_galaxies_input_cpu_000001.pkl"
     mpi_mod._dump_pickle(path_a, payload_a)
     mpi_mod._dump_pickle(path_b, payload_b)
 
@@ -1086,7 +1065,7 @@ def test_group_state_serialization_and_apply_roundtrip():
     assert np.array_equal(gal2.pos, np.array([1.0, 2.0, 3.0]))
 
 
-def test_stage3_payload_helpers():
+def test_calculating_properties_payload_helpers():
     sim = DummySim(pos=np.zeros((4, 3)), vel=np.zeros((4, 3)))
     task = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 2, 2)
     gal = subhalo_mod._build_candidate_group(
@@ -1103,16 +1082,16 @@ def test_stage3_payload_helpers():
         def __init__(self, ahf_halo_id):
             self.AHF_haloID = ahf_halo_id
 
-    halo_payload = mpi_mod._stage3_halo_work_payload([DummyHalo(101), DummyHalo(202)])
-    gal_payload = mpi_mod._stage3_galaxy_work_payload([gal])
+    halo_payload = mpi_mod._calculating_properties_halo_work_payload([DummyHalo(101), DummyHalo(202)])
+    gal_payload = mpi_mod._calculating_properties_galaxy_work_payload([gal])
 
     assert halo_payload == [101, 202]
     assert len(gal_payload) == 1
     assert int(gal_payload[0]["_merge_id"]) == 3
 
 
-def test_stage3_manifest_roundtrip(tmp_path):
-    path = mpi_mod._write_stage3_manifest(
+def test_calculating_properties_manifest_roundtrip(tmp_path):
+    path = mpi_mod._write_calculating_properties_manifest(
         shard_root=tmp_path,
         snapshot_file="snap.hdf5",
         ahf_particles_file="ahf_particles",
@@ -1121,7 +1100,7 @@ def test_stage3_manifest_roundtrip(tmp_path):
         snapshot_hash="abc123",
     )
     assert path.is_file()
-    payload = mpi_mod._load_stage3_manifest(tmp_path)
+    payload = mpi_mod._load_calculating_properties_manifest(tmp_path)
     assert payload["snapshot_file"] == "snap.hdf5"
     assert payload["ahf_particles_file"] == "ahf_particles"
     assert payload["output_file"] == "out.hdf5"
@@ -1158,7 +1137,7 @@ def test_build_caesar_runtime_from_loaded_ds_sets_hash_and_load_haloid(monkeypat
     assert isinstance(sim._ds_type, DummyDatasetType)
 
 
-def test_stage3_property_payload_roundtrip():
+def test_calculating_properties_payload_roundtrip():
     from caesar.group import create_new_group
 
     sim = SimpleNamespace()
@@ -1227,8 +1206,8 @@ def test_stage3_property_payload_roundtrip():
     sim.halo_list = [halo]
     sim.galaxy_list = [gal]
 
-    payload = subhalo_mod._build_stage3_property_payload(sim, [halo])
-    local_sim = subhalo_mod._build_stage3_property_runtime(payload, nproc=2)
+    payload = subhalo_mod._build_calculating_properties_payload(sim, [halo])
+    local_sim = subhalo_mod._build_calculating_properties_runtime(payload, nproc=2)
 
     assert local_sim.nproc == 2
     assert len(local_sim.halo_list) == 1
