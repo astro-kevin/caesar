@@ -134,7 +134,7 @@ def _stage3_result_with_summary(shard_path: Path, halo_states, galaxy_states):
         "shard_path": str(shard_path),
         "count_halos": int(len(halo_states)),
         "count_galaxies": int(len(galaxy_states)),
-        "summary": mpi_mod._build_stage3_summary(halo_states, galaxy_states),
+        "summary": mpi_mod._build_property_shard_summary(halo_states, galaxy_states),
     }
 
 
@@ -460,9 +460,9 @@ def test_streaming_export_matches_original_caesar_format(monkeypatch, tmp_path):
     sim_old.save(str(ref_out))
 
     stream_out = tmp_path / "stream_caesar.hdf5"
-    export_mod.stream_save_stage3_catalogue(
+    export_mod.write_catalogue_from_property_shards(
         snapshot_meta=state.snapshot,
-        stage3_results=[_stage3_result_with_summary(shard_path, halo_states, galaxy_states)],
+        property_results=[_stage3_result_with_summary(shard_path, halo_states, galaxy_states)],
         output_file=str(stream_out),
     )
 
@@ -562,9 +562,9 @@ def test_streaming_export_handles_sorted_multi_halo_lists(monkeypatch, tmp_path)
     sim_old.save(str(ref_out))
 
     stream_out = tmp_path / "stream_caesar_multi.hdf5"
-    export_mod.stream_save_stage3_catalogue(
+    export_mod.write_catalogue_from_property_shards(
         snapshot_meta=state.snapshot,
-        stage3_results=[_stage3_result_with_summary(shard_path, halo_states, galaxy_states)],
+        property_results=[_stage3_result_with_summary(shard_path, halo_states, galaxy_states)],
         output_file=str(stream_out),
     )
 

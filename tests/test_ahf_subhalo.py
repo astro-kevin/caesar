@@ -111,7 +111,7 @@ def test_run_uses_direct_runtime_entrypoint(monkeypatch, tmp_path):
     assert getattr(calls["adopt_runtime"], "marker", "") == "direct-runtime"
 
 
-def test_rank0_prepare_stage12_sets_velocity_linking_length(monkeypatch, tmp_path):
+def test_rank0_prepare_galaxy_finding_sets_velocity_linking_length(monkeypatch, tmp_path):
     class DummyNodes:
         def __init__(self):
             self.halo_id = np.asarray([10], dtype=np.int64)
@@ -137,14 +137,14 @@ def test_rank0_prepare_stage12_sets_velocity_linking_length(monkeypatch, tmp_pat
     monkeypatch.delenv("CAESAR_FOF6D_VEL_LL", raising=False)
     monkeypatch.delenv("CAESAR_FOF6D_DISABLE_VEL", raising=False)
 
-    state, pid_maps_sel, min_stars, fof_ll, fof_vel_ll, tasks, tasks_by_root, payloads = mpi_mod._rank0_prepare_stage12(
+    state, pid_maps_sel, min_stars, fof_ll, fof_vel_ll, tasks, tasks_by_root, payloads = mpi_mod._rank0_prepare_galaxy_finding(
         snapshot_file="snap.hdf5",
         ahf_particles_file="ahf.AHF_particles",
         shard_root=tmp_path,
         nproc=1,
         min_stars=None,
         log_fn=None,
-        log_label="stage1",
+        log_label="finding galaxies",
     )
 
     assert state is direct_state
@@ -158,7 +158,7 @@ def test_rank0_prepare_stage12_sets_velocity_linking_length(monkeypatch, tmp_pat
     assert payloads[10]["task"]["node_id"] == 10
 
 
-def test_stage2_shard_payload_uses_table_format():
+def test_reconciled_galaxy_shard_payload_uses_table_format():
     records = [
         {
             "AHF_haloID": 10,
@@ -173,7 +173,7 @@ def test_stage2_shard_payload_uses_table_format():
             "dlist": np.asarray([], dtype=np.int32),
         }
     ]
-    payload = mpi_mod._stage2_shard_payload(records)
+    payload = mpi_mod._reconciled_galaxy_shard_payload(records)
     assert isinstance(payload, dict)
     assert "ahf_halo_id" in payload
     restored = mpi_mod.candidate_records_from_table_payload(payload)
@@ -187,14 +187,14 @@ def test_rank0_log_includes_total_and_stage_elapsed(monkeypatch, capsys):
     monkeypatch.setattr(mpi_mod.time, "monotonic", lambda: next(ticks))
     mpi_mod._reset_rank0_log_context(now=100.0)
 
-    mpi_mod._rank0_log("stage1: start")
-    mpi_mod._rank0_log("stage1: progress")
-    mpi_mod._rank0_log("stage2: start")
+    mpi_mod._rank0_log("finding galaxies: start")
+    mpi_mod._rank0_log("finding galaxies: progress")
+    mpi_mod._rank0_log("reconciling subhalos: start")
 
     lines = [line for line in capsys.readouterr().out.strip().splitlines() if line]
-    assert "[total=0.0s][stage1=0.0s] stage1: start" in lines[0]
-    assert "[total=5.0s][stage1=5.0s] stage1: progress" in lines[1]
-    assert "[total=12.0s][stage2=0.0s] stage2: start" in lines[2]
+    assert "[total=0.0s][finding galaxies=0.0s] finding galaxies: start" in lines[0]
+    assert "[total=5.0s][finding galaxies=5.0s] finding galaxies: progress" in lines[1]
+    assert "[total=12.0s][reconciling subhalos=0.0s] reconciling subhalos: start" in lines[2]
 
 
 def test_ancestor_chain_and_task_manifest():
@@ -537,11 +537,11 @@ def test_stateless_batch_fof_and_reconcile_root_payload():
     assert np.array_equal(root_out[0]["slist"], np.array([10, 11], dtype=np.int32))
 
 
-def test_stage1_batch_classification_builds_front_back_regular_queue_and_small_batches():
+def test_galaxy_finding_batch_classification_builds_front_back_regular_queue_and_small_batches():
     t_tiny = subhalo_mod.AHFSubhaloTask(5, 0, 5, 0, tuple(), 8, 100)
     t_small = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 64, 1000)
     t_large = subhalo_mod.AHFSubhaloTask(20, 0, 20, 0, tuple(), 64, 100000)
-    regular_items, small_items = mpi_mod._classify_stage1_batches(
+    regular_items, small_items = mpi_mod._classify_galaxy_finding_batches(
         tasks=[t_tiny, t_small, t_large],
         gpu_worker_count=1,
         cpu_worker_count=1,
@@ -566,7 +566,7 @@ def test_gpu_device_assignment_uses_gpu_worker_order_within_host(monkeypatch):
     assert mpi_mod._gpu_device_for_rank(rank=3, role="cpu_worker", world_layout=layout) is None
 
 
-def test_stage1_shard_payload_serializes_node_candidates():
+def test_galaxy_finding_shard_payload_serializes_node_candidates():
     sim = DummySim(pos=np.zeros((4, 3)), vel=np.zeros((4, 3)))
     task = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 4, 10)
     gal = subhalo_mod._build_candidate_group(
@@ -577,19 +577,19 @@ def test_stage1_shard_payload_serializes_node_candidates():
         bh_sel=np.array([], dtype=np.int32),
         dm_sel=np.array([], dtype=np.int32),
     )
-    payload = mpi_mod._stage1_shard_payload({10: [gal]})
+    payload = mpi_mod._galaxy_finding_shard_payload({10: [gal]})
     assert list(payload.keys()) == [10]
     assert int(payload[10][0]["AHF_haloID"]) == 10
     assert np.array_equal(payload[10][0]["slist"], np.array([1, 2], dtype=np.int32))
 
 
-def test_materialize_stage1_batch_item_writes_payload_on_assignment(tmp_path):
+def test_materialize_galaxy_finding_batch_item_writes_payload_on_assignment(tmp_path):
     task = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 4, 10)
     batch = subhalo_mod.AHFSubhaloBatch(tasks=(task,), is_tiny_batch=False, target_backend="cpu", estimated_cost=10)
     payload_path = tmp_path / "stage1_input_regular_000000.pkl"
     assert not payload_path.exists()
 
-    item = mpi_mod._materialize_stage1_batch_item(
+    item = mpi_mod._materialize_galaxy_finding_batch_item(
         shard_root=tmp_path,
         batch=batch,
         prefix="regular",
@@ -655,7 +655,8 @@ def test_dispatch_stage_assigns_regular_front_and_back_with_small_queue(monkeypa
         ],
         regular_queue=["r0", "r1", "r2"],
         small_queue=["s0"],
-        stage_name="stage1",
+        stage_name="finding_galaxies",
+        display_name="finding galaxies",
         prepare_regular=prepare_regular,
         prepare_small=prepare_small,
         regular_total=3,
@@ -671,8 +672,8 @@ def test_dispatch_stage_assigns_regular_front_and_back_with_small_queue(monkeypa
     assert second["items"][0]["payload_path"] == "small_s0.pkl"
     assert second["items"][1]["payload_path"] == "cpu_r2.pkl"
     assert third["payload_path"] == "gpu_r1.pkl"
-    assert any("stage1: starting" in msg for msg in logs)
-    assert any("stage1: complete" in msg for msg in logs)
+    assert any("finding galaxies: starting" in msg for msg in logs)
+    assert any("finding galaxies: complete" in msg for msg in logs)
 
 
 def test_dispatch_stage_bundles_cpu_items_by_rank_threads(monkeypatch):
@@ -713,7 +714,8 @@ def test_dispatch_stage_bundles_cpu_items_by_rank_threads(monkeypatch):
         worker_caps=[mpi_mod.WorkerCapability(rank=1, role="cpu_worker", hostname="nodeA", local_rank=0, gpu_device=None, threads=2)],
         regular_queue=[],
         small_queue=cpu_items,
-        stage_name="stage1",
+        stage_name="finding_galaxies",
+        display_name="finding galaxies",
         regular_total=0,
         small_total=3,
     )
@@ -763,7 +765,8 @@ def test_dispatch_stage_honors_thread_and_role_overrides(monkeypatch):
         worker_caps=[mpi_mod.WorkerCapability(rank=1, role="gpu_worker", hostname="nodeA", local_rank=0, gpu_device=0, threads=2)],
         regular_queue=[],
         small_queue=cpu_items,
-        stage_name="stage2",
+        stage_name="reconciling_subhalos",
+        display_name="reconciling subhalos",
         regular_total=0,
         small_total=4,
         worker_threads={1: 3},
@@ -835,7 +838,7 @@ def test_stage1_thread_map_preserves_gpu_support_threads():
     assert sum(gpu_vals) + sum(cpu_vals) == 31
 
 
-def test_worker_run_stage1_bundles_multiple_items(tmp_path):
+def test_worker_run_finding_galaxies_bundles_multiple_items(tmp_path):
     task_a = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 2, 2)
     task_b = subhalo_mod.AHFSubhaloTask(20, 0, 20, 0, tuple(), 2, 2)
     batch_a = subhalo_mod.AHFSubhaloBatch(tasks=(task_a,), is_tiny_batch=False, target_backend="cpu", estimated_cost=2)
@@ -881,7 +884,7 @@ def test_worker_run_stage1_bundles_multiple_items(tmp_path):
     mpi_mod._dump_pickle(path_a, payload_a)
     mpi_mod._dump_pickle(path_b, payload_b)
 
-    result = mpi_mod._worker_run_stage1(
+    result = mpi_mod._worker_run_finding_galaxies(
         item={
             "items": [
                 {"payload_path": str(path_a), "backend": "cpu"},

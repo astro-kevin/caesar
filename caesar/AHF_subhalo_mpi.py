@@ -65,7 +65,7 @@ from caesar.ahf_subhalo_tables import (
     candidate_records_from_table_payload,
     candidate_records_to_table,
 )
-from caesar.ahf_subhalo_export import stream_save_stage3_catalogue
+from caesar.ahf_subhalo_export import write_catalogue_from_property_shards
 from caesar.fubar import get_b as _get_b
 from caesar.fubar import get_mean_interparticle_separation as _get_mean_interparticle_separation
 from caesar.group import get_min_stars
@@ -477,7 +477,7 @@ def _load_pickle(path: Path):
         return pickle.load(fh)
 
 
-def _stage1_shard_payload(results_by_node: Dict[int, List]) -> Dict[int, List[dict]]:
+def _galaxy_finding_shard_payload(results_by_node: Dict[int, List]) -> Dict[int, List[dict]]:
     out = {}
     for node_id, gals in results_by_node.items():
         out[int(node_id)] = [
@@ -487,7 +487,7 @@ def _stage1_shard_payload(results_by_node: Dict[int, List]) -> Dict[int, List[di
     return out
 
 
-def _stage2_shard_payload(galaxies: Sequence) -> List[dict]:
+def _reconciled_galaxy_shard_payload(galaxies: Sequence) -> List[dict]:
     records = [gal if isinstance(gal, dict) else _serialize_candidate_group(gal) for gal in galaxies]
     return candidate_records_to_table(records).to_payload()
 
@@ -521,7 +521,7 @@ def _prepare_manifest(
     return tasks, tasks_by_root, node_npart, node_nstar
 
 
-def _classify_stage1_batches(
+def _classify_galaxy_finding_batches(
     *,
     tasks: Sequence[AHFSubhaloTask],
     gpu_worker_count: int,
@@ -604,10 +604,9 @@ def _rank0_log_stage_name(message: str) -> Optional[str]:
     if ":" not in str(message):
         return None
     token = str(message).split(":", 1)[0].strip()
-    if not token or " " in token:
+    if not token:
         return None
-    normalized = token.replace("_", "").replace("-", "")
-    return token if normalized.isalnum() else None
+    return token
 
 
 def _rank0_log(message: str) -> None:
@@ -713,7 +712,7 @@ def _stage_queue(source, *, total: Optional[int] = None) -> _StageQueue:
 
 
 def _cpu_local_workers(cap: WorkerCapability, *, stage_name: str, threads: Optional[int] = None) -> int:
-    if str(cap.role) != "cpu_worker" or str(stage_name) not in {"stage1", "stage2"}:
+    if str(cap.role) != "cpu_worker" or str(stage_name) not in {"finding_galaxies", "reconciling_subhalos"}:
         return max(1, int(threads if threads is not None else cap.threads))
     default = max(1, int(threads if threads is not None else cap.threads))
     configured = max(
@@ -770,6 +769,7 @@ def _dispatch_stage(
     regular_queue,
     small_queue,
     stage_name: str,
+    display_name: Optional[str] = None,
     prepare_regular=None,
     prepare_small=None,
     regular_total: Optional[int] = None,
@@ -807,6 +807,7 @@ def _dispatch_stage(
     def log_progress(prefix: str) -> None:
         elapsed = time.monotonic() - start_time
         queued_remaining = int(regular_state.remaining) + int(small_state.remaining)
+        shown_name = str(display_name if display_name is not None else stage_name)
         metrics = [
             (str(metric.label), int(metric_counts[str(metric.label)]), metric_totals[str(metric.label)])
             for metric in metric_defs
@@ -820,7 +821,7 @@ def _dispatch_stage(
         )
         _rank0_log(
             _progress_message(
-                label=f"{stage_name}: {prefix}",
+                label=f"{shown_name}: {prefix}",
                 completed=completed,
                 total=total_items,
                 unit=progress_unit,
@@ -855,7 +856,7 @@ def _dispatch_stage(
                 prepare_regular=prepare_regular or (lambda raw, **_: raw),
                 use_regular_back=bool(has_gpu_workers),
             )
-        elif stage_role == "prop_worker":
+        elif stage_role == "property_worker":
             raw = small_state.next_front()
             if raw is not None:
                 item = prepare_small(raw, cap=cap, direction="small") if prepare_small else raw
@@ -950,7 +951,7 @@ def _direct_fof_linking_length(snapshot) -> float:
     return float(mis * b_galaxy)
 
 
-def _rank0_prepare_stage12(
+def _rank0_prepare_galaxy_finding(
     *,
     snapshot_file: str,
     ahf_particles_file: str,
@@ -1075,7 +1076,7 @@ def _rank0_prepare_stage12(
     return direct_state, pid_maps_sel, int(ms), float(fof_ll), fof_vel_ll, tasks, tasks_by_root, task_payloads_by_node
 
 
-def _materialize_stage1_batch_item(
+def _materialize_galaxy_finding_batch_item(
     *,
     shard_root: Path,
     batch: AHFSubhaloBatch,
@@ -1105,7 +1106,7 @@ def _materialize_stage1_batch_item(
     }
 
 
-def _write_stage2_root_payloads(
+def _write_reconciliation_root_payloads(
     *,
     shard_root: Path,
     tasks_by_root: Dict[int, List[AHFSubhaloTask]],
@@ -1153,7 +1154,7 @@ def _write_stage2_root_payloads(
     return root_payload_paths
 
 
-def _worker_run_stage1(
+def _worker_run_finding_galaxies(
     *,
     item: Dict,
     fof_ll: float,
@@ -1182,7 +1183,7 @@ def _worker_run_stage1(
             device_id=one_item.get("device_id", batch.target_device),
         )
         return {
-            "results": _stage1_shard_payload(results),
+            "results": _galaxy_finding_shard_payload(results),
             "node_ids": [int(t.node_id) for t in batch.tasks],
             "root_ids": sorted({int(t.top_id) for t in batch.tasks}),
             "input_payload_path": str(one_item["payload_path"]),
@@ -1221,7 +1222,7 @@ def _worker_run_stage1(
     }
 
 
-def _worker_run_stage2(
+def _worker_run_reconciling_subhalos(
     *,
     item: Dict,
     fof_ll: float,
@@ -1292,7 +1293,7 @@ def _worker_run_stage2(
         total_count += int(out["count"])
 
     shard_path = shard_dir / f"stage2_rank{os.getpid()}_{abs(hash(tuple(sorted(root_ids))))}.pkl"
-    _dump_pickle(shard_path, _stage2_shard_payload(galaxies_payload))
+    _dump_pickle(shard_path, _reconciled_galaxy_shard_payload(galaxies_payload))
     return {
         "stage": "stage2",
         "shard_path": str(shard_path),
@@ -1344,7 +1345,40 @@ def _stage3_state_list_data(state: Dict, name: str):
     return state.get(f"_{name}", [])
 
 
-def _build_stage3_summary(halo_states: Sequence[Dict], galaxy_states: Sequence[Dict]) -> Dict[str, object]:
+def _stage3_pop_list_data(state: Dict, name: str) -> np.ndarray:
+    if name in state:
+        return np.asarray(state.pop(name))
+    return np.asarray(state.pop(f"_{name}", []))
+
+
+def _build_property_list_blocks(states: Sequence[Dict], list_names: Sequence[str]) -> Dict[str, Dict[str, object]]:
+    blocks: Dict[str, Dict[str, object]] = {}
+    owner_ids = np.asarray([int(state["id"]) for state in states], dtype=np.int64)
+    for name in list_names:
+        lengths = np.zeros(len(states), dtype=np.int64)
+        parts = []
+        dtype_str = None
+        for idx, state in enumerate(states):
+            arr = _stage3_pop_list_data(state, name)
+            lengths[idx] = int(arr.size)
+            if arr.size > 0:
+                if dtype_str is None:
+                    dtype_str = arr.dtype.str
+                parts.append(np.asarray(arr))
+        if parts:
+            data = np.concatenate(parts)
+        else:
+            data = np.empty(0, dtype=np.int64)
+        blocks[str(name)] = {
+            "owner_id": owner_ids.copy(),
+            "lengths": lengths,
+            "data": np.asarray(data),
+            "dtype": dtype_str,
+        }
+    return blocks
+
+
+def _build_property_shard_summary(halo_states: Sequence[Dict], galaxy_states: Sequence[Dict]) -> Dict[str, object]:
     halo_list_names = ("dmlist", "glist", "slist", "bhlist", "dlist")
     galaxy_list_names = ("glist", "slist", "bhlist", "dlist", "cloud_index_list", "AHF_ancestor_haloIDs")
 
@@ -1445,7 +1479,7 @@ def _build_stage3_summary(halo_states: Sequence[Dict], galaxy_states: Sequence[D
     }
 
 
-def _worker_run_stage3(
+def _worker_run_calculating_properties(
     *,
     item: Dict,
     shard_dir: Path,
@@ -1460,12 +1494,20 @@ def _worker_run_stage3(
 
     halo_states = [_serialize_group_state(group, id_key="_merge_id") for group in sim.halo_list]
     galaxy_states = [_serialize_group_state(group, id_key="_merge_id") for group in sim.galaxy_list]
+    summary = _build_property_shard_summary(halo_states, galaxy_states)
+    halo_list_blocks = _build_property_list_blocks(halo_states, ("dmlist", "glist", "slist", "bhlist", "dlist"))
+    galaxy_list_blocks = _build_property_list_blocks(
+        galaxy_states,
+        ("glist", "slist", "bhlist", "dlist", "cloud_index_list", "AHF_ancestor_haloIDs"),
+    )
     shard_path = shard_dir / f"stage3_rank{os.getpid()}_{abs(hash(str(item.get('payload_path'))))}.pkl"
     _dump_pickle(
         shard_path,
         {
             "halos": halo_states,
             "galaxies": galaxy_states,
+            "halo_lists": halo_list_blocks,
+            "galaxy_lists": galaxy_list_blocks,
         },
     )
     return {
@@ -1473,7 +1515,7 @@ def _worker_run_stage3(
         "shard_path": str(shard_path),
         "count_halos": int(len(sim.halo_list)),
         "count_galaxies": int(len(sim.galaxy_list)),
-        "summary": _build_stage3_summary(halo_states, galaxy_states),
+        "summary": summary,
     }
 
 
@@ -1558,7 +1600,7 @@ def _rank0_build_final_sim(
     return sim
 
 
-def _rank0_run_stage3_and_save(
+def _rank0_calculate_properties_and_write(
     comm,
     *,
     worker_caps: Sequence[WorkerCapability],
@@ -1575,9 +1617,9 @@ def _rank0_run_stage3_and_save(
 ):
     if isinstance(sim, AHFSubhaloDirectState):
         direct_state = sim
-        _rank0_log("stage3: reusing in-memory direct shard runtime")
+        _rank0_log("calculating properties: reusing in-memory direct shard runtime")
     else:
-        _rank0_log("stage3: rebuilding direct shard runtime")
+        _rank0_log("calculating properties: rebuilding in-memory direct shard runtime")
         direct_state = build_direct_state(snapshot_file, ahf_particles_file)
 
     final_galaxies = []
@@ -1604,12 +1646,42 @@ def _rank0_run_stage3_and_save(
     stage3_cpu_items = []
     halo_batches = _build_stage3_batches(sim, len(worker_caps))
     _rank0_log(
-        f"stage3: prepared property batches count={len(halo_batches)} halos={len(sim.halo_list)} galaxies={len(sim.galaxy_list)}"
+        f"calculating properties: prepared property batches count={len(halo_batches)} halos={len(sim.halo_list)} galaxies={len(sim.galaxy_list)}"
     )
-    for ibatch, batch in enumerate(halo_batches):
-        payload_path = shard_root / f"stage3_input_{ibatch:05d}.pkl"
+    prep_start = time.monotonic()
+
+    def _materialize_stage3_payload(spec):
+        ibatch, batch = spec
+        payload_path = shard_root / f"stage3_input_{int(ibatch):05d}.pkl"
         _dump_pickle(payload_path, _build_stage3_property_payload(sim, batch))
-        stage3_cpu_items.append({"payload_path": str(payload_path)})
+        return int(ibatch), {"payload_path": str(payload_path)}
+
+    prep_workers = max(
+        1,
+        _env_int(
+            "CAESAR_AHF_SUBHALO_STAGE3_PREP_WORKERS",
+            min(8, max(1, len(halo_batches))),
+        ),
+    )
+    if len(halo_batches) > 1 and prep_workers > 1:
+        prepared = {}
+        with ThreadPoolExecutor(max_workers=int(prep_workers)) as executor:
+            futures = [
+                executor.submit(_materialize_stage3_payload, (ibatch, batch))
+                for ibatch, batch in enumerate(halo_batches)
+            ]
+            for fut in as_completed(futures):
+                ibatch, item = fut.result()
+                prepared[int(ibatch)] = item
+        stage3_cpu_items = [prepared[idx] for idx in range(len(halo_batches))]
+    else:
+        for ibatch, batch in enumerate(halo_batches):
+            _idx, item = _materialize_stage3_payload((ibatch, batch))
+            stage3_cpu_items.append(item)
+    _rank0_log(
+        f"calculating properties: payload materialization complete batches={len(stage3_cpu_items)} "
+        f"elapsed={time.monotonic() - prep_start:.1f}s workers={prep_workers}"
+    )
 
     snapshot_meta = direct_state.snapshot
     total_stage3_halos = int(len(sim.halo_list))
@@ -1624,24 +1696,25 @@ def _rank0_run_stage3_and_save(
         worker_caps=worker_caps,
         regular_queue=[],
         small_queue=stage3_cpu_items,
-        stage_name="stage3",
+        stage_name="calculating_properties",
+        display_name="calculating properties",
         regular_total=0,
         small_total=len(stage3_cpu_items),
         worker_threads=worker_threads,
-        worker_roles={int(cap.rank): "prop_worker" for cap in worker_caps},
+        worker_roles={int(cap.rank): "property_worker" for cap in worker_caps},
         progress_unit="batches",
         progress_metrics=[
             ProgressMetric("halos", "count_halos", total=total_stage3_halos),
             ProgressMetric("galaxies", "count_galaxies", total=total_stage3_galaxies),
         ],
     )
-    _rank0_log("stage4: coordinator beginning final export")
-    stream_save_stage3_catalogue(
+    _rank0_log("writing: coordinator beginning final export")
+    write_catalogue_from_property_shards(
         snapshot_meta=snapshot_meta,
-        stage3_results=stage3_results,
+        property_results=stage3_results,
         output_file=output_file,
         log_fn=_rank0_log,
-        stage_label="stage4",
+        stage_label="writing",
     )
 
 
@@ -1738,13 +1811,19 @@ def run_mpi(
     role: str = "auto",
     min_stars: Optional[int] = None,
     shard_dir: Optional[str] = None,
-    phase: str = "stage1",
+    phase: str = "finding_galaxies",
 ) -> None:
     if MPI is None:
         raise RuntimeError("mpi4py is required for AHF-subhalo MPI execution")
 
     phase = str(phase)
-    if phase not in {"stage1", "stage2", "stage3", "stage12", "pipeline"}:
+    phase = {
+        "stage1": "finding_galaxies",
+        "stage2": "reconciling_subhalos",
+        "stage3": "calculating_properties",
+        "stage12": "grouping_pipeline",
+    }.get(phase, phase)
+    if phase not in {"finding_galaxies", "reconciling_subhalos", "calculating_properties", "grouping_pipeline", "pipeline"}:
         raise ValueError(f"Unsupported AHF-subhalo MPI phase: {phase}")
 
     comm = MPI.COMM_WORLD
@@ -1754,12 +1833,12 @@ def run_mpi(
         raise RuntimeError("AHF-subhalo MPI requires at least 2 ranks (1 coordinator + workers)")
 
     role = str(role)
-    if phase in {"stage1", "stage12", "pipeline"}:
+    if phase in {"finding_galaxies", "grouping_pipeline", "pipeline"}:
         valid_roles = {"coordinator", "gpu_worker", "cpu_worker", "auto"}
-    elif phase == "stage2":
+    elif phase == "reconciling_subhalos":
         valid_roles = {"coordinator", "cpu_worker", "auto"}
     else:
-        valid_roles = {"coordinator", "prop_worker", "auto"}
+        valid_roles = {"coordinator", "property_worker", "auto"}
     if role not in valid_roles:
         raise ValueError(f"Unsupported AHF-subhalo MPI role for {phase}: {role}")
 
@@ -1777,12 +1856,12 @@ def run_mpi(
     if role == "auto":
         if int(rank) == int(coordinator_rank):
             effective_role = "coordinator"
-        elif phase in {"stage1", "stage12", "pipeline"}:
+        elif phase in {"finding_galaxies", "grouping_pipeline", "pipeline"}:
             effective_role = "gpu_worker" if _available_gpu_device_ids() else "cpu_worker"
-        elif phase == "stage2":
+        elif phase == "reconciling_subhalos":
             effective_role = "cpu_worker"
         else:
-            effective_role = "prop_worker"
+            effective_role = "property_worker"
 
     world_layout = comm.allgather(
         {
@@ -1799,9 +1878,9 @@ def run_mpi(
         shard_root.mkdir(parents=True, exist_ok=True)
     shard_root = Path(comm.bcast(str(shard_root), root=coordinator_rank))
 
-    if phase in {"stage1", "stage12", "pipeline"}:
+    if phase in {"finding_galaxies", "grouping_pipeline", "pipeline"}:
         if effective_role == "coordinator":
-            stage_label = "stage12" if phase == "stage12" else "stage1"
+            stage_label = "grouping pipeline" if phase == "grouping_pipeline" else "finding galaxies"
             coordinator_label = "pipeline" if phase == "pipeline" else stage_label
             _rank0_log(f"{coordinator_label}: coordinator starting on shard_root={shard_root}")
             worker_ranks = [i for i in range(size) if int(i) != int(coordinator_rank)]
@@ -1824,7 +1903,7 @@ def run_mpi(
                 tasks,
                 tasks_by_root,
                 task_payloads_by_node,
-            ) = _rank0_prepare_stage12(
+            ) = _rank0_prepare_galaxy_finding(
                 snapshot_file=snapshot_file,
                 ahf_particles_file=ahf_particles_file,
                 shard_root=shard_root,
@@ -1838,7 +1917,7 @@ def run_mpi(
                 f"tasks={len(tasks)}, roots={len(tasks_by_root)}, min_stars={int(min_stars_val)}"
             )
 
-            regular_batches, small_batches = _classify_stage1_batches(
+            regular_batches, small_batches = _classify_galaxy_finding_batches(
                 tasks=tasks,
                 gpu_worker_count=int(gpu_worker_count),
                 cpu_worker_count=int(cpu_worker_count),
@@ -1848,9 +1927,9 @@ def run_mpi(
                 world_layout=world_layout,
                 coordinator_rank=coordinator_rank,
             )
-            _log_thread_map("stage1", worker_caps, stage1_thread_map)
+            _log_thread_map("finding galaxies", worker_caps, stage1_thread_map)
             _rank0_log(
-                "stage1: classified batches "
+                "finding galaxies: classified batches "
                 f"regular={len(regular_batches)}, small={len(small_batches)}, total={len(regular_batches) + len(small_batches)}"
             )
             stage1_regular_specs = [
@@ -1863,7 +1942,7 @@ def run_mpi(
             ]
 
             def _materialize_stage1_regular_spec(spec, direction):
-                return _materialize_stage1_batch_item(
+                return _materialize_galaxy_finding_batch_item(
                     shard_root=shard_root,
                     batch=spec["batch"],
                     prefix="regular",
@@ -1877,7 +1956,7 @@ def run_mpi(
                 )
 
             def _materialize_stage1_small_spec(spec, direction):
-                return _materialize_stage1_batch_item(
+                return _materialize_galaxy_finding_batch_item(
                     shard_root=shard_root,
                     batch=spec["batch"],
                     prefix="small",
@@ -1899,7 +1978,7 @@ def run_mpi(
 
             buffer_scale = max(1, _env_int("CAESAR_AHF_SUBHALO_MPI_STAGE1_BUFFER_SCALE", 4))
             stage1_cpu_capacity = sum(
-                _cpu_local_workers(cap, stage_name="stage1", threads=int(stage1_thread_map.get(int(cap.rank), cap.threads)))
+                _cpu_local_workers(cap, stage_name="finding_galaxies", threads=int(stage1_thread_map.get(int(cap.rank), cap.threads)))
                 for cap in worker_caps
                 if cap.gpu_device is None
             )
@@ -1925,7 +2004,8 @@ def run_mpi(
                 worker_caps=worker_caps,
                 regular_queue=stage1_regular_queue,
                 small_queue=stage1_small_queue,
-                stage_name="stage1",
+                stage_name="finding_galaxies",
+                display_name="finding galaxies",
                 prepare_regular=_bind_stage1_item,
                 prepare_small=_bind_stage1_item,
                 regular_total=len(stage1_regular_specs),
@@ -1942,17 +2022,17 @@ def run_mpi(
                 for root_id in result["root_ids"]:
                     root_to_shards[int(root_id)].append(str(result["shard_path"]))
             _rank0_log(
-                "stage1: result aggregation complete "
+                "finding galaxies: result aggregation complete "
                 f"roots_with_shards={sum(1 for paths in root_to_shards.values() if paths)}"
             )
 
-            _rank0_log(f"stage2: writing root payloads for {len(tasks_by_root)} roots")
-            root_payload_paths = _write_stage2_root_payloads(
+            _rank0_log(f"reconciling subhalos: writing root payloads for {len(tasks_by_root)} roots")
+            root_payload_paths = _write_reconciliation_root_payloads(
                 shard_root=shard_root,
                 tasks_by_root=tasks_by_root,
                 task_payloads_by_node=task_payloads_by_node,
                 log_fn=_rank0_log,
-                progress_label="stage2",
+                progress_label="reconciling subhalos",
             )
             root_costs = {
                 int(root_id): int(sum(int(task.fof_candidates) for task in root_tasks))
@@ -1971,9 +2051,9 @@ def run_mpi(
                 root_to_shards=root_to_shards,
                 root_costs=root_costs,
             )
-            _rank0_log("stage1: wrote stage2 manifest")
+            _rank0_log("finding galaxies: wrote reconciliation manifest")
 
-            if phase == "stage1":
+            if phase == "finding_galaxies":
                 _stop_workers(comm, worker_caps=worker_caps)
                 return
 
@@ -1997,9 +2077,9 @@ def run_mpi(
                 )
                 stage2_thread_map = {int(cap.rank): int(cap.threads) for cap in worker_caps}
                 stage2_worker_roles = {int(cap.rank): str(cap.role) for cap in worker_caps}
-            _log_thread_map("stage2", worker_caps, stage2_thread_map)
+            _log_thread_map("reconciling subhalos", worker_caps, stage2_thread_map)
             _rank0_log(
-                "stage2: classified roots "
+                "reconciling subhalos: classified roots "
                 f"regular={len(stage2_regular_roots)}, small={len(stage2_small_roots)}, total={len(stage2_regular_roots) + len(stage2_small_roots)}"
             )
 
@@ -2020,7 +2100,8 @@ def run_mpi(
                 worker_caps=worker_caps,
                 regular_queue=stage2_regular_roots,
                 small_queue=stage2_small_roots,
-                stage_name="stage2",
+                stage_name="reconciling_subhalos",
+                display_name="reconciling subhalos",
                 prepare_regular=_prepare_stage2_root,
                 prepare_small=_prepare_stage2_root,
                 regular_total=len(stage2_regular_roots),
@@ -2033,7 +2114,7 @@ def run_mpi(
                 ],
             )
             final_shards = [str(result["shard_path"]) for result in stage2_results]
-            _rank0_log(f"stage2: complete; final_shards={len(final_shards)}")
+            _rank0_log(f"reconciling subhalos: complete; final_shards={len(final_shards)}")
 
             if phase == "pipeline":
                 stage3_thread_map = _build_uniform_stage_thread_map(
@@ -2041,8 +2122,8 @@ def run_mpi(
                     world_layout=world_layout,
                     coordinator_rank=coordinator_rank,
                 )
-                _log_thread_map("stage3", worker_caps, stage3_thread_map)
-                _rank0_run_stage3_and_save(
+                _log_thread_map("calculating properties", worker_caps, stage3_thread_map)
+                _rank0_calculate_properties_and_write(
                     comm,
                     worker_caps=worker_caps,
                     snapshot_file=snapshot_file,
@@ -2068,7 +2149,7 @@ def run_mpi(
                 final_shards=final_shards,
                 snapshot_hash=getattr(sim_runtime, "hash", None),
             )
-            _rank0_log("stage12: wrote stage3 manifest")
+            _rank0_log("grouping pipeline: wrote property manifest")
             return
 
         cap = _worker_capability(
@@ -2089,8 +2170,8 @@ def run_mpi(
 
             stage = str(msg["stage"])
             item = msg["item"]
-            if stage == "stage1":
-                result = _worker_run_stage1(
+            if stage == "finding_galaxies":
+                result = _worker_run_finding_galaxies(
                     item=item,
                     fof_ll=float(item["fof_ll"]),
                     fof_vel_ll=item.get("fof_vel_ll"),
@@ -2098,8 +2179,8 @@ def run_mpi(
                     shard_dir=shard_root,
                     nproc=int(cap.threads),
                 )
-            elif stage == "stage2":
-                result = _worker_run_stage2(
+            elif stage == "reconciling_subhalos":
+                result = _worker_run_reconciling_subhalos(
                     item=item,
                     fof_ll=float(item["fof_ll"]),
                     fof_vel_ll=item.get("fof_vel_ll"),
@@ -2107,8 +2188,8 @@ def run_mpi(
                     shard_dir=shard_root,
                     nproc=int(cap.threads),
                 )
-            elif stage == "stage3":
-                result = _worker_run_stage3(
+            elif stage == "calculating_properties":
+                result = _worker_run_calculating_properties(
                     item=item,
                     shard_dir=shard_root,
                     nproc=int(cap.threads),
@@ -2119,15 +2200,15 @@ def run_mpi(
             comm.send(result, dest=coordinator_rank, tag=MSG_RESULT)
         return
 
-    if phase == "stage2":
+    if phase == "reconciling_subhalos":
         if effective_role == "coordinator":
-            _rank0_log(f"stage2: coordinator starting on shard_root={shard_root}")
+            _rank0_log(f"reconciling subhalos: coordinator starting on shard_root={shard_root}")
             worker_ranks = [i for i in range(size) if int(i) != int(coordinator_rank)]
             worker_caps = [comm.recv(source=i, tag=MSG_REGISTER) for i in worker_ranks]
             worker_caps = [WorkerCapability(**cap) if isinstance(cap, dict) else cap for cap in worker_caps]
             cpu_worker_count = len(worker_caps)
             _rank0_log(
-                "stage2: workers registered "
+                "reconciling subhalos: workers registered "
                 f"cpu={cpu_worker_count}, total={len(worker_caps)}"
             )
 
@@ -2155,7 +2236,7 @@ def run_mpi(
             )
             _log_thread_map("stage2", worker_caps, stage2_thread_map)
             _rank0_log(
-                "stage2: classified roots "
+                "reconciling subhalos: classified roots "
                 f"regular={len(stage2_regular_roots)}, small={len(stage2_small_roots)}, total={len(stage2_regular_roots) + len(stage2_small_roots)}"
             )
 
@@ -2176,7 +2257,8 @@ def run_mpi(
                 worker_caps=worker_caps,
                 regular_queue=stage2_regular_roots,
                 small_queue=stage2_small_roots,
-                stage_name="stage2",
+                stage_name="reconciling_subhalos",
+                display_name="reconciling subhalos",
                 prepare_regular=_prepare_stage2_root,
                 prepare_small=_prepare_stage2_root,
                 regular_total=len(stage2_regular_roots),
@@ -2190,7 +2272,7 @@ def run_mpi(
             )
             _stop_workers(comm, worker_caps=worker_caps)
             final_shards = [str(result["shard_path"]) for result in stage2_results]
-            _rank0_log(f"stage2: complete; final_shards={len(final_shards)}")
+            _rank0_log(f"reconciling subhalos: complete; final_shards={len(final_shards)}")
             _write_stage3_manifest(
                 shard_root=shard_root,
                 snapshot_file=str(manifest.get("snapshot_file", snapshot_file)),
@@ -2199,7 +2281,7 @@ def run_mpi(
                 final_shards=final_shards,
                 snapshot_hash=manifest.get("snapshot_hash"),
             )
-            _rank0_log("stage2: wrote stage3 manifest")
+            _rank0_log("reconciling subhalos: wrote property manifest")
             return
 
         cap = _worker_capability(
@@ -2220,7 +2302,7 @@ def run_mpi(
             if str(msg["stage"]) != "stage2":
                 raise RuntimeError(f"Unexpected stage-2 MPI message: {msg}")
             item = msg["item"]
-            result = _worker_run_stage2(
+            result = _worker_run_reconciling_subhalos(
                 item=item,
                 fof_ll=float(item["fof_ll"]),
                 fof_vel_ll=item.get("fof_vel_ll"),
@@ -2242,7 +2324,7 @@ def run_mpi(
             coordinator_rank=coordinator_rank,
         )
         _log_thread_map("stage3", worker_caps, stage3_thread_map)
-        _rank0_run_stage3_and_save(
+        _rank0_calculate_properties_and_write(
             comm,
             worker_caps=worker_caps,
             snapshot_file=str(manifest.get("snapshot_file", snapshot_file)),
@@ -2274,7 +2356,7 @@ def run_mpi(
             raise RuntimeError(f"Unexpected MPI message: {msg}")
         if str(msg["stage"]) != "stage3":
             raise RuntimeError(f"Unexpected property-stage MPI message: {msg}")
-        result = _worker_run_stage3(item=msg["item"], shard_dir=shard_root, nproc=int(cap.threads))
+        result = _worker_run_calculating_properties(item=msg["item"], shard_dir=shard_root, nproc=int(cap.threads))
         comm.send(result, dest=coordinator_rank, tag=MSG_RESULT)
 
 
@@ -2294,8 +2376,8 @@ def main():
         "--role",
         type=str,
         default="auto",
-        choices=("auto", "coordinator", "gpu_worker", "cpu_worker", "prop_worker"),
-        help="MPI rank role; stage12 uses coordinator/gpu_worker/cpu_worker, stage3 uses coordinator/prop_worker",
+        choices=("auto", "coordinator", "gpu_worker", "cpu_worker", "property_worker"),
+        help="MPI rank role; finding_galaxies/grouping_pipeline use coordinator/gpu_worker/cpu_worker, calculating_properties uses coordinator/property_worker",
     )
     parser.add_argument("--nproc", type=int, default=1, help="Per-rank CAESAR nproc/thread budget")
     parser.add_argument("--min-stars", type=int, default=None, help="Minimum stars per galaxy")
