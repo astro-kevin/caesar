@@ -1656,6 +1656,7 @@ def _worker_run_reconciling_subhalos(
                 raise RuntimeError(
                     f"Failed to rebuild task payload from store for root {root_id} node {int(task.node_id)}"
                 )
+            task_payload["task"] = _serialize_task(task)
             task_payloads_by_node[int(task.node_id)] = task_payload
         initial_candidates_by_node: Dict[int, List[dict]] = {int(task.node_id): [] for task in root_tasks}
         wanted = set(initial_candidates_by_node.keys())
@@ -1827,6 +1828,22 @@ def _build_calculating_properties_batches(
     return batches
 
 
+def _assign_calculating_properties_merge_offsets(
+    root_results: Sequence[Mapping[str, object]],
+) -> List[Dict[str, object]]:
+    halo_offset = 0
+    galaxy_offset = 0
+    enriched: List[Dict[str, object]] = []
+    for rec in sorted(root_results, key=lambda item: int(item.get("root_id", -1))):
+        out = dict(rec)
+        out["halo_merge_offset"] = int(halo_offset)
+        out["galaxy_merge_offset"] = int(galaxy_offset)
+        halo_offset += int(out.get("halo_count", 0))
+        galaxy_offset += int(out.get("count", 0))
+        enriched.append(out)
+    return enriched
+
+
 def _calculating_properties_state_list_data(state: Dict, name: str):
     private = f"_{name}"
     if private in state:
@@ -1937,19 +1954,23 @@ def _worker_run_calculating_properties(
         for rec in item["roots"]:
             root_id = int(rec["root_id"])
             root_payload = _load_pickle(Path(str(rec["root_payload_path"])))
-            halo_records.extend(
-                [
-                    _build_store_halo_record(store_state, node_id=int(node_id))
-                    for node_id in root_payload.get("halo_node_ids", [])
-                ]
-            )
+            halo_merge_offset = int(rec.get("halo_merge_offset", len(halo_records)))
+            halo_node_ids = [int(node_id) for node_id in root_payload.get("halo_node_ids", [])]
+            for halo_idx, node_id in enumerate(halo_node_ids):
+                halo_record = _build_store_halo_record(store_state, node_id=int(node_id))
+                halo_record["_merge_id"] = int(halo_merge_offset + halo_idx)
+                halo_records.append(halo_record)
             reconciled_payload = _load_pickle(Path(str(rec["shard_path"])))
             galaxies = (
                 candidate_records_from_table_payload(reconciled_payload)
                 if isinstance(reconciled_payload, dict) and "ahf_halo_id" in reconciled_payload
                 else list(reconciled_payload)
             )
-            galaxy_records.extend([dict(v) for v in galaxies])
+            galaxy_merge_offset = int(rec.get("galaxy_merge_offset", len(galaxy_records)))
+            for galaxy_idx, galaxy in enumerate(galaxies):
+                galaxy_record = dict(galaxy)
+                galaxy_record["_merge_id"] = int(galaxy_merge_offset + galaxy_idx)
+                galaxy_records.append(galaxy_record)
             root_ids.append(int(root_id))
         payload = _build_calculating_properties_payload_from_particle_store(
             particle_store,
@@ -2181,7 +2202,9 @@ def _rank0_calculate_properties(
     else:
         snapshot_meta = load_snapshot_meta_store(snapshot_meta_path)
         _rank0_log("calculating properties: using persisted snapshot metadata and worker-side store reads")
-    calculating_properties_root_results = [dict(rec) for rec in root_results if int(rec.get("count", 0)) > 0]
+    calculating_properties_root_results = _assign_calculating_properties_merge_offsets(
+        [dict(rec) for rec in root_results if int(rec.get("count", 0)) > 0]
+    )
     property_batches = _build_calculating_properties_batches(calculating_properties_root_results, len(worker_caps))
     total_halos = int(sum(int(rec.get("halo_count", 0)) for rec in calculating_properties_root_results))
     total_galaxies = int(sum(int(rec.get("count", 0)) for rec in calculating_properties_root_results))

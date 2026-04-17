@@ -1017,7 +1017,18 @@ def test_rank0_calculating_properties_dispatches_root_batches_using_particle_sto
     assert dispatched["small_queue"] == [
         {
             "store_id": "bucket000001",
-            "roots": [dict(rec) for rec in root_results],
+            "roots": [
+                {
+                    **dict(root_results[0]),
+                    "halo_merge_offset": 0,
+                    "galaxy_merge_offset": 0,
+                },
+                {
+                    **dict(root_results[1]),
+                    "halo_merge_offset": 2,
+                    "galaxy_merge_offset": 2,
+                },
+            ],
             "particle_store_path": str(tmp_path / "particle_store_bucket000001.h5"),
             "node_store_path": str(tmp_path / "node_store_bucket000001.pkl"),
         }
@@ -1031,6 +1042,8 @@ def test_worker_run_calculating_properties_reads_root_shards_and_particle_store(
                 "root_id": 10,
                 "root_payload_path": str(tmp_path / "root10_payload.pkl"),
                 "shard_path": str(tmp_path / "root10.pkl"),
+                "halo_merge_offset": 0,
+                "galaxy_merge_offset": 0,
             }
         ],
         "store_id": "10",
@@ -1075,9 +1088,102 @@ def test_worker_run_calculating_properties_reads_root_shards_and_particle_store(
     assert build_calls["particle_store_path"] is fake_particle_store
     assert [int(rec["AHF_haloID"]) for rec in build_calls["halo_records"]] == [10]
     assert [int(rec["AHF_haloID"]) for rec in build_calls["galaxy_records"]] == [101]
+    assert [int(rec["_merge_id"]) for rec in build_calls["halo_records"]] == [0]
+    assert [int(rec["_merge_id"]) for rec in build_calls["galaxy_records"]] == [0]
     assert result["count_halos"] == 0
     assert result["count_galaxies"] == 0
     assert Path(result["shard_path"]).name.startswith("calculating_properties_shard_rank")
+
+
+def test_worker_run_reconciling_subhalos_rebuilds_task_payloads_with_serialized_task(monkeypatch, tmp_path):
+    task = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 2, 2)
+    item = {
+        "root_id": 10,
+        "root_payload_path": str(tmp_path / "root10_payload.pkl"),
+        "shard_paths": [str(tmp_path / "finding_galaxies_shard_root10.pkl")],
+    }
+
+    payloads = {
+        "root10_payload.pkl": {
+            "root_id": 10,
+            "tasks": [subhalo_mod._serialize_task(task)],
+            "halo_node_ids": [10],
+            "halo_count": 1,
+            "particle_store_path": str(tmp_path / "particle_store_root10.h5"),
+            "node_store_path": str(tmp_path / "node_store_root10.pkl"),
+        },
+        "finding_galaxies_shard_root10.pkl": {
+            10: [{"AHF_haloID": 10, "AHF_top_haloID": 10, "slist": np.asarray([1, 2], dtype=np.int64)}],
+        },
+    }
+    monkeypatch.setattr(mpi_mod, "_load_pickle", lambda path: payloads[Path(path).name])
+    monkeypatch.setattr(mpi_mod, "load_particle_store", lambda path: SimpleNamespace(meta="snapshot-meta"))
+    monkeypatch.setattr(mpi_mod, "load_node_store", lambda path: {"nodes": object()})
+    monkeypatch.setattr(
+        mpi_mod,
+        "_build_store_halo_record",
+        lambda state, *, node_id: {"AHF_haloID": int(node_id), "slist": np.empty(0, dtype=np.int64)},
+    )
+
+    def _fake_build_direct_task_payload(state, *, task, fof_nHlim, fof_Tlim, fof_use_sfr_gate):
+        return {
+            "gas_sel": np.empty(0, dtype=np.int32),
+            "star_sel": np.asarray([1, 2], dtype=np.int32),
+            "bh_sel": np.empty(0, dtype=np.int32),
+            "dm_sel": np.empty(0, dtype=np.int32),
+            "ng": 0,
+            "ns": 2,
+            "nb": 0,
+            "eligible_pos": np.asarray([[0.0, 0.0, 0.0], [0.05, 0.0, 0.0]], dtype=np.float64),
+            "eligible_vel": np.zeros((2, 3), dtype=np.float64),
+        }
+
+    monkeypatch.setattr(mpi_mod, "_build_direct_task_payload", _fake_build_direct_task_payload)
+    monkeypatch.setattr(
+        mpi_mod,
+        "_group_record_member_cost",
+        lambda rec: int(np.asarray(rec.get("slist", np.empty(0, dtype=np.int64))).size),
+    )
+
+    captured = {}
+
+    def _fake_reconcile_root_payload(
+        *,
+        tasks,
+        initial_candidates_by_node,
+        task_payloads_by_node,
+        min_stars,
+        fof_ll,
+        fof_vel_ll,
+        backend,
+        cc_backend,
+        max_pairs_per_batch,
+        device_id=None,
+    ):
+        rebuilt = dict(task_payloads_by_node[int(task.node_id)])
+        captured["task_payload"] = rebuilt
+        assert rebuilt["task"] == subhalo_mod._serialize_task(task)
+        assert np.array_equal(np.asarray(rebuilt["star_sel"]), np.asarray([1, 2], dtype=np.int32))
+        return [{"AHF_haloID": 10, "AHF_top_haloID": 10, "slist": np.asarray([1, 2], dtype=np.int64)}]
+
+    monkeypatch.setattr(mpi_mod, "_reconcile_root_payload", _fake_reconcile_root_payload)
+    monkeypatch.setattr(mpi_mod, "_reconciled_galaxy_shard_payload", lambda galaxies: {"galaxies": list(galaxies)})
+    dumped = {}
+    monkeypatch.setattr(mpi_mod, "_dump_pickle", lambda path, payload: dumped.setdefault(Path(path).name, payload))
+
+    result = mpi_mod._worker_run_reconciling_subhalos(
+        item=item,
+        fof_ll=0.1,
+        fof_vel_ll=1.0,
+        min_stars=2,
+        shard_dir=tmp_path,
+        nproc=1,
+    )
+
+    assert captured["task_payload"]["task"] == subhalo_mod._serialize_task(task)
+    assert result["count"] == 1
+    assert result["root_results"][0]["root_id"] == 10
+    assert "reconciling_subhalos_shard_root00000010.pkl" in dumped
 
 
 def test_finding_galaxies_thread_map_preserves_gpu_support_threads():

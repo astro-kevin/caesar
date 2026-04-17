@@ -2004,7 +2004,14 @@ def _task_pool_from_payload(
     *,
     blocked_star_idx: Optional[np.ndarray] = None,
 ) -> Optional[Dict[str, object]]:
-    task = _deserialize_task(task_payload["task"])
+    task_meta = task_payload.get("task")
+    if task_meta is None:
+        payload_keys = ", ".join(sorted(str(k) for k in task_payload.keys()))
+        raise RuntimeError(
+            "AHF-subhalo task payload is missing serialized task metadata; "
+            f"available keys: {payload_keys}"
+        )
+    task = _deserialize_task(task_meta)
     gas_sel = np.asarray(task_payload["gas_sel"], dtype=np.int32)
     star_sel = np.asarray(task_payload["star_sel"], dtype=np.int32)
     bh_sel = np.asarray(task_payload["bh_sel"], dtype=np.int32)
@@ -2423,7 +2430,17 @@ def _fof_on_batch_payload(
 
     for owner_idx, task_payload in enumerate(task_payloads):
         pool = _task_pool_from_payload(task_payload)
-        task = pool["task"] if pool is not None else _deserialize_task(task_payload["task"])
+        if pool is not None:
+            task = pool["task"]
+        else:
+            task_meta = task_payload.get("task")
+            if task_meta is None:
+                payload_keys = ", ".join(sorted(str(k) for k in task_payload.keys()))
+                raise RuntimeError(
+                    "AHF-subhalo batch payload entry is missing serialized task metadata; "
+                    f"available keys: {payload_keys}"
+                )
+            task = _deserialize_task(task_meta)
         out[int(task.node_id)] = []
         if pool is None:
             continue
@@ -2480,7 +2497,16 @@ def _fof_on_batch_payload(
         comp_mask = tags == int(comp)
         owners = np.unique(combined_owner[comp_mask])
         if owners.size != 1:
-            comp_task_ids = [int(_deserialize_task(task_payloads[int(i)]["task"]).node_id) for i in owners.tolist()]
+            comp_task_ids = []
+            for i in owners.tolist():
+                task_meta = task_payloads[int(i)].get("task")
+                if task_meta is None:
+                    payload_keys = ", ".join(sorted(str(k) for k in task_payloads[int(i)].keys()))
+                    raise RuntimeError(
+                        "AHF-subhalo batch payload entry is missing serialized task metadata; "
+                        f"available keys: {payload_keys}"
+                    )
+                comp_task_ids.append(int(_deserialize_task(task_meta).node_id))
             raise AssertionError(
                 "AHF-subhalo invariant violated: graph component spans multiple batched halos "
                 f"{comp_task_ids}"
