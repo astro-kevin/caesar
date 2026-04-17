@@ -133,11 +133,16 @@ def test_rank0_prepare_galaxy_finding_sets_velocity_linking_length(monkeypatch, 
         "_build_direct_task_payload",
         lambda *_args, **_kwargs: {"star_sel": np.arange(16, dtype=np.int32)},
     )
+    monkeypatch.setattr(
+        mpi_mod,
+        "_build_store_artifacts",
+        lambda **_kwargs: {"roots": {10: {"store_id": "10", "kind": "root", "particle_store_path": "particle_store_root10.h5", "node_store_path": "node_store_root10.pkl"}}},
+    )
     monkeypatch.setattr(mpi_mod, "get_min_stars", lambda *_args, **_kwargs: 16)
     monkeypatch.delenv("CAESAR_FOF6D_VEL_LL", raising=False)
     monkeypatch.delenv("CAESAR_FOF6D_DISABLE_VEL", raising=False)
 
-    state, pid_maps_sel, min_stars, fof_ll, fof_vel_ll, tasks, tasks_by_root, payloads = mpi_mod._rank0_prepare_galaxy_finding(
+    state, pid_maps_sel, min_stars, fof_ll, fof_vel_ll, tasks, tasks_by_root, payloads, store_manifest = mpi_mod._rank0_prepare_galaxy_finding(
         snapshot_file="snap.hdf5",
         ahf_particles_file="ahf.AHF_particles",
         shard_root=tmp_path,
@@ -156,6 +161,7 @@ def test_rank0_prepare_galaxy_finding_sets_velocity_linking_length(monkeypatch, 
     assert set(tasks_by_root.keys()) == {10}
     assert 10 in payloads
     assert payloads[10]["task"]["node_id"] == 10
+    assert store_manifest["roots"][10]["store_id"] == "10"
 
 
 def test_reconciled_galaxy_shard_payload_uses_table_format():
@@ -682,7 +688,7 @@ def test_galaxy_finding_shard_payload_serializes_node_candidates():
 def test_materialize_galaxy_finding_batch_item_writes_payload_on_assignment(tmp_path):
     task = subhalo_mod.AHFSubhaloTask(10, 0, 10, 0, tuple(), 4, 10)
     batch = subhalo_mod.AHFSubhaloBatch(tasks=(task,), is_tiny_batch=False, target_backend="cpu", estimated_cost=10)
-    payload_path = tmp_path / "finding_galaxies_input_regular_000000.pkl"
+    payload_path = tmp_path / "finding_galaxies_payload_regular_000000.pkl"
     assert not payload_path.exists()
 
     item = mpi_mod._materialize_galaxy_finding_batch_item(
@@ -696,6 +702,7 @@ def test_materialize_galaxy_finding_batch_item_writes_payload_on_assignment(tmp_
         min_stars=16,
         backend="cpu",
         device_id=None,
+        store_ids=("10",),
     )
 
     assert payload_path.exists()
@@ -906,33 +913,171 @@ def test_uniform_stage_thread_map_uses_all_worker_cores():
 
 def test_calculating_properties_batches_keep_top_level_hosts_atomic():
     root_results = [
-        {"root_id": 10, "shard_path": "root10.pkl", "root_payload_path": "root10_payload.pkl", "count": 2, "halo_count": 2, "property_cost": 132},
-        {"root_id": 20, "shard_path": "root20.pkl", "root_payload_path": "root20_payload.pkl", "count": 1, "halo_count": 1, "property_cost": 19},
+        {"root_id": 10, "shard_path": "root10.pkl", "root_payload_path": "root10_payload.pkl", "store_id": "10", "particle_store_path": "particle_store_root10.h5", "node_store_path": "node_store_root10.pkl", "count": 2, "halo_count": 2, "property_cost": 132},
+        {"root_id": 20, "shard_path": "root20.pkl", "root_payload_path": "root20_payload.pkl", "store_id": "20", "particle_store_path": "particle_store_root20.h5", "node_store_path": "node_store_root20.pkl", "count": 1, "halo_count": 1, "property_cost": 19},
     ]
 
     batches = mpi_mod._build_calculating_properties_batches(root_results, worker_count=1)
 
     assert len(batches) == 2
-    batch_root_ids = [{int(rec["root_id"]) for rec in batch} for batch in batches]
+    batch_root_ids = [{int(rec["root_id"]) for rec in batch["roots"]} for batch in batches]
     assert {10} in batch_root_ids
     assert {20} in batch_root_ids
 
 
 def test_calculating_properties_batches_balance_whole_hosts_by_internal_cost(monkeypatch):
-    monkeypatch.setenv("CAESAR_AHF_SUBHALO_CALCULATING_PROPERTIES_BATCH_MULTIPLIER", "1")
     root_results = [
-        {"root_id": 10, "shard_path": "root10.pkl", "root_payload_path": "root10_payload.pkl", "count": 2, "halo_count": 2, "property_cost": 229},
-        {"root_id": 20, "shard_path": "root20.pkl", "root_payload_path": "root20_payload.pkl", "count": 1, "halo_count": 1, "property_cost": 61},
-        {"root_id": 30, "shard_path": "root30.pkl", "root_payload_path": "root30_payload.pkl", "count": 0, "halo_count": 1, "property_cost": 58},
-        {"root_id": 40, "shard_path": "root40.pkl", "root_payload_path": "root40_payload.pkl", "count": 1, "halo_count": 1, "property_cost": 58},
+        {"root_id": 10, "shard_path": "root10.pkl", "root_payload_path": "root10_payload.pkl", "store_id": "10", "particle_store_path": "particle_store_root10.h5", "node_store_path": "node_store_root10.pkl", "count": 2, "halo_count": 2, "property_cost": 229},
+        {"root_id": 20, "shard_path": "root20.pkl", "root_payload_path": "root20_payload.pkl", "store_id": "bucket000001", "particle_store_path": "particle_store_bucket000001.h5", "node_store_path": "node_store_bucket000001.pkl", "count": 1, "halo_count": 1, "property_cost": 61},
+        {"root_id": 30, "shard_path": "root30.pkl", "root_payload_path": "root30_payload.pkl", "store_id": "bucket000002", "particle_store_path": "particle_store_bucket000002.h5", "node_store_path": "node_store_bucket000002.pkl", "count": 0, "halo_count": 1, "property_cost": 58},
+        {"root_id": 40, "shard_path": "root40.pkl", "root_payload_path": "root40_payload.pkl", "store_id": "bucket000001", "particle_store_path": "particle_store_bucket000001.h5", "node_store_path": "node_store_bucket000001.pkl", "count": 1, "halo_count": 1, "property_cost": 58},
     ]
 
     batches = mpi_mod._build_calculating_properties_batches(root_results, worker_count=2)
 
     assert len(batches) == 2
-    batch_root_ids = [{int(rec["root_id"]) for rec in batch} for batch in batches]
+    batch_root_ids = [{int(rec["root_id"]) for rec in batch["roots"]} for batch in batches]
     assert {10} in batch_root_ids
     assert any(root_ids == {20, 40} for root_ids in batch_root_ids)
+
+
+def test_rank0_calculating_properties_dispatches_root_batches_using_particle_store(monkeypatch, tmp_path):
+    root_results = [
+        {
+            "root_id": 10,
+            "shard_path": str(tmp_path / "root10.pkl"),
+            "root_payload_path": str(tmp_path / "root10_payload.pkl"),
+            "store_id": "bucket000001",
+            "particle_store_path": str(tmp_path / "particle_store_bucket000001.h5"),
+            "node_store_path": str(tmp_path / "node_store_bucket000001.pkl"),
+            "count": 2,
+            "halo_count": 2,
+            "property_cost": 100,
+        },
+        {
+            "root_id": 20,
+            "shard_path": str(tmp_path / "root20.pkl"),
+            "root_payload_path": str(tmp_path / "root20_payload.pkl"),
+            "store_id": "bucket000001",
+            "particle_store_path": str(tmp_path / "particle_store_bucket000001.h5"),
+            "node_store_path": str(tmp_path / "node_store_bucket000001.pkl"),
+            "count": 1,
+            "halo_count": 1,
+            "property_cost": 50,
+        },
+    ]
+    snapshot_meta_store_path = tmp_path / "snapshot_meta_store.pkl"
+    snapshot_meta_store_path.write_bytes(b"ok")
+    monkeypatch.setattr(
+        mpi_mod,
+        "_build_calculating_properties_batches",
+        lambda root_results, worker_count: [
+            {
+                "store_id": "bucket000001",
+                "particle_store_path": str(tmp_path / "particle_store_bucket000001.h5"),
+                "node_store_path": str(tmp_path / "node_store_bucket000001.pkl"),
+                "roots": [dict(rec) for rec in root_results],
+            }
+        ],
+    )
+    monkeypatch.setattr(mpi_mod, "_snapshot_meta_store_path", lambda shard_root: snapshot_meta_store_path)
+    monkeypatch.setattr(mpi_mod, "load_snapshot_meta_store", lambda path: "snapshot-meta")
+    monkeypatch.setattr(
+        mpi_mod,
+        "build_direct_state",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("snapshot reload should not happen")),
+    )
+    dispatched = {}
+
+    def _fake_dispatch(*args, **kwargs):
+        dispatched["small_queue"] = [dict(item) for item in kwargs["small_queue"]]
+        return []
+
+    monkeypatch.setattr(mpi_mod, "_dispatch_stage", _fake_dispatch)
+
+    worker_caps = [
+        mpi_mod.WorkerCapability(rank=1, role="property_worker", hostname="nodeA", local_rank=0, gpu_device=None, threads=4),
+    ]
+
+    snapshot_meta, results = mpi_mod._rank0_calculate_properties(
+        None,
+        worker_caps=worker_caps,
+        snapshot_file="snap.hdf5",
+        ahf_particles_file="ahf_particles",
+        output_file="out.hdf5",
+        root_results=root_results,
+        nproc=3,
+        shard_root=tmp_path,
+        sim=None,
+        worker_threads=None,
+    )
+
+    assert snapshot_meta == "snapshot-meta"
+    assert results == []
+    assert dispatched["small_queue"] == [
+        {
+            "store_id": "bucket000001",
+            "roots": [dict(rec) for rec in root_results],
+            "particle_store_path": str(tmp_path / "particle_store_bucket000001.h5"),
+            "node_store_path": str(tmp_path / "node_store_bucket000001.pkl"),
+        }
+    ]
+
+
+def test_worker_run_calculating_properties_reads_root_shards_and_particle_store(monkeypatch, tmp_path):
+    item = {
+        "roots": [
+            {
+                "root_id": 10,
+                "root_payload_path": str(tmp_path / "root10_payload.pkl"),
+                "shard_path": str(tmp_path / "root10.pkl"),
+            }
+        ],
+        "store_id": "10",
+        "particle_store_path": str(tmp_path / "particle_store_root10.h5"),
+        "node_store_path": str(tmp_path / "node_store_root10.pkl"),
+    }
+
+    payloads = {
+        "root10_payload.pkl": {"halo_node_ids": [10]},
+        "root10.pkl": [{"AHF_haloID": 101, "AHF_top_haloID": 10, "slist": np.asarray([2], dtype=np.int64)}],
+    }
+    monkeypatch.setattr(mpi_mod, "_load_pickle", lambda path: payloads[Path(path).name])
+    fake_particle_store = SimpleNamespace(meta="snapshot-meta")
+    monkeypatch.setattr(mpi_mod, "load_particle_store", lambda path: fake_particle_store)
+    monkeypatch.setattr(
+        mpi_mod,
+        "load_node_store",
+        lambda path: {"nodes": object(), "root_ids": (10,), "particle_rows_by_ptype": {}},
+    )
+    monkeypatch.setattr(mpi_mod, "_build_store_halo_record", lambda state, *, node_id: {"AHF_haloID": int(node_id), "glist": np.asarray([1], dtype=np.int64)})
+
+    build_calls = {}
+
+    def _fake_build_payload(particle_store_path, *, halo_records, galaxy_records, kwargs=None, load_pot=True):
+        build_calls["particle_store_path"] = particle_store_path
+        build_calls["halo_records"] = [dict(v) for v in halo_records]
+        build_calls["galaxy_records"] = [dict(v) for v in galaxy_records]
+        return {"halos": [], "galaxies": []}
+
+    monkeypatch.setattr(mpi_mod, "_build_calculating_properties_payload_from_particle_store", _fake_build_payload)
+    monkeypatch.setattr(mpi_mod, "_build_calculating_properties_runtime", lambda payload, nproc: SimpleNamespace(halo_list=[], galaxy_list=[]))
+    monkeypatch.setattr(mpi_mod, "_compute_group_properties_subset", lambda *args, **kwargs: None)
+    dumped = {}
+    monkeypatch.setattr(mpi_mod, "_dump_pickle", lambda path, payload: dumped.setdefault(str(path), dict(payload)))
+
+    result = mpi_mod._worker_run_calculating_properties(
+        item=item,
+        shard_dir=tmp_path,
+        nproc=2,
+    )
+
+    assert build_calls["particle_store_path"] is fake_particle_store
+    assert [int(rec["AHF_haloID"]) for rec in build_calls["halo_records"]] == [10]
+    assert [int(rec["AHF_haloID"]) for rec in build_calls["galaxy_records"]] == [101]
+    assert result["count_halos"] == 0
+    assert result["count_galaxies"] == 0
+    assert Path(result["shard_path"]).name.startswith("calculating_properties_shard_rank")
 
 
 def test_finding_galaxies_thread_map_preserves_gpu_support_threads():
@@ -1006,8 +1151,8 @@ def test_worker_run_finding_galaxies_bundles_multiple_items(tmp_path):
         ],
     }
 
-    path_a = tmp_path / "finding_galaxies_input_cpu_000000.pkl"
-    path_b = tmp_path / "finding_galaxies_input_cpu_000001.pkl"
+    path_a = tmp_path / "finding_galaxies_payload_cpu_000000.pkl"
+    path_b = tmp_path / "finding_galaxies_payload_cpu_000001.pkl"
     mpi_mod._dump_pickle(path_a, payload_a)
     mpi_mod._dump_pickle(path_b, payload_b)
 

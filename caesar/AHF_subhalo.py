@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-import h5py
 import os
 from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -858,159 +857,16 @@ def _calculating_properties_simulation_payload(
     }
 
 
-def _load_selected_snapshot_payload(
-    snapshot_file: str,
-    *,
-    gas_ids: np.ndarray,
-    star_ids: np.ndarray,
-    dm_ids: np.ndarray,
-    bh_ids: np.ndarray,
-) -> Tuple[Dict[str, object], List[str], object]:
-    from caesar.ahf_subhalo_hdf5 import (
-        _gas_T_K_from_u_ne,
-        _gas_nH_cm3_from_density,
-        load_snapshot_meta,
-    )
-    from caesar.property_manager import ptype_ints
-
-    snapshot_meta = load_snapshot_meta(snapshot_file)
-    gas_ids = np.asarray(gas_ids, dtype=np.int64)
-    star_ids = np.asarray(star_ids, dtype=np.int64)
-    dm_ids = np.asarray(dm_ids, dtype=np.int64)
-    bh_ids = np.asarray(bh_ids, dtype=np.int64)
-
-    payload_dm: Dict[str, object] = {}
-    pos_blocks: List[np.ndarray] = []
-    vel_blocks: List[np.ndarray] = []
-    mass_blocks: List[np.ndarray] = []
-    pot_blocks: List[np.ndarray] = []
-    ptype_blocks: List[np.ndarray] = []
-    ptypes_local: List[str] = []
-
-    selectors = (
-        ("gas", "PartType0", gas_ids),
-        ("dm", "PartType1", dm_ids),
-        ("star", "PartType4", star_ids),
-        ("bh", "PartType5", bh_ids),
-    )
-
-    def _read_optional_field(group, names, ids, *, scalarize: bool = False):
-        for name in names:
-            if name not in group:
-                continue
-            arr = np.asarray(group[name][ids])
-            if scalarize and arr.ndim > 1:
-                arr = np.asarray(arr[:, 0])
-            return arr
-        return None
-
-    with h5py.File(snapshot_file, "r") as handle:
-        header = handle["Header"].attrs
-        mass_table = np.asarray(header.get("MassTable", np.zeros(6, dtype=np.float64)), dtype=np.float64)
-        h = float(snapshot_meta.hubble_constant)
-        z = float(snapshot_meta.redshift)
-
-        offset = 0
-        for ptype, group_name, ids in selectors:
-            if ids.size == 0 or group_name not in handle:
-                continue
-            group = handle[group_name]
-            pcode = int(group_name.replace("PartType", ""))
-            count = int(ids.size)
-            pos = np.asarray(group["Coordinates"][ids], dtype=np.float32) / max(h, 1.0e-30)
-            vel = np.asarray(group["Velocities"][ids], dtype=np.float32)
-            if "Masses" in group:
-                mass = np.asarray(group["Masses"][ids], dtype=np.float64) * (1.0e10 / max(h, 1.0e-30))
-            else:
-                mass = np.full(count, mass_table[pcode], dtype=np.float64) * (1.0e10 / max(h, 1.0e-30))
-            if "Potential" in group:
-                pot = np.asarray(group["Potential"][ids], dtype=np.float32)
-            elif "Potentials" in group:
-                pot = np.asarray(group["Potentials"][ids], dtype=np.float32)
-            else:
-                pot = np.zeros(count, dtype=np.float32)
-
-            pos_blocks.append(pos)
-            vel_blocks.append(vel)
-            mass_blocks.append(np.asarray(mass, dtype=np.float32))
-            pot_blocks.append(pot)
-            ptype_blocks.append(np.full(count, ptype_ints[ptype], dtype=np.int32))
-            ptypes_local.append(ptype)
-
-            local_ids = np.arange(count, dtype=np.int64) + int(offset)
-            if ptype == "gas":
-                payload_dm["glist"] = local_ids
-                rho = _read_optional_field(group, ("Density", "Densities"), ids)
-                sfr = _read_optional_field(group, ("StarFormationRate", "StarFormationRates"), ids)
-                ne = _read_optional_field(group, ("ElectronAbundance", "ElectronNumberDensities"), ids)
-                u = _read_optional_field(group, ("InternalEnergy",), ids)
-                temp = _read_optional_field(group, ("Temperature", "Temperatures"), ids)
-                metallicity = _read_optional_field(group, ("Metallicity", "GFM_Metallicity"), ids, scalarize=True)
-                gfhi = _read_optional_field(group, ("GrackleHI", "NeutralHydrogenAbundance", "AtomicHydrogenMasses"), ids)
-                gfh2 = _read_optional_field(group, ("FractionH2", "MolecularHydrogenMasses"), ids)
-                dustmass = _read_optional_field(group, ("Dust_Masses",), ids)
-                if rho is not None:
-                    payload_dm["gnh"] = _gas_nH_cm3_from_density(np.asarray(rho, dtype=np.float64), h=h, z=z)
-                if sfr is not None:
-                    payload_dm["gsfr"] = np.asarray(sfr, dtype=np.float32)
-                if metallicity is not None:
-                    payload_dm["gZ"] = np.asarray(metallicity, dtype=np.float32)
-                if temp is not None:
-                    payload_dm["gT"] = np.asarray(temp, dtype=np.float32)
-                elif u is not None and ne is not None:
-                    payload_dm["gT"] = _gas_T_K_from_u_ne(np.asarray(u, dtype=np.float64), np.asarray(ne, dtype=np.float64))
-                if gfhi is not None:
-                    payload_dm["gfHI"] = np.asarray(gfhi, dtype=np.float32)
-                if gfh2 is not None:
-                    payload_dm["gfH2"] = np.asarray(gfh2, dtype=np.float32)
-                if dustmass is not None:
-                    payload_dm["dustmass"] = np.asarray(dustmass, dtype=np.float64) * (1.0e10 / max(h, 1.0e-30))
-            elif ptype == "dm":
-                payload_dm["dmlist"] = local_ids
-            elif ptype == "star":
-                payload_dm["slist"] = local_ids
-                metallicity = _read_optional_field(group, ("Metallicity", "GFM_Metallicity"), ids, scalarize=True)
-                aform = _read_optional_field(group, ("StellarFormationTime", "GFM_StellarFormationTime", "BirthScaleFactors"), ids)
-                if metallicity is not None:
-                    payload_dm["sZ"] = np.asarray(metallicity, dtype=np.float32)
-                if aform is not None:
-                    aform_arr = np.asarray(aform, dtype=np.float64)
-                    valid = aform_arr > 0.0
-                    age = np.zeros_like(aform_arr, dtype=np.float64)
-                    if np.any(valid):
-                        from astropy.cosmology import FlatLambdaCDM
-
-                        cosmology = FlatLambdaCDM(H0=100.0 * h, Om0=snapshot_meta.omega_matter if snapshot_meta.omega_matter > 0.0 else 0.3)
-                        zform = (1.0 / np.maximum(aform_arr[valid], 1.0e-12)) - 1.0
-                        age[valid] = float(snapshot_meta.time_gyr) - cosmology.age(zform).value
-                    payload_dm["age"] = np.asarray(age, dtype=np.float32)
-            elif ptype == "bh":
-                payload_dm["bhlist"] = local_ids
-                bhmass = _read_optional_field(group, ("BH_Mass", "SubgridMasses"), ids)
-                bhmdot = _read_optional_field(group, ("BH_Mdot", "AccretionRates"), ids)
-                if bhmass is not None:
-                    payload_dm["bhmass"] = np.asarray(bhmass, dtype=np.float64) * (1.0e10 / max(h, 1.0e-30))
-                if bhmdot is not None:
-                    payload_dm["bhmdot"] = np.asarray(bhmdot, dtype=np.float32)
-
-            offset += count
-
-    payload_dm["pos"] = np.concatenate(pos_blocks, axis=0) if pos_blocks else np.empty((0, 3), dtype=np.float32)
-    payload_dm["vel"] = np.concatenate(vel_blocks, axis=0) if vel_blocks else np.empty((0, 3), dtype=np.float32)
-    payload_dm["mass"] = np.concatenate(mass_blocks, axis=0) if mass_blocks else np.empty(0, dtype=np.float32)
-    payload_dm["pot"] = np.concatenate(pot_blocks, axis=0) if pot_blocks else np.empty(0, dtype=np.float32)
-    payload_dm["ptype"] = np.concatenate(ptype_blocks, axis=0) if ptype_blocks else np.empty(0, dtype=np.int32)
-    return payload_dm, ptypes_local, snapshot_meta
-
-
-def _build_calculating_properties_payload_from_records(
-    snapshot_file: str,
+def _build_calculating_properties_payload_from_particle_store(
+    particle_store_path,
     *,
     halo_records: Sequence[Dict[str, object]],
     galaxy_records: Sequence[Dict[str, object]],
     kwargs: Optional[Dict[str, object]] = None,
     load_pot: bool = True,
 ) -> Dict[str, object]:
+    from caesar.ahf_subhalo_hdf5 import load_selected_particle_payload_from_store
+
     halo_records = [dict(rec) for rec in halo_records]
     galaxy_records = [dict(rec) for rec in galaxy_records]
 
@@ -1030,19 +886,31 @@ def _build_calculating_properties_payload_from_records(
         [rec.get("bhlist", np.empty(0, dtype=np.int64)) for rec in halo_records]
         + [rec.get("bhlist", np.empty(0, dtype=np.int64)) for rec in galaxy_records]
     )
+    dust_ids = _concat_unique_index_arrays(
+        [rec.get("dlist", np.empty(0, dtype=np.int64)) for rec in halo_records]
+        + [rec.get("dlist", np.empty(0, dtype=np.int64)) for rec in galaxy_records]
+    )
 
-    payload_dm, ptypes_local, snapshot_meta = _load_selected_snapshot_payload(
-        snapshot_file,
+    payload_dm, ptypes_local, snapshot_meta = load_selected_particle_payload_from_store(
+        particle_store_path,
         gas_ids=gas_ids,
         star_ids=star_ids,
         dm_ids=dm_ids,
         bh_ids=bh_ids,
+        dust_ids=dust_ids,
     )
+
+    if (int(snapshot_meta.particle_counts.get("dm2", 0)) > 0 or int(snapshot_meta.particle_counts.get("dm3", 0)) > 0) and int(dm_ids.size) > 0:
+        raise RuntimeError(
+            "AHF-subhalo calculating-properties shard store does not support aggregated dmlist "
+            "when dm2/dm3 particles are present"
+        )
 
     gas_map = {int(v): i for i, v in enumerate(gas_ids.tolist())}
     star_map = {int(v): i for i, v in enumerate(star_ids.tolist())}
     dm_map = {int(v): i for i, v in enumerate(dm_ids.tolist())}
     bh_map = {int(v): i for i, v in enumerate(bh_ids.tolist())}
+    dust_map = {int(v): i for i, v in enumerate(dust_ids.tolist())}
     halo_index_map = {int(rec.get("AHF_haloID", -1)): int(i) for i, rec in enumerate(halo_records)}
 
     def _preserve_global_lists(rec: Dict[str, object]) -> None:
@@ -1060,6 +928,8 @@ def _build_calculating_properties_payload_from_records(
             parts.append(np.asarray(payload_dm["dmlist"], dtype=np.int64)[np.asarray(rec["dmlist"], dtype=np.int64)])
         if "bhlist" in payload_dm and np.asarray(rec.get("bhlist", [])).size > 0:
             parts.append(np.asarray(payload_dm["bhlist"], dtype=np.int64)[np.asarray(rec["bhlist"], dtype=np.int64)])
+        if "dlist" in payload_dm and np.asarray(rec.get("dlist", [])).size > 0:
+            parts.append(np.asarray(payload_dm["dlist"], dtype=np.int64)[np.asarray(rec["dlist"], dtype=np.int64)])
         if parts:
             return np.concatenate(parts).astype(np.int64, copy=False)
         return np.empty(0, dtype=np.int64)
@@ -1072,7 +942,7 @@ def _build_calculating_properties_payload_from_records(
         out["slist"] = _remap_index_array(out.get("slist", []), star_map, dtype=np.int64)
         out["dmlist"] = _remap_index_array(out.get("dmlist", []), dm_map, dtype=np.int64)
         out["bhlist"] = _remap_index_array(out.get("bhlist", []), bh_map, dtype=np.int64)
-        out["dlist"] = np.empty(0, dtype=np.int64)
+        out["dlist"] = _remap_index_array(out.get("dlist", []), dust_map, dtype=np.int64)
         out["global_indexes"] = _combined_local_indexes(out)
         out["galaxy_index_list"] = np.empty(0, dtype=np.int32)
         halo_payloads.append(out)
@@ -1085,7 +955,7 @@ def _build_calculating_properties_payload_from_records(
         out["slist"] = _remap_index_array(out.get("slist", []), star_map, dtype=np.int64)
         out["dmlist"] = _remap_index_array(out.get("dmlist", []), dm_map, dtype=np.int64)
         out["bhlist"] = _remap_index_array(out.get("bhlist", []), bh_map, dtype=np.int64)
-        out["dlist"] = np.empty(0, dtype=np.int64)
+        out["dlist"] = _remap_index_array(out.get("dlist", []), dust_map, dtype=np.int64)
         out["global_indexes"] = _combined_local_indexes(out)
         out["parent_halo_index"] = int(halo_index_map.get(int(out.get("AHF_top_haloID", -1)), -1))
         out["_ahf_host_halo_index"] = int(out["parent_halo_index"])
@@ -1105,7 +975,7 @@ def _build_calculating_properties_payload_from_records(
         ngas=int(gas_ids.size),
         nstar=int(star_ids.size),
         nbh=int(bh_ids.size),
-        ndust=0,
+        ndust=int(dust_ids.size),
         ndm=int(dm_ids.size),
         ntot=int(payload_dm["mass"].size),
     )

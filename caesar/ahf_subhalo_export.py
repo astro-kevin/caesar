@@ -833,8 +833,8 @@ def write_catalogue_from_property_shards(
         galaxy_schema.dict_specs["local_mass_density"][key] = _ValueSpec(shape=(), dtype=np.float64, unit=density_unit)
         galaxy_schema.dict_specs["local_number_density"][key] = _ValueSpec(shape=(), dtype=np.float64, unit=number_density_unit)
 
-        halo_list_names = tuple(name for name in ("dmlist", "glist", "slist", "bhlist", "dlist", "galaxy_index_list") if name in halo_schema.list_lengths)
-        galaxy_list_names = tuple(name for name in ("glist", "slist", "bhlist", "dlist", "cloud_index_list", "AHF_ancestor_haloIDs") if name in galaxy_schema.list_lengths)
+    halo_list_names = tuple(name for name in ("dmlist", "glist", "slist", "bhlist", "dlist", "galaxy_index_list") if name in halo_schema.list_lengths)
+    galaxy_list_names = tuple(name for name in ("glist", "slist", "bhlist", "dlist", "cloud_index_list", "AHF_ancestor_haloIDs") if name in galaxy_schema.list_lengths)
 
     halo_ordered_lengths = {}
     for name in halo_list_names:

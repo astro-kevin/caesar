@@ -36,7 +36,7 @@ from caesar.AHF_subhalo import (
     MINIMUM_DM_PER_TOPLEVEL_AHF_HALO,
     _available_gpu_device_ids,
     _build_node_dm_counts,
-    _build_calculating_properties_payload_from_records,
+    _build_calculating_properties_payload_from_particle_store,
     _build_calculating_properties_runtime,
     _build_task_input_payload,
     _build_task_manifest,
@@ -46,7 +46,6 @@ from caesar.AHF_subhalo import (
     _compute_group_properties_subset,
     _deserialize_candidate_group,
     _deserialize_task,
-    _build_direct_calculating_properties_runtime,
     _env_float,
     _env_int,
     _env_str,
@@ -62,7 +61,14 @@ from caesar.AHF_subhalo import (
 from caesar.ahf_subhalo_hdf5 import (
     AHFSubhaloDirectState,
     build_direct_state,
-    load_snapshot_meta,
+    build_halo_record as _build_store_halo_record,
+    build_store_for_roots,
+    load_node_store,
+    load_particle_store,
+    load_snapshot_meta_store,
+    write_node_store,
+    write_particle_store,
+    write_snapshot_meta_store,
     build_task_payload as _build_direct_task_payload,
 )
 from caesar.ahf_subhalo_tables import (
@@ -490,18 +496,7 @@ def _eligible_halo_node_ids_by_root(state: AHFSubhaloDirectState) -> Dict[int, L
 
 
 def _build_halo_record_from_state(state: AHFSubhaloDirectState, *, node_index: int) -> Dict[str, object]:
-    return {
-        "AHF_haloID": int(state.nodes.halo_id[node_index]),
-        "AHF_parent_haloID": int(state.nodes.parent_halo_id[node_index]),
-        "AHF_top_haloID": int(state.nodes.top_halo_id[node_index]),
-        "AHF_depth": int(state.nodes.depth[node_index]),
-        "AHF_ancestor_haloIDs": np.asarray(state.nodes.ancestors_for(node_index), dtype=np.int64),
-        "glist": np.asarray(state.nodes.members_for(node_index, "gas"), dtype=np.int64),
-        "slist": np.asarray(state.nodes.members_for(node_index, "star"), dtype=np.int64),
-        "dmlist": np.asarray(state.nodes.members_for(node_index, "dm"), dtype=np.int64),
-        "bhlist": np.asarray(state.nodes.members_for(node_index, "bh"), dtype=np.int64),
-        "dlist": np.asarray(state.nodes.members_for(node_index, "dust"), dtype=np.int64),
-    }
+    return _build_store_halo_record(state, node_id=int(state.nodes.halo_id[node_index]))
 
 
 def _group_record_member_cost(record: Mapping[str, object]) -> int:
@@ -520,6 +515,29 @@ def _load_pickle(path: Path):
     with path.open("rb") as fh:
         return pickle.load(fh)
 
+
+def _snapshot_meta_store_path(shard_root: Path) -> Path:
+    return Path(shard_root) / "snapshot_meta_store.pkl"
+
+
+def _store_manifest_path(shard_root: Path) -> Path:
+    return Path(shard_root) / "store_manifest.pkl"
+
+
+def _particle_store_path(shard_root: Path, *, store_id: str, kind: str) -> Path:
+    safe_id = str(store_id)
+    return Path(shard_root) / f"particle_store_{str(kind)}{safe_id}.h5"
+
+
+def _node_store_path(shard_root: Path, *, store_id: str, kind: str) -> Path:
+    safe_id = str(store_id)
+    return Path(shard_root) / f"node_store_{str(kind)}{safe_id}.pkl"
+
+
+def _write_store_manifest(shard_root: Path, payload: Mapping[str, object]) -> Path:
+    path = _store_manifest_path(shard_root)
+    _dump_pickle(path, dict(payload))
+    return path
 
 def _galaxy_finding_shard_payload(results_by_node: Dict[int, List]) -> Dict[int, List[dict]]:
     out = {}
@@ -563,6 +581,214 @@ def _prepare_manifest(
         min_stars=int(min_stars),
     )
     return tasks, tasks_by_root, node_npart, node_nstar
+
+
+def _root_store_summaries(
+    state: AHFSubhaloDirectState,
+    *,
+    tasks_by_root: Mapping[int, Sequence[AHFSubhaloTask]],
+) -> Dict[int, Dict[str, object]]:
+    root_node_indexes: Dict[int, List[int]] = {}
+    for node_index in range(len(state.nodes)):
+        root_id = int(state.nodes.top_halo_id[node_index])
+        if int(root_id) not in tasks_by_root:
+            continue
+        root_node_indexes.setdefault(int(root_id), []).append(int(node_index))
+
+    summaries: Dict[int, Dict[str, object]] = {}
+    for root_id, node_indexes in root_node_indexes.items():
+        particle_rows_by_ptype: Dict[str, int] = {}
+        particle_row_total = 0
+        for ptype in state.particles.ptypes:
+            rows = [
+                np.asarray(state.nodes.members_for(int(node_index), str(ptype), dtype=np.int64), dtype=np.int64)
+                for node_index in node_indexes
+            ]
+            merged = np.unique(np.concatenate(rows).astype(np.int64, copy=False)) if rows else np.empty(0, dtype=np.int64)
+            particle_rows_by_ptype[str(ptype)] = int(merged.size)
+            particle_row_total += int(merged.size)
+
+        summaries[int(root_id)] = {
+            "root_id": int(root_id),
+            "node_count": int(len(node_indexes)),
+            "task_count": int(len(tasks_by_root.get(int(root_id), ()))),
+            "particle_row_total": int(particle_row_total),
+            "particle_rows_by_ptype": particle_rows_by_ptype,
+            "fof_candidates": int(sum(int(task.fof_candidates) for task in tasks_by_root.get(int(root_id), ()))),
+        }
+    return summaries
+
+
+def _bucket_root_stores(
+    root_summaries: Mapping[int, Mapping[str, object]],
+) -> List[Dict[str, object]]:
+    if not root_summaries:
+        return []
+
+    max_roots_per_bucket = max(1, _env_int("CAESAR_AHF_SUBHALO_STORE_MAX_ROOTS_PER_BUCKET", 128))
+    max_particle_rows = max(1, _env_int("CAESAR_AHF_SUBHALO_STORE_MAX_PARTICLE_ROWS", 1_000_000))
+    max_nodes = max(1, _env_int("CAESAR_AHF_SUBHALO_STORE_MAX_NODES", 1024))
+    max_fof_candidates = max(1, _env_int("CAESAR_AHF_SUBHALO_STORE_MAX_FOF_CANDIDATES", 500_000))
+
+    ordered = [
+        dict(root_summaries[int(root_id)])
+        for root_id in sorted(
+            root_summaries.keys(),
+            key=lambda rid: (
+                int(root_summaries[int(rid)].get("fof_candidates", 0)),
+                int(root_summaries[int(rid)].get("particle_row_total", 0)),
+                int(root_summaries[int(rid)].get("node_count", 0)),
+                int(rid),
+            ),
+        )
+    ]
+
+    buckets: List[Dict[str, object]] = []
+    current: Dict[str, object] = {
+        "root_ids": [],
+        "node_count": 0,
+        "particle_row_total": 0,
+        "fof_candidates": 0,
+    }
+
+    def _flush_current() -> None:
+        nonlocal current
+        if current["root_ids"]:
+            buckets.append(
+                {
+                    "root_ids": tuple(int(v) for v in current["root_ids"]),
+                    "node_count": int(current["node_count"]),
+                    "particle_row_total": int(current["particle_row_total"]),
+                    "fof_candidates": int(current["fof_candidates"]),
+                }
+            )
+        current = {
+            "root_ids": [],
+            "node_count": 0,
+            "particle_row_total": 0,
+            "fof_candidates": 0,
+        }
+
+    for rec in ordered:
+        root_id = int(rec["root_id"])
+        add_roots = int(len(current["root_ids"])) + 1
+        add_nodes = int(current["node_count"]) + int(rec.get("node_count", 0))
+        add_rows = int(current["particle_row_total"]) + int(rec.get("particle_row_total", 0))
+        add_candidates = int(current["fof_candidates"]) + int(rec.get("fof_candidates", 0))
+        if current["root_ids"] and (
+            add_roots > int(max_roots_per_bucket)
+            or add_nodes > int(max_nodes)
+            or add_rows > int(max_particle_rows)
+            or add_candidates > int(max_fof_candidates)
+        ):
+            _flush_current()
+        current["root_ids"].append(int(root_id))
+        current["node_count"] = int(current["node_count"]) + int(rec.get("node_count", 0))
+        current["particle_row_total"] = int(current["particle_row_total"]) + int(rec.get("particle_row_total", 0))
+        current["fof_candidates"] = int(current["fof_candidates"]) + int(rec.get("fof_candidates", 0))
+    _flush_current()
+
+    out: List[Dict[str, object]] = []
+    bucket_index = 0
+    for bucket in buckets:
+        root_ids = tuple(int(v) for v in bucket["root_ids"])
+        if len(root_ids) == 1:
+            root_id = int(root_ids[0])
+            out.append(
+                {
+                    "store_id": str(root_id),
+                    "kind": "root",
+                    "root_ids": root_ids,
+                    "node_count": int(bucket["node_count"]),
+                    "particle_row_total": int(bucket["particle_row_total"]),
+                    "fof_candidates": int(bucket["fof_candidates"]),
+                }
+            )
+        else:
+            bucket_index += 1
+            out.append(
+                {
+                    "store_id": f"{bucket_index:06d}",
+                    "kind": "bucket",
+                    "root_ids": root_ids,
+                    "node_count": int(bucket["node_count"]),
+                    "particle_row_total": int(bucket["particle_row_total"]),
+                    "fof_candidates": int(bucket["fof_candidates"]),
+                }
+            )
+    return out
+
+
+def _build_store_artifacts(
+    *,
+    state: AHFSubhaloDirectState,
+    tasks_by_root: Mapping[int, Sequence[AHFSubhaloTask]],
+    shard_root: Path,
+    log_fn=None,
+    log_label: str = "finding galaxies",
+) -> Dict[str, object]:
+    snapshot_meta_path = _snapshot_meta_store_path(shard_root)
+    write_snapshot_meta_store(snapshot_meta_path, state.snapshot)
+    root_summaries = _root_store_summaries(state, tasks_by_root=tasks_by_root)
+    store_specs = _bucket_root_stores(root_summaries)
+
+    stores: Dict[str, Dict[str, object]] = {}
+    roots: Dict[int, Dict[str, object]] = {}
+    for spec in store_specs:
+        store_id = str(spec["store_id"])
+        kind = str(spec["kind"])
+        root_ids = tuple(int(v) for v in spec["root_ids"])
+        particle_store, node_store, store_summary = build_store_for_roots(state, root_ids=root_ids)
+        particle_store_path = _particle_store_path(shard_root, store_id=store_id, kind=kind)
+        node_store_path = _node_store_path(shard_root, store_id=store_id, kind=kind)
+        write_particle_store(particle_store_path, particle_store)
+        write_node_store(
+            node_store_path,
+            node_store,
+            root_ids=root_ids,
+            particle_rows_by_ptype=store_summary.get("particle_rows_by_ptype", {}),
+        )
+        store_rec = {
+            "store_id": store_id,
+            "kind": kind,
+            "root_ids": root_ids,
+            "particle_store_path": str(particle_store_path),
+            "node_store_path": str(node_store_path),
+            "node_count": int(spec.get("node_count", 0)),
+            "particle_row_total": int(spec.get("particle_row_total", 0)),
+            "fof_candidates": int(spec.get("fof_candidates", 0)),
+            "particle_rows_by_ptype": {
+                str(k): int(v)
+                for k, v in dict(store_summary.get("particle_rows_by_ptype", {})).items()
+            },
+        }
+        stores[store_id] = store_rec
+        for root_id in root_ids:
+            root_summary = dict(root_summaries.get(int(root_id), {}))
+            roots[int(root_id)] = {
+                "root_id": int(root_id),
+                "store_id": store_id,
+                "kind": kind,
+                "particle_store_path": str(particle_store_path),
+                "node_store_path": str(node_store_path),
+                "node_count": int(root_summary.get("node_count", 0)),
+                "task_count": int(root_summary.get("task_count", 0)),
+                "particle_row_total": int(root_summary.get("particle_row_total", 0)),
+                "fof_candidates": int(root_summary.get("fof_candidates", 0)),
+            }
+
+    manifest = {
+        "snapshot_meta_store_path": str(snapshot_meta_path),
+        "stores": stores,
+        "roots": roots,
+    }
+    _write_store_manifest(shard_root, manifest)
+    if log_fn is not None:
+        bucket_count = sum(1 for rec in stores.values() if str(rec.get("kind")) == "bucket")
+        log_fn(
+            f"{log_label}: immutable stores ready; stores={len(stores)}, buckets={bucket_count}, roots={len(roots)}"
+        )
+    return manifest
 
 
 def _classify_galaxy_finding_batches(
@@ -1188,8 +1414,27 @@ def _rank0_prepare_galaxy_finding(
         for root, root_tasks in tasks_by_root.items()
     }
     tasks_by_root = {int(root): root_tasks for root, root_tasks in tasks_by_root.items() if root_tasks}
+    if log_fn is not None:
+        log_fn(f"{log_label}: writing immutable particle/node stores for {len(tasks_by_root)} roots")
+    store_manifest = _build_store_artifacts(
+        state=direct_state,
+        tasks_by_root=tasks_by_root,
+        shard_root=shard_root,
+        log_fn=log_fn,
+        log_label=log_label,
+    )
 
-    return direct_state, pid_maps_sel, int(ms), float(fof_ll), fof_vel_ll, tasks, tasks_by_root, task_payloads_by_node
+    return (
+        direct_state,
+        pid_maps_sel,
+        int(ms),
+        float(fof_ll),
+        fof_vel_ll,
+        tasks,
+        tasks_by_root,
+        task_payloads_by_node,
+        store_manifest,
+    )
 
 
 def _materialize_galaxy_finding_batch_item(
@@ -1204,8 +1449,9 @@ def _materialize_galaxy_finding_batch_item(
     min_stars: int,
     backend: str,
     device_id: Optional[int],
+    store_ids: Sequence[str],
 ):
-    payload_path = shard_root / f"finding_galaxies_input_{prefix}_{int(batch_index):06d}.pkl"
+    payload_path = shard_root / f"finding_galaxies_payload_{prefix}_{int(batch_index):06d}.pkl"
     payload = {
         "batch": _serialize_batch(batch),
         "task_payloads": [task_payloads_by_node[int(task.node_id)] for task in batch.tasks],
@@ -1219,6 +1465,7 @@ def _materialize_galaxy_finding_batch_item(
         "fof_ll": float(fof_ll),
         "fof_vel_ll": fof_vel_ll,
         "min_stars": int(min_stars),
+        "store_ids": tuple(sorted(str(v) for v in store_ids)),
     }
 
 
@@ -1226,7 +1473,7 @@ def _write_reconciliation_root_payloads(
     *,
     shard_root: Path,
     tasks_by_root: Dict[int, List[AHFSubhaloTask]],
-    task_payloads_by_node: Dict[int, Dict[str, object]],
+    store_manifest: Mapping[str, object],
     direct_state: Optional[AHFSubhaloDirectState] = None,
     log_fn=None,
     progress_label: str = "reconciling subhalos",
@@ -1243,7 +1490,10 @@ def _write_reconciliation_root_payloads(
     start_time = time.monotonic()
     last_status = start_time
     for idx, (root_id, root_tasks) in enumerate(tasks_by_root.items(), start=1):
-        halo_records: List[Dict[str, object]] = []
+        root_store = dict(dict(store_manifest.get("roots", {})).get(int(root_id), {}))
+        if not root_store:
+            raise RuntimeError(f"Missing store manifest entry for root {int(root_id)}")
+        root_halo_ids: List[int] = []
         if isinstance(direct_state, AHFSubhaloDirectState):
             root_halo_ids = sorted(
                 eligible_halo_ids_by_root.get(int(root_id), []),
@@ -1252,23 +1502,16 @@ def _write_reconciliation_root_payloads(
                     int(halo_id),
                 ),
             )
-            halo_records = [
-                _build_halo_record_from_state(
-                    direct_state,
-                    node_index=int(direct_state.nodes.index_of(int(halo_id))),
-                )
-                for halo_id in root_halo_ids
-            ]
-        payload_path = shard_root / f"reconciling_subhalos_input_root{int(root_id)}.pkl"
+        payload_path = shard_root / f"reconciling_subhalos_manifest_root{int(root_id):08d}.pkl"
         payload = {
             "root_id": int(root_id),
             "tasks": [_serialize_task(task) for task in root_tasks],
-            "task_payloads_by_node": {
-                int(task.node_id): task_payloads_by_node[int(task.node_id)]
-                for task in root_tasks
-            },
-            "halo_records": halo_records,
-            "halo_count": int(len(halo_records)),
+            "halo_node_ids": [int(v) for v in root_halo_ids],
+            "halo_count": int(len(root_halo_ids)),
+            "store_id": str(root_store.get("store_id")),
+            "store_kind": str(root_store.get("kind")),
+            "particle_store_path": str(root_store.get("particle_store_path")),
+            "node_store_path": str(root_store.get("node_store_path")),
         }
         _dump_pickle(payload_path, payload)
         root_payload_paths[int(root_id)] = str(payload_path)
@@ -1326,6 +1569,7 @@ def _worker_run_finding_galaxies(
             "results": _galaxy_finding_shard_payload(results),
             "node_ids": [int(t.node_id) for t in batch.tasks],
             "root_ids": sorted({int(t.top_id) for t in batch.tasks}),
+            "store_ids": [str(v) for v in one_item.get("store_ids", ())],
             "input_payload_path": str(one_item["payload_path"]),
         }
 
@@ -1342,14 +1586,16 @@ def _worker_run_finding_galaxies(
     combined_payload = {}
     node_ids = []
     root_ids = set()
+    store_ids = set()
     input_payload_paths = []
     for out in outputs:
         combined_payload.update(out["results"])
         node_ids.extend(int(v) for v in out["node_ids"])
         root_ids.update(int(v) for v in out["root_ids"])
+        store_ids.update(str(v) for v in out.get("store_ids", []))
         input_payload_paths.append(str(out["input_payload_path"]))
 
-    shard_path = shard_dir / f"finding_galaxies_rank{os.getpid()}_{abs(hash(tuple(sorted(node_ids))))}.pkl"
+    shard_path = shard_dir / f"finding_galaxies_shard_rank{os.getpid()}_{abs(hash(tuple(sorted(node_ids))))}.pkl"
     _dump_pickle(shard_path, combined_payload)
     return {
         "stage": "finding_galaxies",
@@ -1357,6 +1603,7 @@ def _worker_run_finding_galaxies(
         "node_ids": sorted(set(int(v) for v in node_ids)),
         "count_nodes": int(len(set(int(v) for v in node_ids))),
         "root_ids": sorted(root_ids),
+        "store_ids": sorted(store_ids),
         "input_payload_paths": input_payload_paths,
         "completed_count": len(items),
     }
@@ -1377,16 +1624,39 @@ def _worker_run_reconciling_subhalos(
     max_pairs_per_batch = max(1, _env_int("CAESAR_AHF_SUBHALO_MAX_PAIRS_PER_BATCH", 5_000_000))
     halo_overhead = max(0, _env_int("CAESAR_AHF_SUBHALO_CALCULATING_PROPERTIES_HALO_OVERHEAD", 128))
     galaxy_overhead = max(0, _env_int("CAESAR_AHF_SUBHALO_CALCULATING_PROPERTIES_GALAXY_OVERHEAD", 128))
+    fof_nHlim = _env_float("CAESAR_AHF_FAST_FOF_NHLIM", 0.13)
+    fof_Tlim = _env_float("CAESAR_AHF_FAST_FOF_TLIM", 1.0e5)
+    fof_use_sfr_gate = os.environ.get("CAESAR_AHF_FAST_FOF_USE_SFR", "1") == "1"
 
     def run_one(one_item: Dict):
         root_id = int(one_item["root_id"])
         root_payload = _load_pickle(Path(one_item["root_payload_path"]))
         root_tasks = [_deserialize_task(task) for task in root_payload["tasks"]]
-        halo_records = [dict(rec) for rec in root_payload.get("halo_records", [])]
-        task_payloads_by_node = {
-            int(node_id): payload
-            for node_id, payload in root_payload["task_payloads_by_node"].items()
-        }
+        particle_store = load_particle_store(Path(str(root_payload["particle_store_path"])))
+        node_store = load_node_store(Path(str(root_payload["node_store_path"])))
+        store_state = AHFSubhaloDirectState(
+            snapshot=particle_store.meta,
+            particles=particle_store,
+            nodes=node_store["nodes"],
+        )
+        halo_records = [
+            _build_store_halo_record(store_state, node_id=int(node_id))
+            for node_id in root_payload.get("halo_node_ids", [])
+        ]
+        task_payloads_by_node = {}
+        for task in root_tasks:
+            task_payload = _build_direct_task_payload(
+                store_state,
+                task=task,
+                fof_nHlim=float(fof_nHlim),
+                fof_Tlim=float(fof_Tlim),
+                fof_use_sfr_gate=bool(fof_use_sfr_gate),
+            )
+            if task_payload is None:
+                raise RuntimeError(
+                    f"Failed to rebuild task payload from store for root {root_id} node {int(task.node_id)}"
+                )
+            task_payloads_by_node[int(task.node_id)] = task_payload
         initial_candidates_by_node: Dict[int, List[dict]] = {int(task.node_id): [] for task in root_tasks}
         wanted = set(initial_candidates_by_node.keys())
         for path in one_item["shard_paths"]:
@@ -1438,7 +1708,7 @@ def _worker_run_reconciling_subhalos(
     total_count = 0
     for out in outputs:
         root_id = int(out["root_id"])
-        shard_path = shard_dir / f"reconciling_subhalos_root{root_id:08d}.pkl"
+        shard_path = shard_dir / f"reconciling_subhalos_shard_root{root_id:08d}.pkl"
         _dump_pickle(shard_path, _reconciled_galaxy_shard_payload(out["galaxies"]))
         root_results.append(
             {
@@ -1493,6 +1763,9 @@ def _collect_calculating_properties_root_records(root_results: Sequence[Mapping[
             "root_id": int(rec["root_id"]),
             "shard_path": str(rec["shard_path"]),
             "root_payload_path": str(rec["root_payload_path"]),
+            "store_id": str(rec["store_id"]),
+            "particle_store_path": str(rec["particle_store_path"]),
+            "node_store_path": str(rec["node_store_path"]),
             "halo_count": int(rec.get("halo_count", 0)),
             "galaxy_count": int(rec.get("count", 0)),
             "cost": int(rec.get("property_cost", rec.get("count", 0))),
@@ -1515,35 +1788,43 @@ def _collect_calculating_properties_root_records(root_results: Sequence[Mapping[
 def _build_calculating_properties_batches(
     root_results: Sequence[Mapping[str, object]],
     worker_count: int,
-) -> List[List[Dict[str, object]]]:
+) -> List[Dict[str, object]]:
     root_records = _collect_calculating_properties_root_records(root_results)
     if not root_records:
         return []
 
-    multiplier = max(1, _env_int("CAESAR_AHF_SUBHALO_CALCULATING_PROPERTIES_BATCH_MULTIPLIER", 4))
-    target_batches = max(int(worker_count), int(worker_count) * int(multiplier))
-    target_batches = max(1, min(len(root_records), int(target_batches)))
-
-    bins = [
-        {
-            "cost": 0,
-            "roots": [],
-        }
-        for _ in range(target_batches)
-    ]
-
+    by_store: Dict[str, Dict[str, object]] = {}
     for rec in root_records:
-        slot = min(
-            bins,
-            key=lambda bucket: (
-                int(bucket["cost"]),
-                len(bucket["roots"]),
-            ),
+        store_id = str(rec["store_id"])
+        bucket = by_store.setdefault(
+            store_id,
+            {
+                "store_id": store_id,
+                "particle_store_path": str(rec["particle_store_path"]),
+                "node_store_path": str(rec["node_store_path"]),
+                "roots": [],
+                "cost": 0,
+                "halo_count": 0,
+                "galaxy_count": 0,
+            },
         )
-        slot["roots"].append(dict(rec))
-        slot["cost"] += int(rec["cost"])
+        bucket["roots"].append(dict(rec))
+        bucket["cost"] = int(bucket["cost"]) + int(rec["cost"])
+        bucket["halo_count"] = int(bucket["halo_count"]) + int(rec["halo_count"])
+        bucket["galaxy_count"] = int(bucket["galaxy_count"]) + int(rec["galaxy_count"])
 
-    return [list(bucket["roots"]) for bucket in bins if bucket["roots"]]
+    batches = list(by_store.values())
+    batches.sort(
+        key=lambda rec: (
+            int(rec["cost"]),
+            int(rec["halo_count"]),
+            int(rec["galaxy_count"]),
+            len(rec["roots"]),
+            str(rec["store_id"]),
+        ),
+        reverse=True,
+    )
+    return batches
 
 
 def _calculating_properties_state_list_data(state: Dict, name: str):
@@ -1641,18 +1922,28 @@ def _worker_run_calculating_properties(
 ) -> Dict:
     nproc = int(item.get("nproc", nproc))
     if "roots" in item:
+        if "particle_store_path" not in item or "node_store_path" not in item:
+            raise RuntimeError("Calculating properties worker requires particle_store_path and node_store_path")
+        particle_store = load_particle_store(Path(str(item["particle_store_path"])))
+        node_store = load_node_store(Path(str(item["node_store_path"])))
+        store_state = AHFSubhaloDirectState(
+            snapshot=particle_store.meta,
+            particles=particle_store,
+            nodes=node_store["nodes"],
+        )
         halo_records: List[Dict[str, object]] = []
         galaxy_records: List[Dict[str, object]] = []
         root_ids: List[int] = []
-        root_payload_paths: List[str] = []
-        reconciled_paths: List[str] = []
         for rec in item["roots"]:
             root_id = int(rec["root_id"])
-            root_payload_path = str(rec["root_payload_path"])
-            reconciled_path = str(rec["shard_path"])
-            root_payload = _load_pickle(Path(root_payload_path))
-            halo_records.extend([dict(v) for v in root_payload.get("halo_records", [])])
-            reconciled_payload = _load_pickle(Path(reconciled_path))
+            root_payload = _load_pickle(Path(str(rec["root_payload_path"])))
+            halo_records.extend(
+                [
+                    _build_store_halo_record(store_state, node_id=int(node_id))
+                    for node_id in root_payload.get("halo_node_ids", [])
+                ]
+            )
+            reconciled_payload = _load_pickle(Path(str(rec["shard_path"])))
             galaxies = (
                 candidate_records_from_table_payload(reconciled_payload)
                 if isinstance(reconciled_payload, dict) and "ahf_halo_id" in reconciled_payload
@@ -1660,19 +1951,14 @@ def _worker_run_calculating_properties(
             )
             galaxy_records.extend([dict(v) for v in galaxies])
             root_ids.append(int(root_id))
-            root_payload_paths.append(root_payload_path)
-            reconciled_paths.append(reconciled_path)
-        payload = _build_calculating_properties_payload_from_records(
-            str(item["snapshot_file"]),
+        payload = _build_calculating_properties_payload_from_particle_store(
+            particle_store,
             halo_records=halo_records,
             galaxy_records=galaxy_records,
         )
-        shard_source = tuple(sorted(root_ids))
-    elif "payload_path" in item:
-        payload = _load_pickle(Path(item["payload_path"]))
-        shard_source = str(item["payload_path"])
+        shard_source = (str(item.get("store_id", "")), tuple(sorted(root_ids)))
     else:
-        raise RuntimeError("Calculating properties worker requires assigned root records or a materialized payload")
+        raise RuntimeError("Calculating properties worker requires assigned roots plus particle_store_path and node_store_path")
     sim = _build_calculating_properties_runtime(payload, nproc=int(nproc))
 
     _compute_group_properties_subset(sim, group_type="halo", groups=list(sim.halo_list))
@@ -1769,7 +2055,7 @@ def _worker_run_calculating_properties(
         galaxy_states,
         ("glist", "slist", "bhlist", "dlist", "cloud_index_list", "AHF_ancestor_haloIDs"),
     )
-    shard_path = shard_dir / f"calculating_properties_rank{os.getpid()}_{abs(hash(shard_source))}.pkl"
+    shard_path = shard_dir / f"calculating_properties_shard_rank{os.getpid()}_{abs(hash(shard_source))}.pkl"
     _dump_pickle(
         shard_path,
         {
@@ -1884,19 +2170,31 @@ def _rank0_calculate_properties(
     pid_maps_sel=None,
     worker_threads: Optional[Dict[int, int]] = None,
 ):
-    snapshot_meta = sim.snapshot if isinstance(sim, AHFSubhaloDirectState) else load_snapshot_meta(snapshot_file)
+    snapshot_meta_path = _snapshot_meta_store_path(shard_root)
+    if not snapshot_meta_path.is_file():
+        raise RuntimeError(
+            f"Calculating properties requires persisted snapshot meta store: {snapshot_meta_path}"
+        )
+    if isinstance(sim, AHFSubhaloDirectState):
+        snapshot_meta = sim.snapshot
+        _rank0_log("calculating properties: using in-memory snapshot metadata and worker-side store reads")
+    else:
+        snapshot_meta = load_snapshot_meta_store(snapshot_meta_path)
+        _rank0_log("calculating properties: using persisted snapshot metadata and worker-side store reads")
     calculating_properties_root_results = [dict(rec) for rec in root_results if int(rec.get("count", 0)) > 0]
     property_batches = _build_calculating_properties_batches(calculating_properties_root_results, len(worker_caps))
     total_halos = int(sum(int(rec.get("halo_count", 0)) for rec in calculating_properties_root_results))
     total_galaxies = int(sum(int(rec.get("count", 0)) for rec in calculating_properties_root_results))
     _rank0_log(
-        f"calculating properties: prepared root batches count={len(property_batches)} "
+        f"calculating properties: prepared store batches count={len(property_batches)} "
         f"halos={total_halos} galaxies={total_galaxies}"
     )
     calculating_properties_items = [
         {
-            "roots": [dict(rec) for rec in batch],
-            "snapshot_file": str(snapshot_file),
+            "store_id": str(batch["store_id"]),
+            "particle_store_path": str(batch["particle_store_path"]),
+            "node_store_path": str(batch["node_store_path"]),
+            "roots": [dict(rec) for rec in batch["roots"]],
         }
         for batch in property_batches
     ]
@@ -2018,6 +2316,9 @@ def _write_calculating_properties_manifest(
                     "root_id": int(rec["root_id"]),
                     "shard_path": str(rec["shard_path"]),
                     "root_payload_path": str(rec["root_payload_path"]),
+                    "store_id": str(rec.get("store_id", "")),
+                    "particle_store_path": str(rec.get("particle_store_path", "")),
+                    "node_store_path": str(rec.get("node_store_path", "")),
                     "count": int(rec.get("count", 0)),
                     "cost": int(rec.get("cost", 0)),
                     "halo_count": int(rec.get("halo_count", 0)),
@@ -2153,6 +2454,7 @@ def run_mpi(
                 tasks,
                 tasks_by_root,
                 task_payloads_by_node,
+                store_manifest,
             ) = _rank0_prepare_galaxy_finding(
                 snapshot_file=snapshot_file,
                 ahf_particles_file=ahf_particles_file,
@@ -2166,6 +2468,10 @@ def run_mpi(
                 f"{stage_label}: preparation complete "
                 f"tasks={len(tasks)}, roots={len(tasks_by_root)}, min_stars={int(min_stars_val)}"
             )
+            root_store_lookup = {
+                int(k): dict(v)
+                for k, v in dict(store_manifest.get("roots", {})).items()
+            }
 
             regular_batches, small_batches = _classify_galaxy_finding_batches(
                 tasks=tasks,
@@ -2192,6 +2498,11 @@ def run_mpi(
             ]
 
             def _materialize_finding_galaxies_regular_spec(spec, direction):
+                batch_store_ids = {
+                    str(root_store_lookup[int(task.top_id)]["store_id"])
+                    for task in spec["batch"].tasks
+                    if int(task.top_id) in root_store_lookup
+                }
                 return _materialize_galaxy_finding_batch_item(
                     shard_root=shard_root,
                     batch=spec["batch"],
@@ -2203,9 +2514,15 @@ def run_mpi(
                     min_stars=int(min_stars_val),
                     backend="cpu",
                     device_id=None,
+                    store_ids=tuple(sorted(batch_store_ids)),
                 )
 
             def _materialize_finding_galaxies_small_spec(spec, direction):
+                batch_store_ids = {
+                    str(root_store_lookup[int(task.top_id)]["store_id"])
+                    for task in spec["batch"].tasks
+                    if int(task.top_id) in root_store_lookup
+                }
                 return _materialize_galaxy_finding_batch_item(
                     shard_root=shard_root,
                     batch=spec["batch"],
@@ -2217,6 +2534,7 @@ def run_mpi(
                     min_stars=int(min_stars_val),
                     backend="cpu",
                     device_id=None,
+                    store_ids=tuple(sorted(batch_store_ids)),
                 )
 
             def _bind_finding_galaxies_item(base_item, *, cap, direction):
@@ -2280,7 +2598,7 @@ def run_mpi(
             root_payload_paths = _write_reconciliation_root_payloads(
                 shard_root=shard_root,
                 tasks_by_root=tasks_by_root,
-                task_payloads_by_node=task_payloads_by_node,
+                store_manifest=store_manifest,
                 direct_state=sim_runtime if isinstance(sim_runtime, AHFSubhaloDirectState) else None,
                 log_fn=_rank0_log,
                 progress_label="reconciling subhalos",
@@ -2368,11 +2686,18 @@ def run_mpi(
             for result in reconciling_subhalos_results:
                 root_results.extend(list(result.get("root_results", [])))
             root_results = sorted(root_results, key=lambda rec: int(rec["root_id"]))
+            store_roots = {
+                int(k): dict(v)
+                for k, v in dict(store_manifest.get("roots", {})).items()
+            }
             root_results_enriched = [
                 {
                     "root_id": int(rec["root_id"]),
                     "shard_path": str(rec["shard_path"]),
                     "root_payload_path": str(root_payload_paths[int(rec["root_id"])]),
+                    "store_id": str(store_roots[int(rec["root_id"])]["store_id"]),
+                    "particle_store_path": str(store_roots[int(rec["root_id"])]["particle_store_path"]),
+                    "node_store_path": str(store_roots[int(rec["root_id"])]["node_store_path"]),
                     "count": int(rec.get("count", 0)),
                     "cost": int(root_costs.get(int(rec["root_id"]), 0)),
                     "halo_count": int(rec.get("halo_count", 0)),
@@ -2552,11 +2877,18 @@ def run_mpi(
             for result in reconciling_subhalos_results:
                 root_results.extend(list(result.get("root_results", [])))
             root_results = sorted(root_results, key=lambda rec: int(rec["root_id"]))
+            root_payload_meta = {
+                int(root_id): dict(_load_pickle(Path(str(path))))
+                for root_id, path in root_payload_paths.items()
+            }
             root_results_enriched = [
                 {
                     "root_id": int(rec["root_id"]),
                     "shard_path": str(rec["shard_path"]),
                     "root_payload_path": str(root_payload_paths[int(rec["root_id"])]),
+                    "store_id": str(root_payload_meta[int(rec["root_id"])].get("store_id", "")),
+                    "particle_store_path": str(root_payload_meta[int(rec["root_id"])].get("particle_store_path", "")),
+                    "node_store_path": str(root_payload_meta[int(rec["root_id"])].get("node_store_path", "")),
                     "count": int(rec.get("count", 0)),
                     "cost": int(root_costs.get(int(rec["root_id"]), 0)),
                     "halo_count": int(rec.get("halo_count", 0)),

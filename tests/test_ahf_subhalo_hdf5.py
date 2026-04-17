@@ -371,6 +371,102 @@ def test_build_task_payload_uses_direct_particle_tables(monkeypatch, tmp_path):
     assert payload["eligible_vel"].shape == (3, 3)
 
 
+def test_build_store_for_roots_preserves_global_memberships(monkeypatch, tmp_path):
+    snapshot = tmp_path / "snap.hdf5"
+    _write_test_snapshot(snapshot)
+
+    hierarchy = SimpleNamespace(
+        parent_of={10: 0, 20: 0},
+        children_of={10: [], 20: []},
+    )
+    halos_df = pd.DataFrame(
+        {
+            "hid": np.asarray([10, 20], dtype=np.int64),
+            "host_hid": np.asarray([0, 0], dtype=np.int64),
+            "npart": np.asarray([4, 2], dtype=np.int64),
+            "n_star": np.asarray([1, 1], dtype=np.int64),
+        }
+    )
+    memberships = {
+        10: np.asarray([[1001, 0], [2001, 1], [3001, 4], [4001, 5]], dtype=np.int64),
+        20: np.asarray([[1002, 0], [3002, 4]], dtype=np.int64),
+    }
+
+    monkeypatch.setattr(hdf5_mod, "load_ahf_hierarchy", lambda _: hierarchy)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_halos_dataframe", lambda _: halos_df)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_particle_blocks", lambda *args, **kwargs: memberships)
+
+    state = hdf5_mod.build_direct_state(str(snapshot), "dummy.AHF_particles")
+    particle_store, node_store, summary = hdf5_mod.build_store_for_roots(state, root_ids=[20])
+
+    assert summary["root_ids"] == (20,)
+    assert summary["particle_rows_by_ptype"]["gas"] == 1
+    assert summary["particle_rows_by_ptype"]["star"] == 1
+    assert np.array_equal(particle_store.table("gas").get("global_index"), np.asarray([1], dtype=np.int64))
+    assert np.array_equal(particle_store.table("star").get("global_index"), np.asarray([1], dtype=np.int64))
+
+    store_state = hdf5_mod.AHFSubhaloDirectState(snapshot=particle_store.meta, particles=particle_store, nodes=node_store)
+    payload = hdf5_mod.build_task_payload(
+        store_state,
+        task=SimpleNamespace(node_id=20),
+        fof_nHlim=0.0,
+        fof_Tlim=1.0e9,
+        fof_use_sfr_gate=True,
+    )
+    assert payload is not None
+    assert np.array_equal(payload["gas_sel"], np.asarray([1], dtype=np.int32))
+    assert np.array_equal(payload["star_sel"], np.asarray([1], dtype=np.int32))
+
+    halo_record = hdf5_mod.build_halo_record(store_state, node_id=20)
+    assert np.array_equal(halo_record["glist"], np.asarray([1], dtype=np.int64))
+    assert np.array_equal(halo_record["slist"], np.asarray([1], dtype=np.int64))
+
+
+def test_particle_and_node_store_roundtrip(monkeypatch, tmp_path):
+    snapshot = tmp_path / "snap.hdf5"
+    _write_test_snapshot(snapshot)
+
+    hierarchy = SimpleNamespace(
+        parent_of={10: 0, 20: 0},
+        children_of={10: [], 20: []},
+    )
+    halos_df = pd.DataFrame(
+        {
+            "hid": np.asarray([10, 20], dtype=np.int64),
+            "host_hid": np.asarray([0, 0], dtype=np.int64),
+            "npart": np.asarray([4, 2], dtype=np.int64),
+            "n_star": np.asarray([1, 1], dtype=np.int64),
+        }
+    )
+    memberships = {
+        10: np.asarray([[1001, 0], [2001, 1], [3001, 4], [4001, 5]], dtype=np.int64),
+        20: np.asarray([[1002, 0], [3002, 4]], dtype=np.int64),
+    }
+
+    monkeypatch.setattr(hdf5_mod, "load_ahf_hierarchy", lambda _: hierarchy)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_halos_dataframe", lambda _: halos_df)
+    monkeypatch.setattr(hdf5_mod, "load_ahf_particle_blocks", lambda *args, **kwargs: memberships)
+
+    state = hdf5_mod.build_direct_state(str(snapshot), "dummy.AHF_particles")
+    particle_store, node_store, summary = hdf5_mod.build_store_for_roots(state, root_ids=[10, 20])
+
+    particle_store_path = tmp_path / "particle_store_bucket000001.h5"
+    node_store_path = tmp_path / "node_store_bucket000001.pkl"
+    snapshot_meta_store_path = tmp_path / "snapshot_meta_store.pkl"
+    hdf5_mod.write_snapshot_meta_store(snapshot_meta_store_path, state.snapshot)
+    hdf5_mod.write_particle_store(particle_store_path, particle_store)
+    hdf5_mod.write_node_store(node_store_path, node_store, root_ids=summary["root_ids"], particle_rows_by_ptype=summary["particle_rows_by_ptype"])
+
+    loaded_meta = hdf5_mod.load_snapshot_meta_store(snapshot_meta_store_path)
+    loaded_particle_store = hdf5_mod.load_particle_store(particle_store_path)
+    loaded_node_store = hdf5_mod.load_node_store(node_store_path)
+
+    assert loaded_meta.snapshot_file == state.snapshot.snapshot_file
+    assert loaded_node_store["root_ids"] == (10, 20)
+    assert np.array_equal(loaded_particle_store.table("gas").get("global_index"), np.asarray([0, 1], dtype=np.int64))
+    assert np.array_equal(loaded_node_store["nodes"].halo_id, node_store.halo_id)
+
+
 def test_direct_calculating_properties_runtime_can_compute_and_save(monkeypatch, tmp_path):
     snapshot = tmp_path / "snap.hdf5"
     _write_test_snapshot(snapshot)
